@@ -400,17 +400,25 @@ impl App {
     /// track face for each (`rcirc-track-keyword`, or `rcirc-track-nick` when
     /// our nick was mentioned).
     pub fn activity_entries(&self) -> Vec<(String, Style)> {
-        let mut active: Vec<&Chan> = self.buffers.iter().filter(|b| b.unread > 0).collect();
-        active.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+        let targets: Vec<String> = self.buffers.iter().map(|b| b.target.clone()).collect();
+        let short = abbreviate(&targets);
+        let mut active: Vec<usize> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.unread > 0)
+            .map(|(i, _)| i)
+            .collect();
+        active.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_activity));
         active
             .into_iter()
-            .map(|c| {
-                let style = if c.mentioned {
+            .map(|i| {
+                let style = if self.buffers[i].mentioned {
                     self.theme.track_nick
                 } else {
                     self.theme.track_keyword
                 };
-                (c.target.clone(), style)
+                (short[i].clone(), style)
             })
             .collect()
     }
@@ -2094,6 +2102,24 @@ fn action_body(text: &str) -> Option<&str> {
     inner.strip_prefix("ACTION ")
 }
 
+/// The shortest unique prefix of each name (mirrors rcirc's prefix-tree
+/// abbreviation used for the mode-line activity indicator).
+fn abbreviate(targets: &[String]) -> Vec<String> {
+    (0..targets.len())
+        .map(|i| {
+            let name = &targets[i];
+            let chars: Vec<char> = name.chars().collect();
+            for len in 1..=chars.len() {
+                let prefix: String = chars[..len].iter().collect();
+                if (0..targets.len()).all(|j| j == i || !targets[j].starts_with(&prefix)) {
+                    return prefix;
+                }
+            }
+            name.clone()
+        })
+        .collect()
+}
+
 fn common_prefix(items: &[String]) -> String {
     let Some(first) = items.first() else {
         return String::new();
@@ -2178,6 +2204,18 @@ fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abbreviate_shortest_unique_prefixes() {
+        let v = vec![
+            "#emacs".to_string(),
+            "#emacs-dev".to_string(),
+            "*scratch*".to_string(),
+            "bob".to_string(),
+        ];
+        assert_eq!(abbreviate(&v), vec!["#emacs", "#emacs-", "*", "b"]);
+        assert_eq!(abbreviate(&["#cricr".to_string()]), vec!["#"]);
+    }
 
     #[test]
     fn common_prefix_works() {
