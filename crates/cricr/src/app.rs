@@ -37,6 +37,16 @@ pub enum Prompt {
     BrowseUrl { input: String, selected: usize },
 }
 
+/// A pending multi-key prefix (`C-x`, `C-c`, or `C-c C-f`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Prefix {
+    #[default]
+    None,
+    CtrlX,
+    CtrlC,
+    CtrlCF,
+}
+
 /// One connection's shared state.
 pub struct ServerState {
     pub name: String,
@@ -56,6 +66,8 @@ pub struct Chan {
     pub unread: usize,
     /// Whether our nick was mentioned since the last visit.
     pub mentioned: bool,
+    /// Row of the first unread line since the last visit.
+    pub first_unread: Option<usize>,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
     pub last_activity: u64,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
@@ -105,8 +117,7 @@ pub struct App {
     previous: usize,
     activity_seq: u64,
     visit_seq: u64,
-    ctrl_x: bool,
-    ctrl_c: bool,
+    prefix: Prefix,
     quoted: bool,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
 }
@@ -131,8 +142,7 @@ impl App {
             previous: 0,
             activity_seq: 0,
             visit_seq: 0,
-            ctrl_x: false,
-            ctrl_c: false,
+            prefix: Prefix::None,
             quoted: false,
             event_tx,
         };
@@ -197,6 +207,7 @@ impl App {
             nicks: Vec::new(),
             unread: 0,
             mentioned: false,
+            first_unread: None,
             last_activity: 0,
             last_visited: 0,
             last_timestamp: String::new(),
@@ -240,10 +251,12 @@ impl App {
 
     fn trim_scrollback(&mut self, buf: usize) {
         let limit = self.scrollback.max(1);
-        let b = &mut self.buffers[buf].buffer;
-        if b.len() > limit {
-            let excess = b.len() - limit;
-            b.truncate_front(excess);
+        let excess = self.buffers[buf].buffer.len().saturating_sub(limit);
+        if excess > 0 {
+            self.buffers[buf].buffer.truncate_front(excess);
+            if let Some(row) = &mut self.buffers[buf].first_unread {
+                *row = row.saturating_sub(excess);
+            }
         }
     }
 
@@ -252,6 +265,11 @@ impl App {
             self.activity_seq += 1;
             self.buffers[buf].unread += 1;
             self.buffers[buf].last_activity = self.activity_seq;
+            if self.buffers[buf].first_unread.is_none() {
+                // The line just added sits just above the prompt line.
+                self.buffers[buf].first_unread =
+                    Some(self.buffers[buf].buffer.len().saturating_sub(2));
+            }
             if mentioned {
                 self.buffers[buf].mentioned = true;
             }
@@ -268,6 +286,7 @@ impl App {
         self.current = idx;
         self.buffers[idx].unread = 0;
         self.buffers[idx].mentioned = false;
+        self.buffers[idx].first_unread = None;
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
         self.buffers[idx].buffer.end_of_buffer();
@@ -518,45 +537,167 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // A pending `C-x` / `C-c` prefix always consumes the next key.
-        if self.ctrl_x || self.ctrl_c {
-            let x = std::mem::take(&mut self.ctrl_x);
-            let c = std::mem::take(&mut self.ctrl_c);
-            self.message = None;
-            match key.code {
-                // C-x C-c: quit.
-                KeyCode::Char('c') if x && ctrl => self.should_quit = true,
-                // C-x b: switch buffer (the second key is a plain `b`).
-                KeyCode::Char('b') if x => self.start_switch_buffer(),
-                // C-c C-b: browse a URL found in the buffer.
-                KeyCode::Char('b') if c && ctrl => self.start_browse_url(),
-                // C-c C-SPC / C-c C-@: next buffer with activity.
-                KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if c => {
-                    self.next_active()
-                }
-                // C-g / Esc aborts an incomplete prefix.
-                KeyCode::Char('g') if ctrl => {}
-                KeyCode::Esc => {}
-                // Any other key after a prefix is undefined but harmless.
-                _ => {}
-            }
+        // A pending prefix always consumes the next key.
+        if self.prefix != Prefix::None {
+            self.handle_prefix(key, ctrl);
             return;
         }
 
         if ctrl && key.code == KeyCode::Char('x') {
-            self.ctrl_x = true;
+            self.prefix = Prefix::CtrlX;
             self.message = Some("C-x-".to_string());
             return;
         }
         if ctrl && key.code == KeyCode::Char('c') {
-            self.ctrl_c = true;
+            self.prefix = Prefix::CtrlC;
             self.message = Some("C-c-".to_string());
             return;
         }
 
         self.message = None;
         let action = keymap::translate(key);
-        self.perform(action);
+        if action == Action::None {
+            if let Some(desc) = keymap::describe(key) {
+                self.message = Some(format!("{desc} is undefined"));
+            }
+        } else {
+            self.perform(action);
+        }
+    }
+
+    fn handle_prefix(&mut self, key: crossterm::event::KeyEvent, ctrl: bool) {
+        use crossterm::event::KeyCode;
+        let prefix = std::mem::take(&mut self.prefix);
+        self.message = None;
+        match prefix {
+            Prefix::None => {}
+            Prefix::CtrlX => match key.code {
+                KeyCode::Char('c') if ctrl => self.should_quit = true,
+                KeyCode::Char('b') => self.start_switch_buffer(),
+                KeyCode::Char('g') if ctrl => {}
+                _ => self.undefined("C-x", key),
+            },
+            Prefix::CtrlC => match key.code {
+                KeyCode::Char('b') if ctrl => self.start_browse_url(),
+                KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => self.next_active(),
+                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Char('f') if ctrl => {
+                    self.prefix = Prefix::CtrlCF;
+                    self.message = Some("C-c C-f-".to_string());
+                }
+                KeyCode::Char('n') if ctrl => self.cmd_names(),
+                KeyCode::Char('j') if ctrl => self.prefill("/join "),
+                KeyCode::Char('p') if ctrl => self.prefill("/part "),
+                KeyCode::Char('q') if ctrl => self.prefill("/query "),
+                KeyCode::Char('t') if ctrl => self.prefill("/topic "),
+                KeyCode::Char('w') if ctrl => self.prefill("/whois "),
+                KeyCode::Char('m') if ctrl => self.prefill("/msg "),
+                KeyCode::Char('k') if ctrl => self.prefill("/kick "),
+                KeyCode::Char('d') if ctrl => self.prefill("/mode "),
+                KeyCode::Char('r') if ctrl => self.prefill("/nick "),
+                KeyCode::Char('x') if ctrl => self.prefill("/quit "),
+                KeyCode::Char('s') if ctrl => self.switch_to_server(),
+                KeyCode::Char('a') if ctrl => self.jump_first_unread(),
+                _ => self.undefined("C-c", key),
+            },
+            Prefix::CtrlCF => match key.code {
+                KeyCode::Char('b') if ctrl => self.insert_format('\u{2}'),
+                KeyCode::Char('i') if ctrl => self.insert_format('\u{1d}'),
+                KeyCode::Char('u') if ctrl => self.insert_format('\u{1f}'),
+                KeyCode::Char('s') if ctrl => self.insert_format('\u{1e}'),
+                KeyCode::Char('f') | KeyCode::Char('t') if ctrl => self.insert_format('\u{11}'),
+                KeyCode::Char('d') if ctrl => self.unformat(),
+                KeyCode::Char('g') if ctrl => {}
+                _ => self.undefined("C-c C-f", key),
+            },
+        }
+    }
+
+    fn undefined(&mut self, prefix: &str, key: crossterm::event::KeyEvent) {
+        if let Some(desc) = keymap::describe(key) {
+            self.message = Some(format!("{prefix} {desc} is undefined"));
+        }
+    }
+
+    /// Put a command prefix into the current buffer's input line.
+    fn prefill(&mut self, text: &str) {
+        let i = self.current;
+        if self.buffers[i].buffer.is_irc() {
+            self.buffers[i].buffer.set_input(text);
+        }
+    }
+
+    fn cmd_names(&mut self) {
+        let (server, target) = {
+            let c = self.current();
+            (c.server, c.target.clone())
+        };
+        self.send(server, ClientCommand::Names { channel: target });
+    }
+
+    fn switch_to_server(&mut self) {
+        let server = self.current().server;
+        if let Some(idx) = self.servers.get(server).map(|s| s.buffer) {
+            self.switch_to(idx);
+        }
+    }
+
+    fn jump_first_unread(&mut self) {
+        let i = self.current;
+        match self.buffers[i].first_unread {
+            Some(row) => {
+                let row = row.min(self.buffers[i].buffer.last_row());
+                self.buffers[i].buffer.set_point(Pos::new(row, 0));
+            }
+            None => self.buffers[i].buffer.end_of_buffer(),
+        }
+        self.buffers[i].unread = 0;
+        self.buffers[i].mentioned = false;
+        self.buffers[i].first_unread = None;
+    }
+
+    fn insert_format(&mut self, code: char) {
+        let i = self.current;
+        if !self.buffers[i].buffer.is_irc() {
+            return;
+        }
+        if let Some((start, end)) = self.buffers[i].buffer.region() {
+            self.buffers[i].buffer.set_point(end);
+            self.buffers[i].buffer.insert_char('\u{f}');
+            self.buffers[i].buffer.set_point(start);
+            self.buffers[i].buffer.insert_char(code);
+            self.buffers[i].buffer.clear_mark();
+        } else {
+            self.buffers[i].buffer.insert_char(code);
+            self.buffers[i].buffer.insert_char('\u{f}');
+            self.buffers[i].buffer.backward_char();
+        }
+    }
+
+    fn unformat(&mut self) {
+        const CODES: [char; 5] = ['\u{2}', '\u{1d}', '\u{1f}', '\u{1e}', '\u{11}'];
+        let i = self.current;
+        if !self.buffers[i].buffer.is_irc() {
+            return;
+        }
+        let input: Vec<char> = self.buffers[i].buffer.input().chars().collect();
+        let prompt_len = self.buffers[i].buffer.prompt_len();
+        let cursor = self.buffers[i]
+            .buffer
+            .point()
+            .col
+            .saturating_sub(prompt_len)
+            .min(input.len());
+        let start = (0..cursor).rev().find(|&ci| CODES.contains(&input[ci]));
+        if let Some(start) = start {
+            if let Some(end) = (start + 1..input.len()).find(|&ci| input[ci] == '\u{f}') {
+                let mut new = input.clone();
+                new.remove(end);
+                new.remove(start);
+                let text: String = new.into_iter().collect();
+                self.buffers[i].buffer.set_input(&text);
+            }
+        }
     }
 
     fn start_switch_buffer(&mut self) {
@@ -1398,7 +1539,12 @@ impl App {
                     self.add_nick(idx, &nick);
                 }
             }
-            Event::NamesEnd { .. } => {}
+            Event::NamesEnd { channel } => {
+                let idx = self.ensure_buffer(server, channel, Kind::Channel);
+                let names = self.buffers[idx].nicks.join(" ");
+                let line = self.server_line(idx, None, "NAMES", &names);
+                self.push_line(idx, line);
+            }
             Event::Whois { nick, line } => {
                 let idx = self.servers[server].buffer;
                 let l = self.system_line(idx, &format!("{nick}: {line}"));
@@ -1703,6 +1849,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unbound_key_reports_undefined() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .ends_with("is undefined"));
+    }
+
+    #[test]
+    fn c_x_then_unbound_reports_undefined() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(app.message.as_deref(), Some("C-x <f1> is undefined"));
+    }
+
+    #[test]
+    fn c_c_c_n_runs_names_without_quitting() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn c_c_c_f_b_inserts_bold_code() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.input(), "\u{2}\u{f}");
     }
 
     #[test]

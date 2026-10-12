@@ -90,12 +90,65 @@ pub fn translate(key: KeyEvent) -> Action {
     }
 }
 
+/// Render a key the way Emacs echoes it (`C-x`, `M-f`, `C-x C-f`, `TAB`).
+/// Returns `None` for keys we don't want to report as undefined.
+pub fn describe(key: KeyEvent) -> Option<String> {
+    use KeyCode::*;
+    let base = match key.code {
+        Char(' ') | Char('\0') => "SPC".to_string(),
+        Char(c) => c.to_string(),
+        Enter => "RET".to_string(),
+        Tab => "TAB".to_string(),
+        Backspace | Delete => "DEL".to_string(),
+        Up => "<up>".to_string(),
+        Down => "<down>".to_string(),
+        Left => "<left>".to_string(),
+        Right => "<right>".to_string(),
+        Home => "<home>".to_string(),
+        End => "<end>".to_string(),
+        PageUp => "<prior>".to_string(),
+        PageDown => "<next>".to_string(),
+        F(n) => format!("<f{n}>"),
+        _ => return None,
+    };
+    let mut out = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        out.push_str("C-");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        out.push_str("M-");
+    }
+    out.push_str(&base);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn describe_renders_emacs_names() {
+        assert_eq!(
+            describe(key(KeyCode::Char('f'), KeyModifiers::CONTROL)).unwrap(),
+            "C-f"
+        );
+        assert_eq!(
+            describe(key(KeyCode::Char('b'), KeyModifiers::ALT)).unwrap(),
+            "M-b"
+        );
+        assert_eq!(
+            describe(key(KeyCode::Enter, KeyModifiers::NONE)).unwrap(),
+            "RET"
+        );
+        assert_eq!(
+            describe(key(KeyCode::Char(' '), KeyModifiers::CONTROL)).unwrap(),
+            "C-SPC"
+        );
+        assert_eq!(describe(key(KeyCode::Esc, KeyModifiers::NONE)), None);
     }
 
     #[test]
