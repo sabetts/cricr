@@ -81,7 +81,6 @@ pub struct SaslConfig {
 pub struct UiConfig {
     pub timestamp_format: String,
     pub scrollback_lines: usize,
-    pub sidebar: bool,
 }
 
 impl Default for UiConfig {
@@ -89,7 +88,6 @@ impl Default for UiConfig {
         UiConfig {
             timestamp_format: "%H:%M".to_string(),
             scrollback_lines: 100_000,
-            sidebar: true,
         }
     }
 }
@@ -107,7 +105,6 @@ tls = true
 [ui]
 timestamp_format = "%H:%M"
 scrollback_lines = 100000
-sidebar = true
 
 [[servers]]
 name = "irc.libera.chat"
@@ -239,7 +236,7 @@ mod tests {
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].name, "irc.libera.chat");
         assert_eq!(cfg.servers[0].channels, vec!["#emacs", "#rcirc"]);
-        assert!(cfg.ui.sidebar);
+        assert_eq!(cfg.ui.scrollback_lines, 100_000);
     }
 
     #[test]

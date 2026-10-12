@@ -1,51 +1,35 @@
 //! Rendering with ratatui.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color as RColor, Modifier, Style as RStyle, Stylize};
+use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use ratatui::text::{Line as RLine, Span as RSpan, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Kind};
+use crate::app::{App, Prompt};
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::SearchDirection;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let area = frame.area();
     let rows = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .split(area);
+    .split(frame.area());
 
-    let (main_area, sidebar_area) = if app.sidebar && area.width > 50 {
-        let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(rows[0]);
-        (cols[0], Some(cols[1]))
-    } else {
-        (rows[0], None)
-    };
-
-    draw_buffer(frame, app, main_area);
-    if let Some(sidebar) = sidebar_area {
-        draw_sidebar(frame, app, sidebar);
-    }
-    draw_status(frame, app, rows[1]);
+    draw_buffer(frame, app, rows[0]);
+    draw_mode_line(frame, app, rows[1]);
     draw_minibuffer(frame, app, rows[2]);
 }
 
 fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
-    let chan = app.current();
-    let buf = &chan.buffer;
-    let title = buffer_title(app, chan);
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let height = inner.height as usize;
+    let buf = &app.current().buffer;
+    let height = area.height as usize;
     if height == 0 {
         return;
     }
+
     let point = buf.point();
     let mut top = buf.scroll();
     if point.row < top {
@@ -71,28 +55,44 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(to_rline(&cells));
     }
 
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn buffer_title(app: &App, chan: &crate::app::Chan) -> String {
-    let server = app
-        .servers
-        .get(chan.server)
-        .map(|s| s.name.as_str())
-        .unwrap_or("?");
-    let kind = match chan.kind {
-        Kind::Server => "server",
-        Kind::Channel => "channel",
-        Kind::Query => "query",
-    };
-    let mut title = format!(" {} ({kind}) ", chan.target);
-    if let Some(topic) = &chan.topic {
-        if !topic.is_empty() {
-            title.push_str(&format!("— {topic} "));
-        }
+fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
+    let line = app.current().buffer.point().row + 1;
+    let mut text = format!(
+        " {}  ({})  L{} ",
+        app.mode_line_name(),
+        app.mode_line_mode(),
+        line
+    );
+    let activity = app.activity_string();
+    if !activity.is_empty() {
+        text.push_str(&format!(" {activity} "));
     }
-    let _ = server;
-    title
+    let style = RStyle::default().add_modifier(Modifier::REVERSED);
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
+
+fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
+    let text = match &app.prompt {
+        Prompt::SwitchBuffer { input } => {
+            format!(
+                "Switch to buffer (default {}): {input}",
+                app.previous_buffer_name()
+            )
+        }
+        Prompt::None if app.search.active => {
+            let prefix = match app.search.direction {
+                SearchDirection::Forward => "I-search",
+                SearchDirection::Backward => "I-search backward",
+            };
+            let suffix = if app.search.failed { " [failing]" } else { "" };
+            format!("{prefix}: {}{suffix}", app.search.query)
+        }
+        Prompt::None => app.message.clone().unwrap_or_default(),
+    };
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn line_cells(line: &Line) -> Vec<(char, Style)> {
@@ -146,88 +146,6 @@ fn to_rline(cells: &[(char, Style)]) -> RLine<'static> {
         spans.push(RSpan::styled(current, rstyle(s)));
     }
     RLine::from(spans)
-}
-
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let rows =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-
-    let items: Vec<ListItem> = app
-        .buffers
-        .iter()
-        .enumerate()
-        .map(|(i, chan)| {
-            let marker = if i == app.current {
-                ">"
-            } else if chan.unread > 0 {
-                "*"
-            } else {
-                " "
-            };
-            let mut style = RStyle::default();
-            if i == app.current {
-                style = style.bold();
-            }
-            if chan.unread > 0 && i != app.current {
-                style = style.fg(RColor::Yellow);
-            }
-            ListItem::new(RLine::from(format!("{marker} {}", chan.target))).style(style)
-        })
-        .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Buffers "));
-    frame.render_widget(list, rows[0]);
-
-    let mut nicks: Vec<String> = app.current().nicks.clone();
-    nicks.sort();
-    let items: Vec<ListItem> = nicks
-        .iter()
-        .map(|n| ListItem::new(RLine::from(n.clone())))
-        .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Nicks "));
-    frame.render_widget(list, rows[1]);
-}
-
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let chan = app.current();
-    let server = app
-        .servers
-        .get(chan.server)
-        .map(|s| s.name.as_str())
-        .unwrap_or("-");
-    let nick = app
-        .servers
-        .get(chan.server)
-        .map(|s| s.our_nick.as_str())
-        .unwrap_or("-");
-    let status = if app
-        .servers
-        .get(chan.server)
-        .map(|s| s.connected)
-        .unwrap_or(false)
-    {
-        "connected"
-    } else {
-        "offline"
-    };
-    let text = format!(" {nick} @ {server}  [{status}]  — {} ", chan.target);
-    let para = Paragraph::new(text).style(RStyle::default().bg(RColor::Blue).fg(RColor::White));
-    frame.render_widget(para, area);
-}
-
-fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.search.active {
-        let prefix = match app.search.direction {
-            SearchDirection::Forward => "I-search",
-            SearchDirection::Backward => "I-search backward",
-        };
-        let suffix = if app.search.failed { " [failing]" } else { "" };
-        format!("{prefix}: {}{suffix}", app.search.query)
-    } else if let Some(message) = &app.message {
-        message.clone()
-    } else {
-        String::new()
-    };
-    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn rstyle(style: Style) -> RStyle {

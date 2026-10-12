@@ -138,7 +138,9 @@ impl Line {
 #[derive(Debug, Clone)]
 pub struct Buffer {
     lines: Vec<Line>,
-    prompt: String,
+    /// `Some(prompt)` for an rcirc-style buffer (input editable only on the
+    /// prompt line); `None` for a free text buffer (like `*scratch*`).
+    prompt: Option<String>,
     prompt_len: usize,
     point: Pos,
     mark: Option<Pos>,
@@ -151,11 +153,37 @@ impl Buffer {
         let prompt_len = prompt.chars().count();
         Buffer {
             lines: vec![Line::styled(prompt.clone(), Style::fg(Color::Green).bold())],
-            prompt,
+            prompt: Some(prompt),
             prompt_len,
             point: Pos::new(0, prompt_len),
             mark: None,
             scroll: 0,
+        }
+    }
+
+    /// A free text buffer with no prompt (the whole buffer is editable).
+    pub fn text() -> Self {
+        Buffer {
+            lines: vec![Line::plain("")],
+            prompt: None,
+            prompt_len: 0,
+            point: Pos::new(0, 0),
+            mark: None,
+            scroll: 0,
+        }
+    }
+
+    /// Whether this is an rcirc-style buffer with a prompt line.
+    pub fn is_irc(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    /// The minimum column point may occupy on `row`.
+    fn min_col(&self, row: usize) -> usize {
+        if self.is_irc() && row == self.last_row() {
+            self.prompt_len
+        } else {
+            0
         }
     }
 
@@ -188,17 +216,22 @@ impl Buffer {
         self.lines.len() - 1
     }
 
-    /// Insert a line of scrollback immediately before the prompt line.
+    /// Append a line of scrollback. For rcirc buffers the prompt line always
+    /// stays last, so the new line is inserted just before it.
     pub fn push_line(&mut self, line: Line) {
-        let at = self.last_row();
-        self.lines.insert(at, line);
-        if self.point.row >= at {
-            self.point.row += 1;
-        }
-        if let Some(mark) = &mut self.mark {
-            if mark.row >= at {
-                mark.row += 1;
+        if self.is_irc() {
+            let at = self.last_row();
+            self.lines.insert(at, line);
+            if self.point.row >= at {
+                self.point.row += 1;
             }
+            if let Some(mark) = &mut self.mark {
+                if mark.row >= at {
+                    mark.row += 1;
+                }
+            }
+        } else {
+            self.lines.push(line);
         }
     }
 
@@ -221,27 +254,39 @@ impl Buffer {
     }
 
     pub fn clear(&mut self) {
-        self.input_set("");
+        if self.is_irc() {
+            self.input_set("");
+        } else {
+            self.lines = vec![Line::plain("")];
+        }
         self.scroll = 0;
         self.point = Pos::new(0, self.prompt_len);
     }
 
-    /// The current input text (the prompt line after the prompt).
+    /// The current input text (the prompt line after the prompt). Empty for
+    /// free text buffers.
     pub fn input(&self) -> String {
+        if !self.is_irc() {
+            return String::new();
+        }
         let chars = self.lines[self.last_row()].chars();
         chars[self.prompt_len.min(chars.len())..].iter().collect()
     }
 
     fn input_set(&mut self, text: &str) {
         let row = self.last_row();
+        let prompt = self.prompt.clone().unwrap_or_default();
         self.lines[row] = Line::from_spans(vec![
-            Span::new(self.prompt.clone(), Style::fg(Color::Green).bold()),
+            Span::new(prompt, Style::fg(Color::Green).bold()),
             Span::new(text, Style::default()),
         ]);
         self.point.col = self.point.col.max(self.prompt_len);
     }
 
     pub fn set_input(&mut self, text: &str) {
+        if !self.is_irc() {
+            return;
+        }
         self.input_set(text);
         self.point = Pos::new(self.last_row(), self.prompt_len + text.chars().count());
     }
@@ -249,16 +294,15 @@ impl Buffer {
     // ---- read-only queries -------------------------------------------------
 
     pub fn editable(&self) -> bool {
+        if !self.is_irc() {
+            return true;
+        }
         self.point.row == self.last_row() && self.point.col >= self.prompt_len
     }
 
     fn clamp_col(&self, row: usize, col: usize) -> usize {
         let len = self.lines[row].char_len();
-        let mut col = col.min(len);
-        if row == self.last_row() {
-            col = col.max(self.prompt_len);
-        }
-        col
+        col.min(len).max(self.min_col(row))
     }
 
     // ---- motion ------------------------------------------------------------
@@ -279,11 +323,7 @@ impl Buffer {
         let row = self.point.row;
         if self.point.col > 0 {
             self.point.col -= 1;
-            let min = if row == self.last_row() {
-                self.prompt_len
-            } else {
-                0
-            };
+            let min = self.min_col(row);
             if self.point.col < min {
                 self.point.col = min;
             }
@@ -311,11 +351,7 @@ impl Buffer {
     }
 
     pub fn beginning_of_line(&mut self) {
-        self.point.col = if self.point.row == self.last_row() {
-            self.prompt_len
-        } else {
-            0
-        };
+        self.point.col = self.min_col(self.point.row);
     }
 
     pub fn end_of_line(&mut self) {
@@ -337,11 +373,7 @@ impl Buffer {
     pub fn forward_word(&mut self) {
         let chars = self.lines[self.point.row].chars();
         let mut col = self.point.col;
-        let min = if self.point.row == self.last_row() {
-            self.prompt_len
-        } else {
-            0
-        };
+        let min = self.min_col(self.point.row);
         if col >= chars.len() {
             self.next_line();
             return;
@@ -358,11 +390,7 @@ impl Buffer {
 
     pub fn backward_word(&mut self) {
         let chars = self.lines[self.point.row].chars();
-        let min = if self.point.row == self.last_row() {
-            self.prompt_len
-        } else {
-            0
-        };
+        let min = self.min_col(self.point.row);
         let mut col = self.point.col;
         while col > min && !is_word(chars[col - 1]) {
             col -= 1;
@@ -430,50 +458,85 @@ impl Buffer {
         out
     }
 
-    // ---- editing (input only) ---------------------------------------------
+    // ---- editing -----------------------------------------------------------
 
     pub fn insert_char(&mut self, c: char) {
         if !self.editable() {
             return;
         }
-        let mut chars: Vec<char> = self.input().chars().collect();
-        let idx = self.point.col - self.prompt_len;
-        chars.insert(idx.min(chars.len()), c);
-        let text: String = chars.into_iter().collect();
-        self.input_set(&text);
-        self.point.col += 1;
+        if self.is_irc() {
+            let mut chars: Vec<char> = self.input().chars().collect();
+            let idx = self.point.col - self.prompt_len;
+            chars.insert(idx.min(chars.len()), c);
+            let text: String = chars.into_iter().collect();
+            self.input_set(&text);
+            self.point.col += 1;
+        } else {
+            let row = self.point.row;
+            let mut chars = self.lines[row].chars();
+            let idx = self.point.col.min(chars.len());
+            chars.insert(idx, c);
+            self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+            self.point.col += 1;
+        }
         self.scroll_into_view();
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        if !self.editable() {
+        for c in s.chars() {
+            if c == '\n' && !self.is_irc() {
+                self.insert_newline();
+            } else {
+                self.insert_char(c);
+            }
+        }
+    }
+
+    /// Insert a line break at point (free text buffers only).
+    pub fn insert_newline(&mut self) {
+        if self.is_irc() {
             return;
         }
-        let mut chars: Vec<char> = self.input().chars().collect();
-        let idx = (self.point.col - self.prompt_len).min(chars.len());
-        let added: Vec<char> = s.chars().collect();
-        let added_len = added.len();
-        for (i, c) in added.into_iter().enumerate() {
-            chars.insert(idx + i, c);
-        }
-        let text: String = chars.into_iter().collect();
-        self.input_set(&text);
-        self.point.col += added_len;
+        let row = self.point.row;
+        let chars = self.lines[row].chars();
+        let idx = self.point.col.min(chars.len());
+        let left: String = chars[..idx].iter().collect();
+        let right: String = chars[idx..].iter().collect();
+        self.lines[row] = Line::plain(left);
+        self.lines.insert(row + 1, Line::plain(right));
+        self.point = Pos::new(row + 1, 0);
         self.scroll_into_view();
     }
 
     pub fn delete_backward(&mut self) {
-        if !self.editable() || self.point.col <= self.prompt_len {
+        if !self.editable() {
             return;
         }
-        let mut chars: Vec<char> = self.input().chars().collect();
-        let idx = self.point.col - self.prompt_len - 1;
-        if idx < chars.len() {
-            chars.remove(idx);
+        if self.is_irc() {
+            if self.point.col > self.prompt_len {
+                let mut chars: Vec<char> = self.input().chars().collect();
+                let idx = self.point.col - self.prompt_len - 1;
+                chars.remove(idx);
+                let text: String = chars.into_iter().collect();
+                self.input_set(&text);
+                self.point.col -= 1;
+            }
+        } else if self.point.col > 0 {
+            let row = self.point.row;
+            let mut chars = self.lines[row].chars();
+            chars.remove(self.point.col - 1);
+            self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+            self.point.col -= 1;
+        } else if self.point.row > 0 {
+            let row = self.point.row;
+            let prev_len = self.lines[row - 1].char_len();
+            let current = self.lines[row].text();
+            let mut prev = self.lines[row - 1].chars();
+            prev.extend(current.chars());
+            self.lines[row - 1] = Line::plain(prev.into_iter().collect::<String>());
+            self.lines.remove(row);
+            self.point = Pos::new(row - 1, prev_len);
         }
-        let text: String = chars.into_iter().collect();
-        self.input_set(&text);
-        self.point.col -= 1;
         self.scroll_into_view();
     }
 
@@ -481,28 +544,55 @@ impl Buffer {
         if !self.editable() {
             return;
         }
-        let mut chars: Vec<char> = self.input().chars().collect();
-        let idx = self.point.col - self.prompt_len;
-        if idx < chars.len() {
-            chars.remove(idx);
+        if self.is_irc() {
+            let mut chars: Vec<char> = self.input().chars().collect();
+            let idx = self.point.col - self.prompt_len;
+            if idx < chars.len() {
+                chars.remove(idx);
+            }
+            let text: String = chars.into_iter().collect();
+            self.input_set(&text);
+        } else {
+            let row = self.point.row;
+            let len = self.lines[row].char_len();
+            if self.point.col < len {
+                let mut chars = self.lines[row].chars();
+                chars.remove(self.point.col);
+                self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+            } else if row + 1 < self.lines.len() {
+                let next = self.lines[row + 1].text();
+                let mut chars = self.lines[row].chars();
+                chars.extend(next.chars());
+                self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+                self.lines.remove(row + 1);
+            }
         }
-        let text: String = chars.into_iter().collect();
-        self.input_set(&text);
         self.scroll_into_view();
     }
 
-    /// Kill from point to end of the input line; returns the killed text.
+    /// Kill from point to end of line; returns the killed text.
     pub fn kill_line(&mut self) -> String {
         if !self.editable() {
             return String::new();
         }
-        let chars: Vec<char> = self.input().chars().collect();
-        let idx = self.point.col - self.prompt_len;
-        let killed: String = chars[idx.min(chars.len())..].iter().collect();
-        let kept: String = chars[..idx.min(chars.len())].iter().collect();
-        self.input_set(&kept);
-        self.scroll_into_view();
-        killed
+        if self.is_irc() {
+            let chars: Vec<char> = self.input().chars().collect();
+            let idx = (self.point.col - self.prompt_len).min(chars.len());
+            let killed: String = chars[idx..].iter().collect();
+            let kept: String = chars[..idx].iter().collect();
+            self.input_set(&kept);
+            self.scroll_into_view();
+            killed
+        } else {
+            let row = self.point.row;
+            let chars = self.lines[row].chars();
+            let idx = self.point.col.min(chars.len());
+            let killed: String = chars[idx..].iter().collect();
+            let kept: String = chars[..idx].iter().collect();
+            self.lines[row] = Line::plain(kept);
+            self.scroll_into_view();
+            killed
+        }
     }
 
     // ---- search ------------------------------------------------------------
@@ -690,5 +780,58 @@ mod tests {
         let killed = b.kill_line();
         assert_eq!(killed, " world");
         assert_eq!(b.input(), "hello");
+    }
+
+    #[test]
+    fn text_buffer_is_editable_everywhere() {
+        let mut b = Buffer::text();
+        assert!(!b.is_irc());
+        assert!(b.editable());
+        for c in "hello".chars() {
+            b.insert_char(c);
+        }
+        assert_eq!(b.line(0).text(), "hello");
+        b.insert_newline();
+        b.insert_char('x');
+        assert_eq!(b.line(1).text(), "x");
+        assert_eq!(b.len(), 2);
+        // point may sit anywhere
+        b.set_point(Pos::new(0, 2));
+        assert!(b.editable());
+    }
+
+    #[test]
+    fn text_backspace_joins_lines() {
+        let mut b = Buffer::text();
+        b.insert_char('a');
+        b.insert_newline();
+        b.insert_char('b');
+        b.delete_backward();
+        assert_eq!(b.line(1).text(), "");
+        b.delete_backward();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.line(0).text(), "a");
+        assert_eq!(b.point(), Pos::new(0, 1));
+    }
+
+    #[test]
+    fn text_forward_delete_joins_lines() {
+        let mut b = Buffer::text();
+        b.insert_char('a');
+        b.insert_newline();
+        b.insert_char('b');
+        b.set_point(Pos::new(0, 1));
+        b.delete_forward();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.line(0).text(), "ab");
+    }
+
+    #[test]
+    fn text_insert_str_with_newlines() {
+        let mut b = Buffer::text();
+        b.insert_str("a\nb");
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.line(0).text(), "a");
+        assert_eq!(b.line(1).text(), "b");
     }
 }

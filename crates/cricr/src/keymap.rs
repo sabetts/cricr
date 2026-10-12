@@ -32,7 +32,6 @@ pub enum Action {
     Complete,
     SearchForward,
     SearchBackward,
-    SwitchBuffer,
     QuotedInsert,
     Abort,
 }
@@ -87,7 +86,6 @@ pub fn translate(key: KeyEvent) -> Action {
         KeyCode::End => EndOfLine,
         KeyCode::PageUp => PageUp,
         KeyCode::PageDown => PageDown,
-        KeyCode::F(9) => SwitchBuffer,
         _ => None,
     }
 }

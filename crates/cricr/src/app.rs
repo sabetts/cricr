@@ -24,11 +24,19 @@ pub enum Kind {
     Server,
     Channel,
     Query,
+    /// A free text buffer (no prompt), like Emacs's `*scratch*`.
+    Scratch,
+}
+
+/// The minibuffer prompt, if one is active.
+#[derive(Debug, Clone)]
+pub enum Prompt {
+    None,
+    SwitchBuffer { input: String },
 }
 
 /// One connection's shared state.
 pub struct ServerState {
-    pub name: String,
     pub handle: ClientHandle,
     pub our_nick: String,
     pub connected: bool,
@@ -43,6 +51,8 @@ pub struct Chan {
     pub buffer: Buffer,
     pub nicks: Vec<String>,
     pub unread: usize,
+    /// Monotonic stamp of the most recent activity, for mode-line ordering.
+    pub last_activity: u64,
     pub topic: Option<String>,
 }
 
@@ -79,17 +89,19 @@ pub struct App {
     pub search: Search,
     pub message: Option<String>,
     pub kill_ring: String,
-    pub sidebar: bool,
     pub scrollback: usize,
     pub should_quit: bool,
+    pub prompt: Prompt,
+    previous: usize,
+    activity_seq: u64,
     ctrl_x: bool,
+    ctrl_c: bool,
     quoted: bool,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
 }
 
 impl App {
     pub fn new(config: Config, event_tx: mpsc::UnboundedSender<(usize, Event)>) -> Self {
-        let sidebar = config.ui.sidebar;
         let scrollback = config.ui.scrollback_lines;
         let mut app = App {
             config,
@@ -100,25 +112,22 @@ impl App {
             search: Search::default(),
             message: None,
             kill_ring: String::new(),
-            sidebar,
             scrollback,
             should_quit: false,
+            prompt: Prompt::None,
+            previous: 0,
+            activity_seq: 0,
             ctrl_x: false,
+            ctrl_c: false,
             quoted: false,
             event_tx,
         };
         app.connect_all();
-        if app.buffers.is_empty() {
-            app.buffers.push(Chan {
-                server: 0,
-                target: "*cricr*".to_string(),
-                kind: Kind::Server,
-                buffer: Buffer::new("> "),
-                nicks: Vec::new(),
-                unread: 0,
-                topic: None,
-            });
-        }
+        // Emacs always has a *scratch* buffer; start there unless a server
+        // buffer exists so connection output is visible immediately.
+        let scratch = app.new_buffer(0, "*scratch*".to_string(), Kind::Scratch);
+        app.current = app.servers.first().map(|s| s.buffer).unwrap_or(scratch);
+        app.previous = scratch;
         app
     }
 
@@ -131,7 +140,6 @@ impl App {
                     let index = self.servers.len();
                     let buf = self.new_buffer(index, server.name.clone(), Kind::Server);
                     self.servers.push(ServerState {
-                        name: server.name.clone(),
                         handle,
                         our_nick: server
                             .nick
@@ -164,13 +172,19 @@ impl App {
     }
 
     fn new_buffer(&mut self, server: usize, target: String, kind: Kind) -> usize {
+        let buffer = if kind == Kind::Scratch {
+            Buffer::text()
+        } else {
+            Buffer::new("> ")
+        };
         self.buffers.push(Chan {
             server,
             target,
             kind,
-            buffer: Buffer::new("> "),
+            buffer,
             nicks: Vec::new(),
             unread: 0,
+            last_activity: 0,
             topic: None,
         });
         self.buffers.len() - 1
@@ -219,38 +233,85 @@ impl App {
     }
 
     fn bump_activity(&mut self, buf: usize) {
-        let current = self.current;
-        if buf != current {
+        if buf != self.current && self.buffers[buf].kind != Kind::Scratch {
+            self.activity_seq += 1;
             self.buffers[buf].unread += 1;
+            self.buffers[buf].last_activity = self.activity_seq;
         }
     }
 
     fn switch_to(&mut self, idx: usize) {
-        if idx < self.buffers.len() {
-            self.current = idx;
-            self.buffers[idx].unread = 0;
-            self.buffers[idx].buffer.end_of_buffer();
-        }
-    }
-
-    fn next_buffer(&mut self) {
-        if self.buffers.is_empty() {
+        if idx >= self.buffers.len() {
             return;
         }
-        let n = self.buffers.len();
-        self.switch_to((self.current + 1) % n);
+        if idx != self.current {
+            self.previous = self.current;
+        }
+        self.current = idx;
+        self.buffers[idx].unread = 0;
+        self.buffers[idx].buffer.end_of_buffer();
     }
 
-    fn next_unread(&mut self) {
-        let n = self.buffers.len();
-        for step in 1..=n {
-            let i = (self.current + step) % n;
-            if self.buffers[i].unread > 0 {
-                self.switch_to(i);
-                return;
+    fn scratch_index(&self) -> Option<usize> {
+        self.buffers.iter().position(|b| b.kind == Kind::Scratch)
+    }
+
+    /// Switch to the buffer with the most recent activity, or to `*scratch*`
+    /// when nothing has activity (mirrors `rcirc-next-active-buffer`).
+    fn next_active(&mut self) {
+        let target = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| *i != self.current && b.unread > 0)
+            .max_by_key(|(_, b)| b.last_activity)
+            .map(|(i, _)| i);
+        match target {
+            Some(i) => self.switch_to(i),
+            None => {
+                if let Some(s) = self.scratch_index() {
+                    self.switch_to(s);
+                }
             }
         }
-        self.next_buffer();
+    }
+
+    /// Targets with pending activity, most recent first.
+    pub fn activity_targets(&self) -> Vec<String> {
+        let mut active: Vec<&Chan> = self.buffers.iter().filter(|b| b.unread > 0).collect();
+        active.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
+        active.into_iter().map(|c| c.target.clone()).collect()
+    }
+
+    /// The `rcirc-activity-string`-style mode-line indicator.
+    pub fn activity_string(&self) -> String {
+        let targets = self.activity_targets();
+        if targets.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", targets.join(","))
+        }
+    }
+
+    /// The name of the previously-current buffer (the `C-x b` default).
+    pub fn previous_buffer_name(&self) -> String {
+        self.buffers
+            .get(self.previous)
+            .map(|b| b.target.clone())
+            .unwrap_or_default()
+    }
+
+    /// The buffer name shown in the mode line.
+    pub fn mode_line_name(&self) -> String {
+        self.current().target.clone()
+    }
+
+    /// The major-mode indicator shown in the mode line.
+    pub fn mode_line_mode(&self) -> &'static str {
+        match self.current().kind {
+            Kind::Scratch => "Fundamental",
+            _ => "rcirc",
+        }
     }
 
     // ---- input -------------------------------------------------------------
@@ -343,7 +404,8 @@ impl App {
     }
 
     fn close_current(&mut self) {
-        if self.buffers.len() <= 1 || self.buffers[self.current].kind == Kind::Server {
+        let kind = self.buffers[self.current].kind;
+        if self.buffers.len() <= 1 || matches!(kind, Kind::Server | Kind::Scratch) {
             self.message = Some("Cannot close this buffer".to_string());
             return;
         }
@@ -351,6 +413,8 @@ impl App {
         if self.current >= self.buffers.len() {
             self.current = self.buffers.len() - 1;
         }
+        let prev = self.previous.min(self.buffers.len() - 1);
+        self.previous = prev;
     }
 
     fn send(&mut self, server: usize, command: ClientCommand) {
@@ -377,6 +441,10 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if !matches!(self.prompt, Prompt::None) {
+            self.handle_prompt_key(key);
+            return;
+        }
         if self.search.active {
             self.handle_search_key(key);
             return;
@@ -394,21 +462,130 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
         if self.ctrl_x {
             self.ctrl_x = false;
             self.message = None;
-            if ctrl && key.code == KeyCode::Char('c') {
-                self.should_quit = true;
-                return;
+            match key.code {
+                KeyCode::Char('c') if ctrl => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('b') if ctrl => {
+                    self.start_switch_buffer();
+                    return;
+                }
+                _ => {}
             }
         } else if ctrl && key.code == KeyCode::Char('x') {
             self.ctrl_x = true;
             self.message = Some("C-x-".to_string());
             return;
         }
+
+        if self.ctrl_c {
+            self.ctrl_c = false;
+            self.message = None;
+            if ctrl
+                && matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0')
+                )
+            {
+                self.next_active();
+                return;
+            }
+        } else if ctrl && key.code == KeyCode::Char('c') {
+            self.ctrl_c = true;
+            self.message = Some("C-c-".to_string());
+            return;
+        }
+
         self.message = None;
         let action = keymap::translate(key);
         self.perform(action);
+    }
+
+    fn start_switch_buffer(&mut self) {
+        self.prompt = Prompt::SwitchBuffer {
+            input: String::new(),
+        };
+    }
+
+    fn handle_prompt_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
+            KeyCode::Esc => self.prompt = Prompt::None,
+            KeyCode::Enter => self.commit_switch_buffer(),
+            KeyCode::Tab => self.complete_prompt(),
+            KeyCode::Backspace => {
+                if let Prompt::SwitchBuffer { input } = &mut self.prompt {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Prompt::SwitchBuffer { input } = &mut self.prompt {
+                    input.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_switch_buffer(&mut self) {
+        let input = match std::mem::replace(&mut self.prompt, Prompt::None) {
+            Prompt::SwitchBuffer { input } => input,
+            Prompt::None => return,
+        };
+        let name = input.trim();
+        if name.is_empty() {
+            let prev = self.previous;
+            if prev < self.buffers.len() {
+                self.switch_to(prev);
+            }
+            return;
+        }
+        let exact = self.buffers.iter().position(|b| b.target == name);
+        let candidate = exact.or_else(|| {
+            let matches: Vec<usize> = self
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.target.starts_with(name))
+                .map(|(i, _)| i)
+                .collect();
+            (matches.len() == 1).then(|| matches[0])
+        });
+        match candidate {
+            Some(i) => self.switch_to(i),
+            None => self.message = Some(format!("No such buffer: {name}")),
+        }
+    }
+
+    fn complete_prompt(&mut self) {
+        let input = match &self.prompt {
+            Prompt::SwitchBuffer { input } => input.clone(),
+            Prompt::None => return,
+        };
+        let candidates: Vec<String> = self
+            .buffers
+            .iter()
+            .map(|b| b.target.clone())
+            .filter(|t| t.starts_with(&input))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let completion = if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            common_prefix(&candidates)
+        };
+        if let Prompt::SwitchBuffer { input } = &mut self.prompt {
+            *input = completion;
+        }
     }
 
     fn perform(&mut self, action: Action) {
@@ -416,7 +593,13 @@ impl App {
         match action {
             None => {}
             SelfInsert(c) => self.current_mut().buffer.insert_char(c),
-            Send => self.submit_input(),
+            Send => {
+                if self.current().kind == Kind::Scratch {
+                    self.current_mut().buffer.insert_newline();
+                } else {
+                    self.submit_input();
+                }
+            }
             ForwardChar => self.current_mut().buffer.forward_char(),
             BackwardChar => self.current_mut().buffer.backward_char(),
             NextLine => self.current_mut().buffer.next_line(),
@@ -448,10 +631,15 @@ impl App {
             }
             HistoryPrev => self.history_prev(),
             HistoryNext => self.history_next(),
-            Complete => self.complete(),
+            Complete => {
+                if self.current().kind == Kind::Scratch {
+                    self.current_mut().buffer.insert_str("    ");
+                } else {
+                    self.complete();
+                }
+            }
             SearchForward => self.start_search(SearchDirection::Forward),
             SearchBackward => self.start_search(SearchDirection::Backward),
-            SwitchBuffer => self.next_unread(),
             QuotedInsert => {
                 self.quoted = true;
                 self.message = Some("C-q-".to_string());
@@ -1123,5 +1311,51 @@ mod tests {
     fn action_parsing() {
         assert_eq!(action_body("\u{1}ACTION waves\u{1}"), Some("waves"));
         assert_eq!(action_body("hello"), None);
+    }
+
+    fn app_without_servers() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(Config::default(), tx)
+    }
+
+    #[test]
+    fn activity_string_is_most_recent_first() {
+        let mut app = app_without_servers();
+        assert_eq!(app.mode_line_mode(), "Fundamental");
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Query);
+        app.bump_activity(a);
+        app.bump_activity(b);
+        assert_eq!(app.activity_string(), "[#b,#a]");
+        app.switch_to(a);
+        assert_eq!(app.activity_string(), "[#b]");
+    }
+
+    #[test]
+    fn next_active_prefers_most_recent_then_scratch() {
+        let mut app = app_without_servers();
+        let scratch = app.current;
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        app.bump_activity(a);
+        app.bump_activity(b);
+        app.next_active();
+        assert_eq!(app.current, b, "should jump to the most recent activity");
+        app.next_active();
+        assert_eq!(app.current, a, "then the next-most-recent");
+        app.next_active();
+        assert_eq!(app.current, scratch, "no activity left -> *scratch*");
+    }
+
+    #[test]
+    fn switch_buffer_prompt_resolves_names() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.prompt = Prompt::SwitchBuffer {
+            input: "#a".to_string(),
+        };
+        app.commit_switch_buffer();
+        assert_eq!(app.current, a);
+        assert!(matches!(app.prompt, Prompt::None));
     }
 }
