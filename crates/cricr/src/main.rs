@@ -73,5 +73,15 @@ async fn run_app(
         }
     });
 
+    // On terminals that still deliver Ctrl+C as SIGINT, swallow it so it can
+    // never terminate the app (quit with C-x C-c or /quit instead).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigint) = signal(SignalKind::interrupt()) {
+            tokio::spawn(async move { while sigint.recv().await.is_some() {} });
+        }
+    }
+
     app.run(terminal, net_rx, term_rx).await
 }

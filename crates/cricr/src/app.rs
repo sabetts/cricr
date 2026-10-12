@@ -518,43 +518,37 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        if self.ctrl_x {
-            self.ctrl_x = false;
+        // A pending `C-x` / `C-c` prefix always consumes the next key.
+        if self.ctrl_x || self.ctrl_c {
+            let x = std::mem::take(&mut self.ctrl_x);
+            let c = std::mem::take(&mut self.ctrl_c);
             self.message = None;
             match key.code {
-                KeyCode::Char('c') if ctrl => {
-                    self.should_quit = true;
-                    return;
+                // C-x C-c: quit.
+                KeyCode::Char('c') if x && ctrl => self.should_quit = true,
+                // C-x b: switch buffer (the second key is a plain `b`).
+                KeyCode::Char('b') if x => self.start_switch_buffer(),
+                // C-c C-b: browse a URL found in the buffer.
+                KeyCode::Char('b') if c && ctrl => self.start_browse_url(),
+                // C-c C-SPC / C-c C-@: next buffer with activity.
+                KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if c => {
+                    self.next_active()
                 }
-                KeyCode::Char('b') if ctrl => {
-                    self.start_switch_buffer();
-                    return;
-                }
+                // C-g / Esc aborts an incomplete prefix.
+                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Esc => {}
+                // Any other key after a prefix is undefined but harmless.
                 _ => {}
             }
-        } else if ctrl && key.code == KeyCode::Char('x') {
+            return;
+        }
+
+        if ctrl && key.code == KeyCode::Char('x') {
             self.ctrl_x = true;
             self.message = Some("C-x-".to_string());
             return;
         }
-
-        if self.ctrl_c {
-            self.ctrl_c = false;
-            self.message = None;
-            if ctrl {
-                match key.code {
-                    KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => {
-                        self.next_active();
-                        return;
-                    }
-                    KeyCode::Char('b') => {
-                        self.start_browse_url();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        } else if ctrl && key.code == KeyCode::Char('c') {
+        if ctrl && key.code == KeyCode::Char('c') {
             self.ctrl_c = true;
             self.message = Some("C-c-".to_string());
             return;
@@ -691,6 +685,7 @@ impl App {
         };
         match key.code {
             KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
+            KeyCode::Char('c') if ctrl => self.prompt = Prompt::None,
             KeyCode::Esc => self.prompt = Prompt::None,
             KeyCode::Enter => self.commit_prompt(),
             KeyCode::Tab => self.prompt_complete(),
@@ -1663,6 +1658,51 @@ mod tests {
     fn common_prefix_works() {
         let items = vec!["hello".to_string(), "help".to_string(), "helm".to_string()];
         assert_eq!(common_prefix(&items), "hel");
+    }
+
+    fn press(app: &mut App, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) {
+        app.handle_key(crossterm::event::KeyEvent::new(code, mods));
+    }
+
+    #[test]
+    fn cx_b_opens_switch_prompt() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(matches!(app.prompt, Prompt::SwitchBuffer { .. }));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn cc_cb_twice_does_not_quit() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prompt, Prompt::BrowseUrl { .. }));
+        // A second C-c cancels the prompt; the following key does nothing odd.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prompt, Prompt::None));
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(!app.should_quit, "C-c C-b twice must not quit");
+    }
+
+    #[test]
+    fn only_cx_cc_quits() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        for a in ['c', 'x', 'g', 'b', 'n', 'p'] {
+            for b in ['c', 'x', 'g', 'b', ' ', '@'] {
+                let mut app = app_without_servers();
+                press(&mut app, KeyCode::Char(a), KeyModifiers::CONTROL);
+                press(&mut app, KeyCode::Char(b), KeyModifiers::CONTROL);
+                if a == 'x' && b == 'c' {
+                    assert!(app.should_quit, "C-x C-c should quit");
+                } else {
+                    assert!(!app.should_quit, "C-{a} C-{b} must not quit");
+                }
+            }
+        }
     }
 
     #[test]
