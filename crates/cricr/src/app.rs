@@ -123,6 +123,7 @@ pub struct App {
     pub message: Option<String>,
     pub kill_ring: String,
     pub scrollback: usize,
+    pub fill_column: usize,
     pub theme: Theme,
     pub should_quit: bool,
     pub prompt: Prompt,
@@ -131,12 +132,15 @@ pub struct App {
     visit_seq: u64,
     prefix: Prefix,
     quoted: bool,
+    /// Row of the first line inserted by the most recent `push_line`.
+    last_push_row: usize,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
 }
 
 impl App {
     pub fn new(config: Config, event_tx: mpsc::UnboundedSender<(usize, Event)>) -> Self {
         let scrollback = config.ui.scrollback_lines;
+        let fill_column = config.ui.fill_column;
         let theme = Theme::for_background(config.ui.background);
         let mut app = App {
             config,
@@ -148,6 +152,7 @@ impl App {
             message: None,
             kill_ring: String::new(),
             scrollback,
+            fill_column,
             theme,
             should_quit: false,
             prompt: Prompt::None,
@@ -156,6 +161,7 @@ impl App {
             visit_seq: 0,
             prefix: Prefix::None,
             quoted: false,
+            last_push_row: 0,
             event_tx,
         };
         app.connect_all();
@@ -258,7 +264,10 @@ impl App {
     }
 
     fn push_line(&mut self, buf: usize, line: Line) {
-        self.buffers[buf].buffer.push_line(line);
+        self.last_push_row = self.buffers[buf].buffer.len().saturating_sub(1);
+        for wrapped in line.wrap(self.fill_column) {
+            self.buffers[buf].buffer.push_line(wrapped);
+        }
         self.trim_scrollback(buf);
     }
 
@@ -282,9 +291,8 @@ impl App {
             self.buffers[buf].unread += 1;
             self.buffers[buf].last_activity = self.activity_seq;
             if self.buffers[buf].first_unread.is_none() {
-                // The line just added sits just above the prompt line.
-                self.buffers[buf].first_unread =
-                    Some(self.buffers[buf].buffer.len().saturating_sub(2));
+                // The first line of the message just added.
+                self.buffers[buf].first_unread = Some(self.last_push_row);
             }
             if mentioned {
                 self.buffers[buf].mentioned = true;
@@ -1364,13 +1372,14 @@ impl App {
                 span.style = span.style.bold();
             }
         }
+        let indent = 6 + nick.chars().count() + 3;
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(format!("<{nick}>"), nstyle),
             Span::new(" ".to_string(), Style::default()),
         ];
         spans.extend(body);
-        Line::from_spans(spans)
+        Line::from_spans(spans).indented(indent)
     }
 
     fn action_line(
@@ -1391,9 +1400,10 @@ impl App {
             Span::new(nick.to_string(), nstyle),
             Span::new(" ".to_string(), Style::default()),
         ];
+        let indent = 6 + nick.chars().count() + 2;
         spans.extend(body);
         spans.push(Span::new("]".to_string(), Style::default()));
-        Line::from_spans(spans)
+        Line::from_spans(spans).indented(indent)
     }
 
     fn notice_line(
@@ -1408,6 +1418,7 @@ impl App {
         let prefix = self.time_prefix(buf, &ts);
         let nstyle = self.nick_style(server, nick);
         let (body, _) = self.message_spans(server, text);
+        let indent = 6 + nick.chars().count() + 3;
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new("-".to_string(), nstyle),
@@ -1415,7 +1426,7 @@ impl App {
             Span::new("- ".to_string(), nstyle),
         ];
         spans.extend(body);
-        Line::from_spans(spans)
+        Line::from_spans(spans).indented(indent)
     }
 
     /// A server/event line in rcirc's default format: `*** [sender] RESPONSE
@@ -1429,23 +1440,26 @@ impl App {
     ) -> Line {
         let ts = now_hhmm();
         let prefix = self.time_prefix(buf, &ts);
-        let mut body = String::from("***");
+        let mut head = String::from("***");
         if let Some(sender) = sender {
-            body.push(' ');
-            body.push_str(sender);
+            head.push(' ');
+            head.push_str(sender);
         }
         if !response.is_empty() {
-            body.push(' ');
-            body.push_str(response);
+            head.push(' ');
+            head.push_str(response);
         }
-        if !text.is_empty() {
-            body.push(' ');
-            body.push_str(text);
-        }
+        let indent = 6 + head.chars().count() + usize::from(!text.is_empty());
+        let body = if text.is_empty() {
+            head
+        } else {
+            format!("{head} {text}")
+        };
         Line::from_spans(vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(body, self.theme.server),
         ])
+        .indented(indent)
     }
 
     /// A connection/system message (`*** text`).
@@ -2005,6 +2019,19 @@ mod tests {
         match &app.prompt {
             Prompt::Topic { input } => assert_eq!(input, "hello world"),
             other => panic!("expected Topic prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_messages_wrap_on_push() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.fill_column = 20;
+        let before = app.buffers[ch].buffer.len();
+        app.push_line(ch, Line::plain("x".repeat(100)));
+        assert!(app.buffers[ch].buffer.len() > before + 1);
+        for row in 0..app.buffers[ch].buffer.len() {
+            assert!(app.buffers[ch].buffer.line(row).char_len() <= 20);
         }
     }
 

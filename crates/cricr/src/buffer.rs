@@ -104,23 +104,34 @@ impl Span {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Line {
     pub spans: Vec<Span>,
+    /// When wrapping, continuation lines are indented by this many columns
+    /// (the width of the line's prefix, e.g. timestamp + `<nick> `).
+    pub indent: usize,
 }
 
 impl Line {
     pub fn plain(text: impl Into<String>) -> Self {
         Line {
             spans: vec![Span::new(text, Style::default())],
+            indent: 0,
         }
     }
 
     pub fn styled(text: impl Into<String>, style: Style) -> Self {
         Line {
             spans: vec![Span::new(text, style)],
+            indent: 0,
         }
     }
 
     pub fn from_spans(spans: Vec<Span>) -> Self {
-        Line { spans }
+        Line { spans, indent: 0 }
+    }
+
+    /// Set the continuation indent used when wrapping.
+    pub fn indented(mut self, indent: usize) -> Self {
+        self.indent = indent;
+        self
     }
 
     pub fn text(&self) -> String {
@@ -138,6 +149,87 @@ impl Line {
     pub fn char_len(&self) -> usize {
         self.spans.iter().map(|s| s.text.chars().count()).sum()
     }
+
+    /// Word-wrap this line to `width` columns. Continuation lines are indented
+    /// by `self.indent`. Returns the original line unchanged if it fits.
+    pub fn wrap(&self, width: usize) -> Vec<Line> {
+        if width == 0 {
+            return vec![self.clone()];
+        }
+        let cells: Vec<(char, Style)> = self
+            .spans
+            .iter()
+            .flat_map(|s| s.text.chars().map(move |c| (c, s.style)))
+            .collect();
+        if cells.len() <= width {
+            return vec![self.clone()];
+        }
+
+        let indent = self.indent.min(width.saturating_sub(1));
+        let mut chunks: Vec<&[(char, Style)]> = Vec::new();
+        let mut start = 0;
+        let mut limit = width;
+        // On the first line, never break inside the prefix (columns < indent).
+        let mut min_break = indent;
+        while start < cells.len() {
+            if cells.len() - start <= limit {
+                chunks.push(&cells[start..]);
+                break;
+            }
+            let window_end = start + limit;
+            // `brk` is the index just past the last space within the window.
+            let brk = (start + 1..=window_end)
+                .rev()
+                .find(|&i| cells[i - 1].0 == ' ' && i > min_break);
+            let end = brk.map_or(window_end, |i| i - 1);
+            chunks.push(&cells[start..end]);
+            start = brk.unwrap_or(window_end);
+            limit = width.saturating_sub(indent);
+            min_break = 0;
+        }
+
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut line = cells_to_line(chunk);
+                if i > 0 && indent > 0 {
+                    let mut spans = vec![Span::new(" ".repeat(indent), Style::default())];
+                    spans.append(&mut line.spans);
+                    line = Line::from_spans(spans);
+                }
+                line
+            })
+            .collect()
+    }
+}
+
+fn cells_to_line(cells: &[(char, Style)]) -> Line {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_style: Option<Style> = None;
+    for (ch, style) in cells {
+        match cur_style {
+            Some(s) if s == *style => cur.push(*ch),
+            Some(_) => {
+                if !cur.is_empty() {
+                    spans.push(Span::new(std::mem::take(&mut cur), cur_style.unwrap()));
+                }
+                cur.push(*ch);
+                cur_style = Some(*style);
+            }
+            None => {
+                cur.push(*ch);
+                cur_style = Some(*style);
+            }
+        }
+    }
+    if let Some(style) = cur_style {
+        if !cur.is_empty() {
+            spans.push(Span::new(cur, style));
+        }
+    }
+    Line::from_spans(spans)
 }
 
 /// The buffer model: scrollback lines plus a prompt line holding the input.
@@ -843,6 +935,49 @@ mod tests {
         b.delete_forward();
         assert_eq!(b.len(), 1);
         assert_eq!(b.line(0).text(), "ab");
+    }
+
+    #[test]
+    fn short_line_is_not_wrapped() {
+        let line = Line::plain("hello");
+        assert_eq!(line.wrap(70).len(), 1);
+    }
+
+    #[test]
+    fn wraps_long_line_at_width() {
+        let line = Line::plain("a".repeat(80)).indented(4);
+        let wrapped = line.wrap(40);
+        assert!(wrapped.len() >= 2);
+        for l in &wrapped {
+            assert!(l.char_len() <= 40, "line too long: {}", l.char_len());
+        }
+        // continuation lines carry the indent
+        assert!(wrapped[1].text().starts_with("    "));
+    }
+
+    #[test]
+    fn wraps_on_word_boundaries() {
+        let line = Line::plain("word ".repeat(20).trim_end());
+        let wrapped = line.wrap(30);
+        assert!(wrapped.len() > 1);
+        for l in &wrapped {
+            assert!(l.char_len() <= 30);
+            assert!(!l.text().starts_with(' '));
+            assert!(!l.text().ends_with(' '));
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_styles() {
+        let line = Line::from_spans(vec![
+            Span::new("nick: ", Style::rgb(1, 2, 3)),
+            Span::new("y".repeat(80), Style::default()),
+        ])
+        .indented(6);
+        let wrapped = line.wrap(40);
+        assert!(wrapped[0].text().starts_with("nick: "));
+        assert_eq!(wrapped[0].spans[0].style, Style::rgb(1, 2, 3));
+        assert!(wrapped[1].text().starts_with("      "));
     }
 
     #[test]

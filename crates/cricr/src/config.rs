@@ -83,6 +83,8 @@ pub struct SaslConfig {
 pub struct UiConfig {
     pub timestamp_format: String,
     pub scrollback_lines: usize,
+    /// Word-wrap messages at this many columns (0 disables wrapping).
+    pub fill_column: usize,
     /// Which rcirc face variant to use: `"dark"` (default) or `"light"`.
     pub background: Background,
 }
@@ -92,6 +94,7 @@ impl Default for UiConfig {
         UiConfig {
             timestamp_format: "%H:%M".to_string(),
             scrollback_lines: 100_000,
+            fill_column: 70,
             background: Background::Dark,
         }
     }
@@ -110,6 +113,7 @@ tls = true
 [ui]
 timestamp_format = "%H:%M"
 scrollback_lines = 100000
+fill_column = 70      # word-wrap messages at this column (0 = off)
 background = "dark"   # or "light"
 
 [[servers]]
@@ -243,6 +247,7 @@ mod tests {
         assert_eq!(cfg.servers[0].name, "irc.libera.chat");
         assert_eq!(cfg.servers[0].channels, vec!["#emacs", "#rcirc"]);
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
+        assert_eq!(cfg.ui.fill_column, 70);
         assert_eq!(cfg.ui.background, Background::Dark);
     }
 
