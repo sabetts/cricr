@@ -1810,16 +1810,57 @@ impl App {
             tokio::select! {
                 Some((server, event)) = net_rx.recv() => {
                     self.handle_event(server, event);
+                    // Batch a burst of server output into a single redraw.
+                    while let Ok((server, event)) = net_rx.try_recv() {
+                        self.handle_event(server, event);
+                    }
                 }
                 Some(term_event) = term_rx.recv() => {
-                    if let TermEvent::Key(key) = term_event {
-                        self.handle_key(key);
+                    self.handle_term(term_event);
+                    // Batch a burst of input (e.g. a paste) into one redraw.
+                    while let Ok(event) = term_rx.try_recv() {
+                        self.handle_term(event);
                     }
                 }
                 else => break,
             }
         }
         Ok(())
+    }
+
+    fn handle_term(&mut self, event: TermEvent) {
+        match event {
+            TermEvent::Key(key) => self.handle_key(key),
+            TermEvent::Paste(text) => self.handle_paste(text),
+            _ => {}
+        }
+    }
+
+    /// Insert pasted text. In an rcirc buffer newlines become spaces (the input
+    /// is a single line); the scratch buffer keeps them.
+    fn handle_paste(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if !matches!(self.prompt, Prompt::None) {
+            for ch in text.chars() {
+                if ch != '\r' && ch != '\n' {
+                    self.prompt_push(ch);
+                }
+            }
+            return;
+        }
+        let i = self.current;
+        if self.buffers[i].buffer.is_irc() {
+            let cleaned: String = text
+                .chars()
+                .filter(|c| *c != '\r')
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .collect();
+            self.buffers[i].buffer.insert_str(&cleaned);
+        } else {
+            self.buffers[i].buffer.insert_str(&text);
+        }
     }
 }
 
@@ -2075,6 +2116,23 @@ mod tests {
             Prompt::Topic { input } => assert_eq!(input, "hello world"),
             other => panic!("expected Topic prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paste_folds_newlines_into_irc_input() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.handle_paste("hello\r\nworld".to_string());
+        assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[test]
+    fn paste_into_scratch_keeps_newlines() {
+        let mut app = app_without_servers();
+        app.handle_paste("a\nb".to_string());
+        assert_eq!(app.current().buffer.line(0).text(), "a");
+        assert_eq!(app.current().buffer.line(1).text(), "b");
     }
 
     #[test]
