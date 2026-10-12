@@ -106,10 +106,18 @@ pub fn parse(input: &str, current_target: Option<&str>) -> ParsedInput {
         "quit" => ParsedInput::Send(ClientCommand::Quit {
             reason: (!args.is_empty()).then(|| args.to_string()),
         }),
-        "topic" => ParsedInput::Send(ClientCommand::Topic {
-            channel: target.to_string(),
-            topic: (!args.is_empty()).then(|| args.to_string()),
-        }),
+        "topic" => {
+            // `/topic #chan text` targets CHAN; otherwise the current channel.
+            let (channel, text) = if is_channel(first) && !remainder.is_empty() {
+                (first.to_string(), remainder.to_string())
+            } else {
+                (target.to_string(), args.to_string())
+            };
+            ParsedInput::Send(ClientCommand::Topic {
+                channel,
+                topic: (!text.is_empty()).then_some(text),
+            })
+        }
         "mode" if !first.is_empty() => ParsedInput::Send(ClientCommand::Mode {
             target: first.to_string(),
             modes: remainder.to_string(),
@@ -160,6 +168,13 @@ pub fn parse(input: &str, current_target: Option<&str>) -> ParsedInput {
             command: other.to_string(),
         },
     }
+}
+
+fn is_channel(s: &str) -> bool {
+    matches!(
+        s.chars().next(),
+        Some('#') | Some('&') | Some('!') | Some('+')
+    )
 }
 
 fn split_first(s: &str) -> (&str, &str) {
@@ -213,6 +228,31 @@ mod tests {
             ParsedInput::Send(ClientCommand::Join {
                 channel: "#c".into(),
                 keys: None
+            })
+        );
+    }
+
+    #[test]
+    fn topic_command() {
+        assert_eq!(
+            parse("/topic hello world", Some("#c")),
+            ParsedInput::Send(ClientCommand::Topic {
+                channel: "#c".into(),
+                topic: Some("hello world".into())
+            })
+        );
+        assert_eq!(
+            parse("/topic", Some("#c")),
+            ParsedInput::Send(ClientCommand::Topic {
+                channel: "#c".into(),
+                topic: None
+            })
+        );
+        assert_eq!(
+            parse("/topic #other hi there", Some("#c")),
+            ParsedInput::Send(ClientCommand::Topic {
+                channel: "#other".into(),
+                topic: Some("hi there".into())
             })
         );
     }

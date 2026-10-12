@@ -42,9 +42,11 @@ pub enum Prompt {
         input: String,
         selected: usize,
     },
-    /// Set the channel topic, prefilled with the current one (`C-c C-t`).
+    /// Set the channel topic; the current topic is shown as a default
+    /// (`C-c C-t`).
     Topic {
         input: String,
+        default: String,
     },
     /// Kill (and part from) a buffer chosen from a list (`C-x k`).
     KillBuffer {
@@ -920,7 +922,7 @@ impl App {
                 input.push(c);
                 *selected = 0;
             }
-            Prompt::Topic { input } => input.push(c),
+            Prompt::Topic { input, .. } => input.push(c),
             Prompt::None => {}
         }
     }
@@ -933,7 +935,7 @@ impl App {
                 input.pop();
                 *selected = 0;
             }
-            Prompt::Topic { input } => {
+            Prompt::Topic { input, .. } => {
                 input.pop();
             }
             Prompt::None => {}
@@ -1038,7 +1040,7 @@ impl App {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
             }
-            Prompt::Topic { input } => {
+            Prompt::Topic { input, default } => {
                 let (server, kind, target) = {
                     let c = self.current();
                     (c.server, c.kind, c.target.clone())
@@ -1047,9 +1049,15 @@ impl App {
                     self.message = Some("Not a channel buffer".to_string());
                     return;
                 }
-                let current = self.current().topic.clone();
-                if input.is_empty() {
-                    // No new topic: just query.
+                // Empty input means "keep the default" (the current topic).
+                let text = if input.trim().is_empty() {
+                    default
+                } else {
+                    input
+                };
+                let current = self.current().topic.clone().unwrap_or_default();
+                if text.is_empty() {
+                    // Nothing at all: query the topic.
                     self.send(
                         server,
                         ClientCommand::Topic {
@@ -1057,12 +1065,12 @@ impl App {
                             topic: None,
                         },
                     );
-                } else if Some(input.clone()) != current {
+                } else if text != current {
                     self.send(
                         server,
                         ClientCommand::Topic {
                             channel: target,
-                            topic: Some(input),
+                            topic: Some(text),
                         },
                     );
                 }
@@ -1072,7 +1080,10 @@ impl App {
 
     fn start_topic(&mut self) {
         let topic = self.current().topic.clone().unwrap_or_default();
-        self.prompt = Prompt::Topic { input: topic };
+        self.prompt = Prompt::Topic {
+            input: String::new(),
+            default: topic,
+        };
     }
 
     fn toggle_ignore_activity(&mut self) {
@@ -1137,7 +1148,14 @@ impl App {
                     *selected,
                 ))
             }
-            Prompt::Topic { input } => Some((format!("Topic: {input}"), Vec::new(), 0)),
+            Prompt::Topic { input, default } => {
+                let prompt = if default.is_empty() {
+                    format!("Topic: {input}")
+                } else {
+                    format!("Topic (default {default}): {input}")
+                };
+                Some((prompt, Vec::new(), 0))
+            }
         }
     }
 
@@ -2338,9 +2356,19 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         match &app.prompt {
-            Prompt::Topic { input } => assert_eq!(input, "hello world"),
+            Prompt::Topic { input, default } => {
+                // The current topic is a default, not inserted editable text.
+                assert_eq!(input, "");
+                assert_eq!(default, "hello world");
+            }
             other => panic!("expected Topic prompt, got {other:?}"),
         }
+        // Typing replaces (rather than appends to) the topic.
+        for c in "new topic".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.prompt, Prompt::None));
     }
 
     #[test]
@@ -2388,6 +2416,63 @@ mod tests {
         assert_eq!(app.current().buffer.input(), "hello ");
         app.perform(Action::Yank);
         assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn topic_command_reaches_the_wire() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = BufReader::new(rd);
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                if rd.read_line(&mut buf).await.unwrap() == 0 {
+                    break;
+                }
+                let line = buf.trim_end().to_string();
+                let upper = line.to_ascii_uppercase();
+                if upper.starts_with("CAP LS") {
+                    wr.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+                } else if upper.starts_with("CAP END") {
+                    wr.write_all(b":srv 001 nick :Welcome\r\n").await.unwrap();
+                } else if upper.starts_with("TOPIC ") {
+                    assert!(line.contains("TOPIC #test :hello world"), "got: {line}");
+                    return;
+                }
+            }
+            panic!("no TOPIC seen");
+        });
+
+        let mut cfg = Config::default();
+        cfg.servers.push(crate::config::ServerConfig {
+            name: "127.0.0.1".to_string(),
+            port: Some(addr.port()),
+            tls: Some(false),
+            nick: Some("nick".to_string()),
+            user_name: None,
+            full_name: None,
+            password: None,
+            channels: Vec::new(),
+            sasl: None,
+            cert: None,
+            key: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let ch = app.new_buffer(0, "#test".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("/topic hello world");
+        app.submit_input();
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
     }
 
     #[test]

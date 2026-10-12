@@ -114,3 +114,48 @@ async fn registers_authenticates_and_chats() {
     handle.send(ClientCommand::Disconnect);
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn sends_topic_command() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(read_half);
+        while let Some(line) = read_line(&mut rd).await {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("CAP LS") {
+                wr.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+            } else if upper.starts_with("CAP END") {
+                wr.write_all(b":srv 001 nick :Welcome\r\n").await.unwrap();
+            } else if upper.starts_with("TOPIC ") {
+                assert!(line.contains("TOPIC #test :hello world"), "got: {line}");
+                return;
+            }
+        }
+        panic!("server never saw TOPIC");
+    });
+
+    let (handle, _rx) = spawn(ClientConfig {
+        server: "127.0.0.1".to_string(),
+        port: addr.port(),
+        tls: false,
+        nick: "nick".to_string(),
+        user_name: "u".to_string(),
+        full_name: "n".to_string(),
+        server_password: None,
+        sasl: None,
+        client_cert: None,
+        channels: vec![],
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.send(ClientCommand::Topic {
+        channel: "#test".to_string(),
+        topic: Some("hello world".to_string()),
+    });
+
+    let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+}
