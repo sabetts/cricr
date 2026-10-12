@@ -46,6 +46,11 @@ pub enum Prompt {
     Topic {
         input: String,
     },
+    /// Kill (and part from) a buffer chosen from a list (`C-x k`).
+    KillBuffer {
+        input: String,
+        selected: usize,
+    },
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, or `C-c C-f`).
@@ -547,7 +552,8 @@ impl App {
                 self.servers[server].handle.send(ClientCommand::Disconnect);
             }
             LocalCommand::Close => {
-                self.close_current();
+                let cur = self.current;
+                self.kill_buffer(cur);
             }
             LocalCommand::Switch(name) => {
                 if let Some(i) = self.buffers.iter().position(|b| b.target == name) {
@@ -557,18 +563,46 @@ impl App {
         }
     }
 
-    fn close_current(&mut self) {
-        let kind = self.buffers[self.current].kind;
-        if self.buffers.len() <= 1 || matches!(kind, Kind::Server | Kind::Scratch) {
-            self.message = Some("Cannot close this buffer".to_string());
+    /// Kill a buffer: part from a channel (or close a query), then remove it.
+    fn kill_buffer(&mut self, idx: usize) {
+        if idx >= self.buffers.len() {
             return;
         }
-        self.buffers.remove(self.current);
-        if self.current >= self.buffers.len() {
-            self.current = self.buffers.len() - 1;
+        let kind = self.buffers[idx].kind;
+        let server = self.buffers[idx].server;
+        let target = self.buffers[idx].target.clone();
+        match kind {
+            Kind::Server => {
+                self.message = Some("Cannot kill a server buffer".to_string());
+                return;
+            }
+            Kind::Scratch => {
+                self.message = Some("Cannot kill *scratch*".to_string());
+                return;
+            }
+            Kind::Channel => {
+                self.send(
+                    server,
+                    ClientCommand::Part {
+                        channel: target,
+                        reason: None,
+                    },
+                );
+            }
+            Kind::Query => {}
         }
-        let prev = self.previous.min(self.buffers.len() - 1);
-        self.previous = prev;
+        self.buffers.remove(idx);
+        if self.current > idx {
+            self.current -= 1;
+        } else if self.current == idx {
+            self.current = idx.min(self.buffers.len().saturating_sub(1));
+        }
+        if self.previous >= self.buffers.len() {
+            self.previous = self.buffers.len().saturating_sub(1);
+        }
+        if let Some(chan) = self.buffers.get_mut(self.current) {
+            chan.buffer.end_of_buffer();
+        }
     }
 
     fn send(&mut self, server: usize, command: ClientCommand) {
@@ -654,6 +688,7 @@ impl App {
             Prefix::CtrlX => match key.code {
                 KeyCode::Char('c') if ctrl => self.should_quit = true,
                 KeyCode::Char('b') => self.start_switch_buffer(),
+                KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
             },
@@ -792,16 +827,23 @@ impl App {
         };
     }
 
+    fn start_kill_buffer(&mut self) {
+        self.prompt = Prompt::KillBuffer {
+            input: String::new(),
+            selected: 0,
+        };
+    }
+
     /// Buffers matching `input` (case-insensitive substring), most recently
-    /// visited first, excluding the current buffer.
-    fn switch_candidates(&self, input: &str) -> Vec<usize> {
+    /// visited first. `include_current` keeps the current buffer in the list.
+    fn buffer_candidates(&self, input: &str, include_current: bool) -> Vec<usize> {
         let needle = input.to_lowercase();
         let mut v: Vec<usize> = self
             .buffers
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                *i != self.current
+                (include_current || *i != self.current)
                     && (needle.is_empty() || b.target.to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
@@ -809,6 +851,16 @@ impl App {
         v.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_visited));
         v.truncate(5);
         v
+    }
+
+    /// Buffers matching `input`, excluding the current one (for switching).
+    fn switch_candidates(&self, input: &str) -> Vec<usize> {
+        self.buffer_candidates(input, false)
+    }
+
+    /// Buffers matching `input`, including the current one (for killing).
+    fn kill_candidates(&self, input: &str) -> Vec<usize> {
+        self.buffer_candidates(input, true)
     }
 
     /// URLs in the current buffer matching `input`, most recent first.
@@ -839,7 +891,9 @@ impl App {
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
         let selected = match &mut self.prompt {
-            Prompt::SwitchBuffer { selected, .. } | Prompt::BrowseUrl { selected, .. } => selected,
+            Prompt::SwitchBuffer { selected, .. }
+            | Prompt::BrowseUrl { selected, .. }
+            | Prompt::KillBuffer { selected, .. } => selected,
             Prompt::None | Prompt::Topic { .. } => return,
         };
         if count == 0 {
@@ -852,7 +906,9 @@ impl App {
 
     fn prompt_push(&mut self, c: char) {
         match &mut self.prompt {
-            Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } => {
+            Prompt::SwitchBuffer { input, selected }
+            | Prompt::BrowseUrl { input, selected }
+            | Prompt::KillBuffer { input, selected } => {
                 input.push(c);
                 *selected = 0;
             }
@@ -863,7 +919,9 @@ impl App {
 
     fn prompt_backspace(&mut self) {
         match &mut self.prompt {
-            Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } => {
+            Prompt::SwitchBuffer { input, selected }
+            | Prompt::BrowseUrl { input, selected }
+            | Prompt::KillBuffer { input, selected } => {
                 input.pop();
                 *selected = 0;
             }
@@ -882,6 +940,11 @@ impl App {
                 .map(|i| self.buffers[i].target.clone())
                 .collect::<Vec<_>>(),
             Prompt::BrowseUrl { input, .. } => self.url_candidates(input),
+            Prompt::KillBuffer { input, .. } => self
+                .kill_candidates(input)
+                .into_iter()
+                .map(|i| self.buffers[i].target.clone())
+                .collect::<Vec<_>>(),
             Prompt::None | Prompt::Topic { .. } => return,
         };
         if candidates.is_empty() {
@@ -892,8 +955,9 @@ impl App {
         } else {
             common_prefix(&candidates)
         };
-        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
-            &mut self.prompt
+        if let Prompt::SwitchBuffer { input, selected }
+        | Prompt::BrowseUrl { input, selected }
+        | Prompt::KillBuffer { input, selected } = &mut self.prompt
         {
             *input = completion;
             *selected = 0;
@@ -906,6 +970,7 @@ impl App {
         let count = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::BrowseUrl { input, .. } => self.url_candidates(input).len(),
+            Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::None | Prompt::Topic { .. } => 0,
         };
         match key.code {
@@ -950,6 +1015,19 @@ impl App {
                     .or_else(|| (!input.trim().is_empty()).then(|| input.trim().to_string()));
                 if let Some(url) = url {
                     self.open_url(&url);
+                }
+            }
+            Prompt::KillBuffer { input, selected } => {
+                let candidates = self.kill_candidates(&input);
+                if let Some(&i) = candidates.get(selected) {
+                    self.kill_buffer(i);
+                } else if let Some(i) = self.buffers.iter().position(|b| b.target == input.trim()) {
+                    self.kill_buffer(i);
+                } else if input.trim().is_empty() {
+                    let cur = self.current;
+                    self.kill_buffer(cur);
+                } else {
+                    self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
             }
             Prompt::Topic { input } => {
@@ -1039,6 +1117,18 @@ impl App {
                 self.url_candidates(input),
                 *selected,
             )),
+            Prompt::KillBuffer { input, selected } => {
+                let names = self
+                    .kill_candidates(input)
+                    .into_iter()
+                    .map(|i| self.buffers[i].target.clone())
+                    .collect();
+                Some((
+                    format!("Kill buffer (default {}): {input}", self.mode_line_name()),
+                    names,
+                    *selected,
+                ))
+            }
             Prompt::Topic { input } => Some((format!("Topic: {input}"), Vec::new(), 0)),
         }
     }
@@ -1712,11 +1802,13 @@ impl App {
                 nick,
                 reason,
             } => {
-                let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
-                self.remove_nick(idx, &nick);
-                let line =
-                    self.server_line(idx, Some(&nick), "PART", &format!("{channel} {reason}"));
-                self.push_line(idx, line);
+                // Do not recreate a channel buffer we've killed/parted.
+                if let Some(idx) = self.find_buffer(server, &channel, Kind::Channel) {
+                    self.remove_nick(idx, &nick);
+                    let line =
+                        self.server_line(idx, Some(&nick), "PART", &format!("{channel} {reason}"));
+                    self.push_line(idx, line);
+                }
             }
             Event::Kick {
                 channel,
@@ -1724,11 +1816,12 @@ impl App {
                 by,
                 reason,
             } => {
-                let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
-                self.remove_nick(idx, &nick);
-                let text = format!("{nick} {channel} {reason}");
-                let line = self.server_line(idx, Some(&by), "KICK", text.trim_end());
-                self.push_line(idx, line);
+                if let Some(idx) = self.find_buffer(server, &channel, Kind::Channel) {
+                    self.remove_nick(idx, &nick);
+                    let text = format!("{nick} {channel} {reason}");
+                    let line = self.server_line(idx, Some(&by), "KICK", text.trim_end());
+                    self.push_line(idx, line);
+                }
             }
             Event::Quit { nick, reason } => {
                 for idx in 0..self.buffers.len() {
@@ -2257,6 +2350,54 @@ mod tests {
         assert_eq!(app.current().buffer.input(), "hello ");
         app.perform(Action::Yank);
         assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[test]
+    fn cx_k_kills_selected_buffer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        app.switch_to(a);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(app.prompt, Prompt::KillBuffer { .. }));
+        for c in "#b".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.buffers.iter().all(|x| x.target != "#b"));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn kill_scratch_is_refused() {
+        let mut app = app_without_servers();
+        let s = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        let before = app.buffers.len();
+        app.kill_buffer(s);
+        assert_eq!(app.buffers.len(), before);
+        assert!(app.message.as_deref().unwrap().contains("Cannot kill"));
+    }
+
+    #[test]
+    fn part_of_killed_channel_does_not_recreate_it() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.kill_buffer(a);
+        app.handle_event(
+            0,
+            Event::Part {
+                channel: "#a".to_string(),
+                nick: "me".to_string(),
+                reason: String::new(),
+            },
+        );
+        assert!(app.buffers.iter().all(|b| b.target != "#a"));
     }
 
     #[test]
