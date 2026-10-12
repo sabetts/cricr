@@ -6,6 +6,7 @@ mod buffer;
 mod config;
 mod input;
 mod keymap;
+mod killring;
 mod search;
 mod theme;
 mod ui;

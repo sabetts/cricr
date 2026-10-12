@@ -16,6 +16,7 @@ use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
 use crate::config::Config;
 use crate::input::History;
 use crate::keymap::{self, Action};
+use crate::killring::KillRing;
 use crate::search::{Search, SearchDirection};
 use crate::theme::Theme;
 
@@ -55,6 +56,15 @@ enum Prefix {
     CtrlX,
     CtrlC,
     CtrlCF,
+}
+
+/// The kind of the previous editing command, for kill/yank chaining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LastCommand {
+    #[default]
+    Other,
+    Kill,
+    Yank,
 }
 
 /// One connection's shared state.
@@ -123,7 +133,9 @@ pub struct App {
     pub history: History,
     pub search: Search,
     pub message: Option<String>,
-    pub kill_ring: String,
+    pub kill_ring: KillRing,
+    /// Height (in rows) of the buffer view, from the last draw.
+    pub viewport_rows: usize,
     pub scrollback: usize,
     pub fill_column: usize,
     pub theme: Theme,
@@ -134,6 +146,9 @@ pub struct App {
     visit_seq: u64,
     prefix: Prefix,
     quoted: bool,
+    last_command: LastCommand,
+    /// (start, end) positions of the text inserted by the last `yank`.
+    last_yank: Option<(Pos, Pos)>,
     /// Row of the first line inserted by the most recent `push_line`.
     last_push_row: usize,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
@@ -152,7 +167,8 @@ impl App {
             history: History::default(),
             search: Search::default(),
             message: None,
-            kill_ring: String::new(),
+            kill_ring: KillRing::new(),
+            viewport_rows: 20,
             scrollback,
             fill_column,
             theme,
@@ -163,6 +179,8 @@ impl App {
             visit_seq: 0,
             prefix: Prefix::None,
             quoted: false,
+            last_command: LastCommand::Other,
+            last_yank: None,
             last_push_row: 0,
             event_tx,
         };
@@ -1036,6 +1054,8 @@ impl App {
 
     fn perform(&mut self, action: Action) {
         use Action::*;
+        let prev = self.last_command;
+        self.last_command = LastCommand::Other;
         match action {
             None => {}
             SelfInsert(c) => self.current_mut().buffer.insert_char(c),
@@ -1062,19 +1082,14 @@ impl App {
             DeleteForward => self.current_mut().buffer.delete_forward(),
             KillLine => {
                 let killed = self.current_mut().buffer.kill_line();
-                self.kill_ring = killed;
+                self.kill_ring.push(&killed, prev == LastCommand::Kill);
+                self.last_command = LastCommand::Kill;
             }
             SetMark => self.current_mut().buffer.set_mark(),
-            KillRegion => self.kill_region(),
-            CopyRegion => {
-                if let Some(text) = self.current().buffer.region_text() {
-                    self.kill_ring = text;
-                }
-            }
-            Yank => {
-                let text = self.kill_ring.clone();
-                self.current_mut().buffer.insert_str(&text);
-            }
+            KillRegion => self.kill_region(prev),
+            CopyRegion => self.copy_region(prev),
+            Yank => self.yank(),
+            YankPop => self.yank_pop(prev),
             HistoryPrev => self.history_prev(),
             HistoryNext => self.history_next(),
             Complete => {
@@ -1097,19 +1112,89 @@ impl App {
         }
     }
 
+    /// A screenful minus two lines, like Emacs `next-screen-context-lines`.
+    fn page_lines(&self) -> usize {
+        self.viewport_rows.saturating_sub(2).max(1)
+    }
+
     fn page_up(&mut self) {
-        self.current_mut().buffer.scroll_up(10);
+        let n = self.page_lines();
+        self.current_mut().buffer.page_backward(n);
     }
 
     fn page_down(&mut self) {
-        self.current_mut().buffer.scroll_down(10);
+        let n = self.page_lines();
+        self.current_mut().buffer.page_forward(n);
     }
 
-    fn kill_region(&mut self) {
-        let buf = self.current_mut();
-        if let Some(text) = buf.buffer.region_text() {
-            self.kill_ring = text;
+    /// `M-w`: save the region to the kill ring (no deletion).
+    fn copy_region(&mut self, prev: LastCommand) {
+        let Some(text) = self.current().buffer.region_text() else {
+            self.message = Some("The mark is not set now, so there is no region".to_string());
+            return;
+        };
+        self.kill_ring.push(&text, prev == LastCommand::Kill);
+        self.last_command = LastCommand::Kill;
+    }
+
+    /// `C-w`: kill the region (delete and save to the kill ring).
+    fn kill_region(&mut self, prev: LastCommand) {
+        let i = self.current;
+        let Some((start, end)) = self.buffers[i].buffer.region() else {
+            self.message = Some("The mark is not set now, so there is no region".to_string());
+            return;
+        };
+        let Some(text) = self.buffers[i].buffer.region_text() else {
+            return;
+        };
+        if self.buffers[i].buffer.delete_region(start, end) {
+            self.kill_ring.push(&text, prev == LastCommand::Kill);
+            self.last_command = LastCommand::Kill;
+        } else {
+            self.message = Some("Text is read-only".to_string());
         }
+    }
+
+    /// `C-y`: insert the most recent kill.
+    fn yank(&mut self) {
+        let Some(text) = self.kill_ring.yank() else {
+            self.message = Some("Kill ring is empty".to_string());
+            return;
+        };
+        let i = self.current;
+        if !self.buffers[i].buffer.editable() {
+            self.message = Some("Text is read-only".to_string());
+            return;
+        }
+        let start = self.buffers[i].buffer.point();
+        self.buffers[i].buffer.insert_str(&text);
+        let end = self.buffers[i].buffer.point();
+        self.last_yank = Some((start, end));
+        self.last_command = LastCommand::Yank;
+    }
+
+    /// `M-y`: replace the just-yanked text with the previous kill.
+    fn yank_pop(&mut self, prev: LastCommand) {
+        if prev != LastCommand::Yank {
+            self.message = Some("Previous command was not a yank".to_string());
+            return;
+        }
+        let Some((start, end)) = self.last_yank else {
+            return;
+        };
+        let i = self.current;
+        if !self.buffers[i].buffer.delete_region(start, end) {
+            return;
+        }
+        let Some(text) = self.kill_ring.yank_pop() else {
+            return;
+        };
+        self.buffers[i].buffer.set_point(start);
+        let start = self.buffers[i].buffer.point();
+        self.buffers[i].buffer.insert_str(&text);
+        let end = self.buffers[i].buffer.point();
+        self.last_yank = Some((start, end));
+        self.last_command = LastCommand::Yank;
     }
 
     fn history_prev(&mut self) {
@@ -1800,6 +1885,10 @@ impl App {
         mut term_rx: mpsc::UnboundedReceiver<TermEvent>,
     ) -> Result<()> {
         loop {
+            if let Ok(size) = terminal.size() {
+                // Buffer view height = terminal rows minus mode line + minibuffer.
+                self.viewport_rows = size.height.saturating_sub(2) as usize;
+            }
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
             if self.should_quit {
                 for state in &self.servers {
@@ -2116,6 +2205,53 @@ mod tests {
             Prompt::Topic { input } => assert_eq!(input, "hello world"),
             other => panic!("expected Topic prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn page_down_and_up_move_by_a_screenful() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..50 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.viewport_rows = 10; // page = 8 lines
+        let bottom = app.current().buffer.point().row;
+        app.perform(Action::PageUp);
+        assert_eq!(app.current().buffer.point().row, bottom - 8);
+        app.perform(Action::PageDown);
+        assert_eq!(app.current().buffer.point().row, bottom);
+    }
+
+    #[test]
+    fn yank_and_yank_pop_cycle_kill_ring() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.kill_ring.push("one", false);
+        app.kill_ring.push("two", false);
+        app.perform(Action::Yank);
+        assert_eq!(app.current().buffer.input(), "two");
+        app.perform(Action::YankPop);
+        assert_eq!(app.current().buffer.input(), "one");
+        app.perform(Action::YankPop);
+        assert_eq!(app.current().buffer.input(), "two");
+    }
+
+    #[test]
+    fn kill_region_and_yank_roundtrip() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello world");
+        // select "world"
+        app.current_mut().buffer.set_point(Pos::new(0, 8));
+        app.current_mut().buffer.set_mark();
+        app.current_mut().buffer.set_point(Pos::new(0, 13));
+        app.perform(Action::KillRegion);
+        assert_eq!(app.current().buffer.input(), "hello ");
+        app.perform(Action::Yank);
+        assert_eq!(app.current().buffer.input(), "hello world");
     }
 
     #[test]

@@ -555,12 +555,23 @@ impl Buffer {
         self.scroll_into_view();
     }
 
-    pub fn scroll_up(&mut self, rows: usize) {
-        self.scroll = self.scroll.saturating_sub(rows);
+    /// Emacs `scroll-up-command` (C-v): move point forward a screenful and
+    /// scroll the view with it.
+    pub fn page_forward(&mut self, rows: usize) {
+        let target = (self.point.row + rows).min(self.last_row());
+        let delta = target - self.point.row;
+        self.point.row = target;
+        self.point.col = self.clamp_col(self.point.row, self.point.col);
+        self.scroll = (self.scroll + delta).min(self.point.row);
     }
 
-    pub fn scroll_down(&mut self, rows: usize) {
-        self.scroll = self.scroll.saturating_add(rows);
+    /// Emacs `scroll-down-command` (M-v): move point back a screenful.
+    pub fn page_backward(&mut self, rows: usize) {
+        let target = self.point.row.saturating_sub(rows);
+        let delta = self.point.row - target;
+        self.point.row = target;
+        self.point.col = self.clamp_col(self.point.row, self.point.col);
+        self.scroll = self.scroll.saturating_sub(delta);
     }
 
     pub fn set_point(&mut self, pos: Pos) {
@@ -746,6 +757,58 @@ impl Buffer {
             self.scroll_into_view();
             killed
         }
+    }
+
+    fn region_editable(&self, start: Pos, end: Pos) -> bool {
+        if self.is_irc() {
+            start.row == self.last_row()
+                && end.row == self.last_row()
+                && start.col >= self.prompt_len
+                && end.col >= self.prompt_len
+        } else {
+            true
+        }
+    }
+
+    /// Delete the text between `start` and `end` (ordered, `start <= end`).
+    /// Returns false if the region is not editable (e.g. rcirc history).
+    pub fn delete_region(&mut self, start: Pos, end: Pos) -> bool {
+        if start == end {
+            return true;
+        }
+        if start > end || !self.region_editable(start, end) {
+            return false;
+        }
+        if self.is_irc() {
+            let base = self.prompt_len;
+            let mut chars: Vec<char> = self.input().chars().collect();
+            let s = (start.col - base).min(chars.len());
+            let e = (end.col - base).min(chars.len());
+            chars.drain(s..e);
+            let text: String = chars.into_iter().collect();
+            self.input_set(&text);
+            self.point = Pos::new(self.last_row(), base + s);
+        } else if start.row == end.row {
+            let mut chars = self.lines[start.row].chars();
+            chars.drain(start.col..end.col.min(chars.len()));
+            self.lines[start.row] = Line::plain(chars.into_iter().collect::<String>());
+            self.point = Pos::new(start.row, start.col);
+        } else {
+            let left: String = self.lines[start.row].chars()[..start.col].iter().collect();
+            let right_chars = self.lines[end.row].chars();
+            let right: String = right_chars[end.col.min(right_chars.len())..]
+                .iter()
+                .collect();
+            self.lines[start.row] = Line::plain(format!("{left}{right}"));
+            for _ in 0..(end.row - start.row) {
+                self.lines.remove(start.row + 1);
+            }
+            self.point = Pos::new(start.row, start.col);
+        }
+        self.mark = None;
+        self.point.col = self.clamp_col(self.point.row, self.point.col);
+        self.scroll_into_view();
+        true
     }
 
     // ---- search ------------------------------------------------------------
@@ -977,6 +1040,57 @@ mod tests {
         b.delete_forward();
         assert_eq!(b.len(), 1);
         assert_eq!(b.line(0).text(), "ab");
+    }
+
+    #[test]
+    fn delete_region_in_input() {
+        let mut b = Buffer::new("> ");
+        b.set_input("hello world");
+        b.set_point(Pos::new(0, 8));
+        b.set_mark();
+        b.set_point(Pos::new(0, 13));
+        let (start, end) = b.region().unwrap();
+        assert_eq!(b.region_text().unwrap(), "world");
+        assert!(b.delete_region(start, end));
+        assert_eq!(b.input(), "hello ");
+    }
+
+    #[test]
+    fn delete_region_rejects_read_only_history() {
+        let mut b = Buffer::new("> ");
+        b.push_plain("history line");
+        b.set_point(Pos::new(0, 0));
+        b.set_mark();
+        b.set_point(Pos::new(0, 4));
+        let (start, end) = b.region().unwrap();
+        assert!(!b.delete_region(start, end));
+    }
+
+    #[test]
+    fn delete_region_multiline_text() {
+        let mut b = Buffer::text();
+        b.insert_str("abc\ndef");
+        b.set_point(Pos::new(0, 1));
+        b.set_mark();
+        b.set_point(Pos::new(1, 2));
+        let (start, end) = b.region().unwrap();
+        assert!(b.delete_region(start, end));
+        assert_eq!(b.line(0).text(), "af");
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn paging_moves_point_and_scroll() {
+        let mut b = Buffer::new("> ");
+        for i in 0..50 {
+            b.push_plain(format!("line {i}"));
+        }
+        b.end_of_buffer();
+        let before = b.point().row;
+        b.page_backward(8);
+        assert_eq!(b.point().row, before - 8);
+        b.page_forward(8);
+        assert_eq!(b.point().row, before);
     }
 
     #[test]
