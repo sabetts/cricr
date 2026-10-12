@@ -7,6 +7,7 @@ mod config;
 mod input;
 mod keymap;
 mod search;
+mod theme;
 mod ui;
 
 use std::io::stdout;

@@ -61,18 +61,44 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = app.current().buffer.point().row + 1;
-    let mut text = format!(
-        " {}  ({})  L{} ",
-        app.mode_line_name(),
-        app.mode_line_mode(),
-        line
-    );
-    let activity = app.activity_string();
-    if !activity.is_empty() {
-        text.push_str(&format!(" {activity} "));
+    let base = RStyle::default().add_modifier(Modifier::REVERSED);
+    let mut spans = vec![RSpan::styled(
+        format!(
+            " {}  ({})  L{} ",
+            app.mode_line_name(),
+            app.mode_line_mode(),
+            line
+        ),
+        base,
+    )];
+
+    let entries = app.activity_entries();
+    if !entries.is_empty() {
+        spans.push(RSpan::styled(" ", base));
+        spans.push(RSpan::styled("[", base));
+        for (i, (name, style)) in entries.iter().enumerate() {
+            if i > 0 {
+                spans.push(RSpan::styled(",", base));
+            }
+            spans.push(RSpan::styled(name.clone(), track_style(base, *style)));
+        }
+        spans.push(RSpan::styled("] ", base));
     }
-    let style = RStyle::default().add_modifier(Modifier::REVERSED);
-    frame.render_widget(Paragraph::new(text).style(style), area);
+
+    frame.render_widget(Paragraph::new(RLine::from(spans)).style(base), area);
+}
+
+/// Compose an activity entry's style over the (reversed) mode-line base:
+/// keywords bold, our-mentioned nicks un-reversed so they stand out.
+fn track_style(base: RStyle, style: Style) -> RStyle {
+    let mut out = base;
+    if style.bold {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if style.reverse {
+        out = out.remove_modifier(Modifier::REVERSED);
+    }
+    out
 }
 
 fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
@@ -190,5 +216,6 @@ fn rcolor(color: Color) -> RColor {
         Color::LightMagenta => RColor::LightMagenta,
         Color::LightCyan => RColor::LightCyan,
         Color::White => RColor::White,
+        Color::Rgb(r, g, b) => RColor::Rgb(r, g, b),
     }
 }

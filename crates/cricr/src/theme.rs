@@ -1,0 +1,98 @@
+//! rcirc face colors, resolved against Emacs' color list.
+//!
+//! The faces and their light/dark-background variants come from the
+//! `defface` forms at the end of `contrib/rcirc.el`; the hex values are the
+//! Emacs color names (e.g. `LightSkyBlue`) as listed in `colors_list.txt`.
+
+use serde::Deserialize;
+
+use crate::buffer::Style;
+
+/// Which background the terminal uses, selecting the rcirc face variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// The set of rcirc faces used for rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+    pub my_nick: Style,
+    pub other_nick: Style,
+    #[allow(dead_code)]
+    pub bright_nick: Style,
+    #[allow(dead_code)]
+    pub dim_nick: Style,
+    pub server: Style,
+    #[allow(dead_code)]
+    pub server_prefix: Style,
+    pub timestamp: Style,
+    pub prompt: Style,
+    pub nick_in_message: Style,
+    pub url: Style,
+    #[allow(dead_code)]
+    pub keyword: Style,
+    pub track_nick: Style,
+    pub track_keyword: Style,
+}
+
+impl Theme {
+    pub fn for_background(background: Background) -> Theme {
+        match background {
+            Background::Dark => Theme {
+                my_nick: Style::rgb(0x87, 0xce, 0xfa),     // LightSkyBlue
+                other_nick: Style::rgb(0xee, 0xdd, 0x82),  // LightGoldenrod
+                bright_nick: Style::rgb(0x7f, 0xff, 0xd4), // Aquamarine
+                dim_nick: Style::default(),
+                server: Style::rgb(0xff, 0x7f, 0x24), // chocolate1
+                server_prefix: Style::rgb(0xff, 0x7f, 0x24),
+                timestamp: Style::default(),
+                prompt: Style::rgb(0x00, 0xff, 0xff), // cyan1
+                nick_in_message: Style::rgb(0x00, 0xff, 0xff), // Cyan1
+                url: Style::default().bold(),
+                keyword: Style::default().reverse(),
+                track_nick: Style::default().reverse(),
+                track_keyword: Style::default().bold(),
+            },
+            Background::Light => Theme {
+                my_nick: Style::rgb(0x00, 0x00, 0xff),     // Blue1
+                other_nick: Style::rgb(0xb8, 0x86, 0x0b),  // DarkGoldenrod
+                bright_nick: Style::rgb(0x5f, 0x9e, 0xa0), // CadetBlue
+                dim_nick: Style::default(),
+                server: Style::rgb(0xb2, 0x22, 0x22), // Firebrick
+                server_prefix: Style::rgb(0xb2, 0x22, 0x22),
+                timestamp: Style::default(),
+                prompt: Style::rgb(0x00, 0x00, 0x8b), // dark blue
+                nick_in_message: Style::rgb(0xa0, 0x20, 0xf0), // Purple
+                url: Style::default().bold(),
+                keyword: Style::default().reverse(),
+                track_nick: Style::default().reverse(),
+                track_keyword: Style::default().bold(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dark_uses_light_variants() {
+        let theme = Theme::for_background(Background::Dark);
+        assert_eq!(theme.my_nick, Style::rgb(0x87, 0xce, 0xfa));
+        assert_eq!(theme.other_nick, Style::rgb(0xee, 0xdd, 0x82));
+        assert!(theme.url.bold);
+        assert!(theme.track_nick.reverse);
+    }
+
+    #[test]
+    fn light_uses_dark_variants() {
+        let theme = Theme::for_background(Background::Light);
+        assert_eq!(theme.my_nick, Style::rgb(0x00, 0x00, 0xff));
+        assert_eq!(theme.server, Style::rgb(0xb2, 0x22, 0x22));
+    }
+}

@@ -8,6 +8,8 @@ use serde::Deserialize;
 use cricr_irc::client::{ClientCert, ClientConfig};
 use cricr_irc::sasl::{SaslCredentials, SaslMechanism};
 
+use crate::theme::Background;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -81,6 +83,8 @@ pub struct SaslConfig {
 pub struct UiConfig {
     pub timestamp_format: String,
     pub scrollback_lines: usize,
+    /// Which rcirc face variant to use: `"dark"` (default) or `"light"`.
+    pub background: Background,
 }
 
 impl Default for UiConfig {
@@ -88,6 +92,7 @@ impl Default for UiConfig {
         UiConfig {
             timestamp_format: "%H:%M".to_string(),
             scrollback_lines: 100_000,
+            background: Background::Dark,
         }
     }
 }
@@ -105,6 +110,7 @@ tls = true
 [ui]
 timestamp_format = "%H:%M"
 scrollback_lines = 100000
+background = "dark"   # or "light"
 
 [[servers]]
 name = "irc.libera.chat"
@@ -237,6 +243,7 @@ mod tests {
         assert_eq!(cfg.servers[0].name, "irc.libera.chat");
         assert_eq!(cfg.servers[0].channels, vec!["#emacs", "#rcirc"]);
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
+        assert_eq!(cfg.ui.background, Background::Dark);
     }
 
     #[test]

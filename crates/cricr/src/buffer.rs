@@ -41,6 +41,8 @@ pub enum Color {
     LightMagenta,
     LightCyan,
     White,
+    /// A 24-bit truecolor value.
+    Rgb(u8, u8, u8),
 }
 
 /// A minimal, UI-independent text style.
@@ -67,14 +69,18 @@ impl Style {
         self
     }
 
-    pub const fn dim(mut self) -> Self {
-        self.dim = true;
-        self
-    }
-
     pub const fn reverse(mut self) -> Self {
         self.reverse = true;
         self
+    }
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Style {
+            color: Color::Rgb(r, g, b),
+            bold: false,
+            dim: false,
+            reverse: false,
+        }
     }
 }
 
@@ -142,6 +148,7 @@ pub struct Buffer {
     /// prompt line); `None` for a free text buffer (like `*scratch*`).
     prompt: Option<String>,
     prompt_len: usize,
+    prompt_style: Style,
     point: Pos,
     mark: Option<Pos>,
     scroll: usize,
@@ -151,10 +158,12 @@ impl Buffer {
     pub fn new(prompt: impl Into<String>) -> Self {
         let prompt = prompt.into();
         let prompt_len = prompt.chars().count();
+        let prompt_style = Style::fg(Color::Green).bold();
         Buffer {
-            lines: vec![Line::styled(prompt.clone(), Style::fg(Color::Green).bold())],
+            lines: vec![Line::styled(prompt.clone(), prompt_style)],
             prompt: Some(prompt),
             prompt_len,
+            prompt_style,
             point: Pos::new(0, prompt_len),
             mark: None,
             scroll: 0,
@@ -167,9 +176,19 @@ impl Buffer {
             lines: vec![Line::plain("")],
             prompt: None,
             prompt_len: 0,
+            prompt_style: Style::default(),
             point: Pos::new(0, 0),
             mark: None,
             scroll: 0,
+        }
+    }
+
+    /// Set the style used to render the prompt (e.g. `rcirc-prompt`).
+    pub fn set_prompt_style(&mut self, style: Style) {
+        self.prompt_style = style;
+        if self.is_irc() {
+            let input = self.input();
+            self.input_set(&input);
         }
     }
 
@@ -277,7 +296,7 @@ impl Buffer {
         let row = self.last_row();
         let prompt = self.prompt.clone().unwrap_or_default();
         self.lines[row] = Line::from_spans(vec![
-            Span::new(prompt, Style::fg(Color::Green).bold()),
+            Span::new(prompt, self.prompt_style),
             Span::new(text, Style::default()),
         ]);
         self.point.col = self.point.col.max(self.prompt_len);

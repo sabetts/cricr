@@ -12,11 +12,12 @@ use cricr_irc::commands::{self, LocalCommand, ParsedInput};
 use cricr_irc::message::Tag;
 use cricr_irc::{ClientCommand, ClientHandle, Event};
 
-use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
+use crate::buffer::{Buffer, Line, Pos, Span, Style};
 use crate::config::Config;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::search::{Search, SearchDirection};
+use crate::theme::Theme;
 
 /// What kind of conversation a buffer represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub struct Chan {
     pub buffer: Buffer,
     pub nicks: Vec<String>,
     pub unread: usize,
+    /// Whether our nick was mentioned since the last visit.
+    pub mentioned: bool,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
     pub last_activity: u64,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
@@ -96,6 +99,7 @@ pub struct App {
     pub message: Option<String>,
     pub kill_ring: String,
     pub scrollback: usize,
+    pub theme: Theme,
     pub should_quit: bool,
     pub prompt: Prompt,
     previous: usize,
@@ -110,6 +114,7 @@ pub struct App {
 impl App {
     pub fn new(config: Config, event_tx: mpsc::UnboundedSender<(usize, Event)>) -> Self {
         let scrollback = config.ui.scrollback_lines;
+        let theme = Theme::for_background(config.ui.background);
         let mut app = App {
             config,
             servers: Vec::new(),
@@ -120,6 +125,7 @@ impl App {
             message: None,
             kill_ring: String::new(),
             scrollback,
+            theme,
             should_quit: false,
             prompt: Prompt::None,
             previous: 0,
@@ -181,11 +187,12 @@ impl App {
     }
 
     fn new_buffer(&mut self, server: usize, target: String, kind: Kind) -> usize {
-        let buffer = if kind == Kind::Scratch {
+        let mut buffer = if kind == Kind::Scratch {
             Buffer::text()
         } else {
             Buffer::new("> ")
         };
+        buffer.set_prompt_style(self.theme.prompt);
         self.buffers.push(Chan {
             server,
             target,
@@ -193,6 +200,7 @@ impl App {
             buffer,
             nicks: Vec::new(),
             unread: 0,
+            mentioned: false,
             last_activity: 0,
             last_visited: 0,
             last_timestamp: String::new(),
@@ -243,11 +251,14 @@ impl App {
         }
     }
 
-    fn bump_activity(&mut self, buf: usize) {
+    fn bump_activity(&mut self, buf: usize, mentioned: bool) {
         if buf != self.current && self.buffers[buf].kind != Kind::Scratch {
             self.activity_seq += 1;
             self.buffers[buf].unread += 1;
             self.buffers[buf].last_activity = self.activity_seq;
+            if mentioned {
+                self.buffers[buf].mentioned = true;
+            }
         }
     }
 
@@ -260,6 +271,7 @@ impl App {
         }
         self.current = idx;
         self.buffers[idx].unread = 0;
+        self.buffers[idx].mentioned = false;
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
         self.buffers[idx].buffer.end_of_buffer();
@@ -289,14 +301,36 @@ impl App {
         }
     }
 
-    /// Targets with pending activity, most recent first.
-    pub fn activity_targets(&self) -> Vec<String> {
+    /// Targets with pending activity, most recent first, with the mode-line
+    /// track face for each (`rcirc-track-keyword`, or `rcirc-track-nick` when
+    /// our nick was mentioned).
+    pub fn activity_entries(&self) -> Vec<(String, Style)> {
         let mut active: Vec<&Chan> = self.buffers.iter().filter(|b| b.unread > 0).collect();
         active.sort_by_key(|b| std::cmp::Reverse(b.last_activity));
-        active.into_iter().map(|c| c.target.clone()).collect()
+        active
+            .into_iter()
+            .map(|c| {
+                let style = if c.mentioned {
+                    self.theme.track_nick
+                } else {
+                    self.theme.track_keyword
+                };
+                (c.target.clone(), style)
+            })
+            .collect()
+    }
+
+    /// Targets with pending activity, most recent first.
+    #[allow(dead_code)]
+    pub fn activity_targets(&self) -> Vec<String> {
+        self.activity_entries()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
     }
 
     /// The `rcirc-activity-string`-style mode-line indicator.
+    #[allow(dead_code)]
     pub fn activity_string(&self) -> String {
         let targets = self.activity_targets();
         if targets.is_empty() {
@@ -968,9 +1002,9 @@ impl App {
 
     fn nick_style(&self, server: usize, nick: &str) -> Style {
         if nick == self.our_nick(server) {
-            Style::fg(Color::LightCyan).bold()
+            self.theme.my_nick
         } else {
-            Style::fg(nick_color(nick)).bold()
+            self.theme.other_nick
         }
     }
 
@@ -985,6 +1019,120 @@ impl App {
         }
     }
 
+    /// Message body as spans: whole-word occurrences of our nick get
+    /// `rcirc-nick-in-message`, URLs get `rcirc-url`. Returns whether our nick
+    /// was mentioned.
+    fn message_spans(&self, server: usize, text: &str) -> (Vec<Span>, bool) {
+        let our = self.our_nick(server);
+        let mut mentioned = false;
+        let mut spans = Vec::new();
+        let mut run = String::new();
+        let mut run_space: Option<bool> = None;
+        for ch in text.chars() {
+            let space = ch.is_whitespace();
+            match run_space {
+                Some(s) if s == space => run.push(ch),
+                Some(s) => {
+                    self.emit_run(&mut run, s, &our, &mut mentioned, &mut spans);
+                    run.push(ch);
+                    run_space = Some(space);
+                }
+                None => {
+                    run.push(ch);
+                    run_space = Some(space);
+                }
+            }
+        }
+        if let Some(s) = run_space {
+            self.emit_run(&mut run, s, &our, &mut mentioned, &mut spans);
+        }
+        (spans, mentioned)
+    }
+
+    fn emit_run(
+        &self,
+        run: &mut String,
+        space: bool,
+        our: &str,
+        mentioned: &mut bool,
+        spans: &mut Vec<Span>,
+    ) {
+        if run.is_empty() {
+            return;
+        }
+        let text = std::mem::take(run);
+        if space {
+            spans.push(Span::new(text, Style::default()));
+        } else {
+            spans.extend(self.token_spans(&text, our, mentioned));
+        }
+    }
+
+    fn token_spans(&self, token: &str, our: &str, mentioned: &mut bool) -> Vec<Span> {
+        if let Some(url) = extract_url(token) {
+            if let Some(start) = token.find(&url) {
+                let mut spans = Vec::new();
+                let before = &token[..start];
+                let after = &token[start + url.len()..];
+                if !before.is_empty() {
+                    spans.extend(self.nick_spans(before, our, mentioned));
+                }
+                spans.push(Span::new(url, self.theme.url));
+                if !after.is_empty() {
+                    spans.extend(self.nick_spans(after, our, mentioned));
+                }
+                return spans;
+            }
+        }
+        self.nick_spans(token, our, mentioned)
+    }
+
+    /// Highlight whole-word occurrences of `our` within `text`.
+    fn nick_spans(&self, text: &str, our: &str, mentioned: &mut bool) -> Vec<Span> {
+        let chars: Vec<char> = text.chars().collect();
+        let needle: Vec<char> = our.to_lowercase().chars().collect();
+        if our.is_empty() || needle.len() > chars.len() {
+            return vec![Span::new(text.to_string(), Style::default())];
+        }
+        let lowered: Vec<char> = text.to_lowercase().chars().collect();
+        let mut spans = Vec::new();
+        let mut last = 0;
+        let mut i = 0;
+        while i + needle.len() <= chars.len() {
+            let hit = lowered[i..i + needle.len()] == needle[..];
+            let before_ok = i == 0 || !is_word_char(chars[i - 1]);
+            let after_ok =
+                i + needle.len() >= chars.len() || !is_word_char(chars[i + needle.len()]);
+            if hit && before_ok && after_ok {
+                if i > last {
+                    spans.push(Span::new(
+                        chars[last..i].iter().collect::<String>(),
+                        Style::default(),
+                    ));
+                }
+                spans.push(Span::new(
+                    chars[i..i + needle.len()].iter().collect::<String>(),
+                    self.theme.nick_in_message,
+                ));
+                *mentioned = true;
+                last = i + needle.len();
+                i = last;
+            } else {
+                i += 1;
+            }
+        }
+        if last < chars.len() {
+            spans.push(Span::new(
+                chars[last..].iter().collect::<String>(),
+                Style::default(),
+            ));
+        }
+        if spans.is_empty() {
+            spans.push(Span::new(text.to_string(), Style::default()));
+        }
+        spans
+    }
+
     fn chat_line(
         &mut self,
         server: usize,
@@ -996,11 +1144,19 @@ impl App {
         let ts = timestamp(tags);
         let prefix = self.time_prefix(buf, &ts);
         let nstyle = self.nick_style(server, nick);
-        Line::from_spans(vec![
-            Span::new(prefix, Style::fg(Color::DarkGray)),
+        let (mut body, mentioned) = self.message_spans(server, text);
+        if mentioned {
+            for span in &mut body {
+                span.style = span.style.bold();
+            }
+        }
+        let mut spans = vec![
+            Span::new(prefix, self.theme.timestamp),
             Span::new(format!("<{nick}>"), nstyle),
-            Span::new(format!(" {text}"), Style::default()),
-        ])
+            Span::new(" ".to_string(), Style::default()),
+        ];
+        spans.extend(body);
+        Line::from_spans(spans)
     }
 
     fn action_line(
@@ -1014,35 +1170,73 @@ impl App {
         let ts = timestamp(tags);
         let prefix = self.time_prefix(buf, &ts);
         let nstyle = self.nick_style(server, nick);
-        Line::from_spans(vec![
-            Span::new(prefix, Style::fg(Color::DarkGray)),
-            Span::new("* ", Style::fg(Color::Magenta)),
+        let (body, _) = self.message_spans(server, body);
+        let mut spans = vec![
+            Span::new(prefix, self.theme.timestamp),
+            Span::new("[".to_string(), Style::default()),
             Span::new(nick.to_string(), nstyle),
-            Span::new(format!(" {body}"), Style::default()),
-        ])
-    }
-
-    /// A server/system message, prefixed with `***`.
-    fn system_line(&mut self, buf: usize, text: &str) -> Line {
-        let ts = now_hhmm();
-        let prefix = self.time_prefix(buf, &ts);
-        Line::from_spans(vec![
-            Span::new(prefix, Style::default().dim()),
-            Span::new("*** ", Style::fg(Color::DarkGray)),
-            Span::new(text.to_string(), Style::fg(Color::DarkGray)),
-        ])
-    }
-
-    /// A server/event message built from `spans`, prefixed with `***`.
-    fn event_line(&mut self, buf: usize, spans: Vec<Span>) -> Line {
-        let ts = now_hhmm();
-        let prefix = self.time_prefix(buf, &ts);
-        let mut all = vec![
-            Span::new(prefix, Style::default().dim()),
-            Span::new("*** ", Style::fg(Color::DarkGray)),
+            Span::new(" ".to_string(), Style::default()),
         ];
-        all.extend(spans);
-        Line::from_spans(all)
+        spans.extend(body);
+        spans.push(Span::new("]".to_string(), Style::default()));
+        Line::from_spans(spans)
+    }
+
+    fn notice_line(
+        &mut self,
+        server: usize,
+        buf: usize,
+        tags: &[Tag],
+        nick: &str,
+        text: &str,
+    ) -> Line {
+        let ts = timestamp(tags);
+        let prefix = self.time_prefix(buf, &ts);
+        let nstyle = self.nick_style(server, nick);
+        let (body, _) = self.message_spans(server, text);
+        let mut spans = vec![
+            Span::new(prefix, self.theme.timestamp),
+            Span::new("-".to_string(), nstyle),
+            Span::new(nick.to_string(), nstyle),
+            Span::new("- ".to_string(), nstyle),
+        ];
+        spans.extend(body);
+        Line::from_spans(spans)
+    }
+
+    /// A server/event line in rcirc's default format: `*** [sender] RESPONSE
+    /// text`, rendered in the `rcirc-server` face.
+    fn server_line(
+        &mut self,
+        buf: usize,
+        sender: Option<&str>,
+        response: &str,
+        text: &str,
+    ) -> Line {
+        let ts = now_hhmm();
+        let prefix = self.time_prefix(buf, &ts);
+        let mut body = String::from("***");
+        if let Some(sender) = sender {
+            body.push(' ');
+            body.push_str(sender);
+        }
+        if !response.is_empty() {
+            body.push(' ');
+            body.push_str(response);
+        }
+        if !text.is_empty() {
+            body.push(' ');
+            body.push_str(text);
+        }
+        Line::from_spans(vec![
+            Span::new(prefix, self.theme.timestamp),
+            Span::new(body, self.theme.server),
+        ])
+    }
+
+    /// A connection/system message (`*** text`).
+    fn system_line(&mut self, buf: usize, text: &str) -> Line {
+        self.server_line(buf, None, "", text)
     }
 
     // ---- network events ----------------------------------------------------
@@ -1098,12 +1292,16 @@ impl App {
                     (target, Kind::Query)
                 };
                 let idx = self.ensure_buffer(server, target_name, kind);
+                let mentioned = self.message_spans(server, &text).1;
                 let line = self.chat_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
-                self.bump_activity(idx);
+                self.bump_activity(idx, mentioned);
             }
             Event::Notice {
-                from, target, text, ..
+                from,
+                target,
+                text,
+                tags,
             } => {
                 let our = self.our_nick(server);
                 let (target_name, kind) = if is_channel(&target) {
@@ -1114,15 +1312,10 @@ impl App {
                     (target, Kind::Query)
                 };
                 let idx = self.ensure_buffer(server, target_name, kind);
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{from}: {text}"),
-                        Style::fg(Color::Yellow),
-                    )],
-                );
+                let mentioned = self.message_spans(server, &text).1;
+                let line = self.notice_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
-                self.bump_activity(idx);
+                self.bump_activity(idx, mentioned);
             }
             Event::Action {
                 from,
@@ -1131,9 +1324,10 @@ impl App {
                 tags,
             } => {
                 let idx = self.buffer_for_sender(server, &from, &target);
+                let mentioned = self.message_spans(server, &text).1;
                 let line = self.action_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
-                self.bump_activity(idx);
+                self.bump_activity(idx, mentioned);
             }
             Event::Ctcp {
                 from,
@@ -1142,26 +1336,18 @@ impl App {
                 body,
             } => {
                 let idx = self.buffer_for_sender(server, &from, &target);
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("CTCP {request} from {from}: {body}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let text = if body.is_empty() {
+                    request
+                } else {
+                    format!("{request} {body}")
+                };
+                let line = self.server_line(idx, Some(&from), "CTCP", &text);
                 self.push_line(idx, line);
             }
             Event::Join { channel, nick } => {
-                let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
+                let idx = self.ensure_buffer(server, channel, Kind::Channel);
                 self.add_nick(idx, &nick);
-                let style = self.nick_style(server, &nick);
-                let line = self.event_line(
-                    idx,
-                    vec![
-                        Span::new(nick.clone(), style),
-                        Span::new(format!(" joined {channel}"), Style::fg(Color::DarkGray)),
-                    ],
-                );
+                let line = self.server_line(idx, Some(&nick), "JOIN", "");
                 self.push_line(idx, line);
             }
             Event::Part {
@@ -1171,22 +1357,8 @@ impl App {
             } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.remove_nick(idx, &nick);
-                let suffix = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({reason})")
-                };
-                let style = self.nick_style(server, &nick);
-                let line = self.event_line(
-                    idx,
-                    vec![
-                        Span::new(nick.clone(), style),
-                        Span::new(
-                            format!(" left {channel}{suffix}"),
-                            Style::fg(Color::DarkGray),
-                        ),
-                    ],
-                );
+                let line =
+                    self.server_line(idx, Some(&nick), "PART", &format!("{channel} {reason}"));
                 self.push_line(idx, line);
             }
             Event::Kick {
@@ -1197,40 +1369,18 @@ impl App {
             } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.remove_nick(idx, &nick);
-                let suffix = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({reason})")
-                };
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{by} kicked {nick} from {channel}{suffix}"),
-                        Style::fg(Color::Red),
-                    )],
-                );
+                let text = format!("{nick} {channel} {reason}");
+                let line = self.server_line(idx, Some(&by), "KICK", text.trim_end());
                 self.push_line(idx, line);
             }
             Event::Quit { nick, reason } => {
-                let suffix = if reason.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({reason})")
-                };
                 for idx in 0..self.buffers.len() {
                     if self.buffers[idx].kind == Kind::Channel
                         && self.buffers[idx].server == server
                         && self.buffers[idx].nicks.iter().any(|n| n == &nick)
                     {
                         self.remove_nick(idx, &nick);
-                        let style = self.nick_style(server, &nick);
-                        let line = self.event_line(
-                            idx,
-                            vec![
-                                Span::new(nick.clone(), style),
-                                Span::new(format!(" quit{suffix}"), Style::fg(Color::Red)),
-                            ],
-                        );
+                        let line = self.server_line(idx, Some(&nick), "QUIT", &reason);
                         self.push_line(idx, line);
                     }
                 }
@@ -1247,48 +1397,24 @@ impl App {
                     }
                 }
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{old} is now known as {new}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line = self.server_line(idx, Some(&old), "NICK", &new);
                 self.push_line(idx, line);
             }
             Event::TopicChanged { channel, topic, by } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{by} changed the topic of {channel} to: {topic}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line = self.server_line(idx, Some(&by), "TOPIC", &topic);
                 self.push_line(idx, line);
             }
             Event::TopicReply { channel, topic, .. } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("Topic for {channel}: {topic}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line = self.server_line(idx, None, "TOPIC", &format!("{channel} :{topic}"));
                 self.push_line(idx, line);
             }
             Event::Mode { target, modes } => {
                 let idx = self.ensure_buffer(server, target.clone(), Kind::Channel);
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("mode {target}: {modes}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line = self.server_line(idx, None, "MODE", &format!("{target} {modes}"));
                 self.push_line(idx, line);
             }
             Event::Names { channel, nicks } => {
@@ -1300,54 +1426,39 @@ impl App {
             Event::NamesEnd { .. } => {}
             Event::Whois { nick, line } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{nick}: {line}"),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
-                self.push_line(idx, line);
+                let l = self.system_line(idx, &format!("{nick}: {line}"));
+                self.push_line(idx, l);
             }
-            Event::Motd { text } | Event::ServerText { text, .. } => {
+            Event::Motd { text } => {
                 let idx = self.servers[server].buffer;
                 if !text.is_empty() {
                     let l = self.system_line(idx, &text);
                     self.push_line(idx, l);
                 }
             }
+            Event::ServerText { command, text } => {
+                let idx = self.servers[server].buffer;
+                if !text.is_empty() {
+                    let l = self.server_line(idx, None, &command, &text);
+                    self.push_line(idx, l);
+                }
+            }
             Event::Isupport { tokens } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("Supported: {}", tokens.join(" ")),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line = self.system_line(idx, &format!("Supported: {}", tokens.join(" ")));
                 self.push_line(idx, line);
             }
             Event::Ping { .. } | Event::Pong { .. } => {}
             Event::CapAck { caps } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("Capabilities enabled: {}", caps.join(" ")),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line =
+                    self.system_line(idx, &format!("Capabilities enabled: {}", caps.join(" ")));
                 self.push_line(idx, line);
             }
             Event::CapNak { caps } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("Capabilities rejected: {}", caps.join(" ")),
-                        Style::fg(Color::DarkGray),
-                    )],
-                );
+                let line =
+                    self.system_line(idx, &format!("Capabilities rejected: {}", caps.join(" ")));
                 self.push_line(idx, line);
             }
             Event::CapList { .. } | Event::Authenticate => {}
@@ -1358,13 +1469,7 @@ impl App {
             }
             Event::StandardReply { level, text } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(
-                    idx,
-                    vec![Span::new(
-                        format!("{level}: {text}"),
-                        Style::fg(Color::Yellow),
-                    )],
-                );
+                let line = self.system_line(idx, &format!("{level}: {text}"));
                 self.push_line(idx, line);
             }
             Event::Sent { line } => {
@@ -1436,6 +1541,10 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 fn is_channel(target: &str) -> bool {
@@ -1527,24 +1636,6 @@ fn timestamp(tags: &[Tag]) -> String {
     now_hhmm()
 }
 
-fn nick_color(nick: &str) -> Color {
-    const PALETTE: &[Color] = &[
-        Color::Green,
-        Color::Yellow,
-        Color::Blue,
-        Color::Magenta,
-        Color::Cyan,
-        Color::LightGreen,
-        Color::LightYellow,
-        Color::LightBlue,
-        Color::LightMagenta,
-        Color::LightCyan,
-        Color::LightRed,
-    ];
-    let sum: usize = nick.bytes().map(|b| b as usize).sum();
-    PALETTE[sum % PALETTE.len()]
-}
-
 /// Advance a point by one cell, for the next search starting position.
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
     match direction {
@@ -1587,11 +1678,13 @@ mod tests {
         assert_eq!(app.mode_line_mode(), "Fundamental");
         let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
         let b = app.new_buffer(0, "#b".to_string(), Kind::Query);
-        app.bump_activity(a);
-        app.bump_activity(b);
+        app.bump_activity(a, false);
+        app.bump_activity(b, true);
         assert_eq!(app.activity_string(), "[#b,#a]");
         app.switch_to(a);
         assert_eq!(app.activity_string(), "[#b]");
+        // b was a mention, so its track style is the (reverse) nick face
+        assert!(app.activity_entries()[0].1.reverse);
     }
 
     #[test]
@@ -1600,8 +1693,8 @@ mod tests {
         let scratch = app.current;
         let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
         let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
-        app.bump_activity(a);
-        app.bump_activity(b);
+        app.bump_activity(a, false);
+        app.bump_activity(b, false);
         app.next_active();
         assert_eq!(app.current, b, "should jump to the most recent activity");
         app.next_active();
@@ -1643,6 +1736,23 @@ mod tests {
         // current is #beta (excluded); recency order: #alpha then *scratch*
         assert_eq!(names, vec!["#alpha", "*scratch*"]);
         assert_eq!(app.switch_candidates("alp"), vec![a]);
+    }
+
+    #[test]
+    fn nick_and_url_spans_are_marked() {
+        let app = app_without_servers();
+        let mut mentioned = false;
+        let spans = app.nick_spans("hey crictest!", "crictest", &mut mentioned);
+        assert!(mentioned);
+        assert!(spans
+            .iter()
+            .any(|s| s.text == "crictest" && s.style == app.theme.nick_in_message));
+
+        let mut mentioned = false;
+        let url_spans = app.token_spans("see https://example.com/x.", "crictest", &mut mentioned);
+        assert!(url_spans
+            .iter()
+            .any(|s| s.style.bold && s.text == "https://example.com/x"));
     }
 
     #[test]
