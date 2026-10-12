@@ -1467,6 +1467,34 @@ impl App {
         self.server_line(buf, None, "", text)
     }
 
+    /// An error/warning line (`!!! text`) in `font-lock-warning-face`.
+    fn error_line(&mut self, buf: usize, text: &str) -> Line {
+        let ts = now_hhmm();
+        let prefix = self.time_prefix(buf, &ts);
+        Line::from_spans(vec![
+            Span::new(prefix, self.theme.timestamp),
+            Span::new(format!("!!! {text}"), self.theme.warning),
+        ])
+        .indented(10)
+    }
+
+    /// Print an error into every buffer of `server` (mirrors rcirc's sentinel
+    /// printing an `ERROR` response in all buffers on disconnect).
+    fn broadcast_error(&mut self, server: usize, message: &str) {
+        let text = format!("{}: {message}", self.server_name(server));
+        let targets: Vec<usize> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.server == server && b.kind != Kind::Scratch)
+            .map(|(i, _)| i)
+            .collect();
+        for idx in targets {
+            let line = self.error_line(idx, &text);
+            self.push_line(idx, line);
+        }
+    }
+
     // ---- network events ----------------------------------------------------
 
     pub fn handle_event(&mut self, server: usize, event: Event) {
@@ -1495,15 +1523,11 @@ impl App {
             }
             Event::Disconnected { reason } => {
                 self.servers[server].connected = false;
-                let idx = self.servers[server].buffer;
-                let line = self.system_line(idx, &format!("Disconnected: {reason}"));
-                self.push_line(idx, line);
+                self.broadcast_error(server, &reason);
             }
             Event::ConnectionError { error } => {
                 self.servers[server].connected = false;
-                let idx = self.servers[server].buffer;
-                let line = self.system_line(idx, &format!("Error: {error}"));
-                self.push_line(idx, line);
+                self.broadcast_error(server, &error);
             }
             Event::Privmsg {
                 from,
@@ -2020,6 +2044,33 @@ mod tests {
             Prompt::Topic { input } => assert_eq!(input, "hello world"),
             other => panic!("expected Topic prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn disconnect_broadcasts_to_each_buffer() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Query);
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|x| x.kind == Kind::Scratch)
+            .unwrap();
+        let before_a = app.buffers[a].buffer.len();
+        let before_b = app.buffers[b].buffer.len();
+        let before_scratch = app.buffers[scratch].buffer.len();
+
+        app.broadcast_error(0, "connection closed");
+
+        assert!(app.buffers[a].buffer.len() > before_a);
+        assert!(app.buffers[b].buffer.len() > before_b);
+        assert_eq!(app.buffers[scratch].buffer.len(), before_scratch);
+        let text: Vec<String> = (0..app.buffers[a].buffer.len())
+            .map(|r| app.buffers[a].buffer.line(r).text())
+            .collect();
+        assert!(text
+            .iter()
+            .any(|l| l.contains("!!!") && l.contains("connection closed")));
     }
 
     #[test]

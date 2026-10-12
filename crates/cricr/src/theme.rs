@@ -35,6 +35,8 @@ pub struct Theme {
     pub url: Style,
     #[allow(dead_code)]
     pub keyword: Style,
+    /// `font-lock-warning-face`, used for `!!! ` error/disconnect lines.
+    pub warning: Style,
     pub track_nick: Style,
     pub track_keyword: Style,
 }
@@ -54,6 +56,8 @@ impl Theme {
                 nick_in_message: Style::rgb(0x00, 0xff, 0xff), // Cyan1
                 url: Style::default().bold(),
                 keyword: Style::default().reverse(),
+                // font-lock-warning-face (dark bg): Red1, bold.
+                warning: Style::rgb(0xff, 0x00, 0x00).bold(),
                 track_nick: Style::default().reverse(),
                 track_keyword: Style::default().bold(),
             },
@@ -69,6 +73,7 @@ impl Theme {
                 nick_in_message: Style::rgb(0xa0, 0x20, 0xf0), // Purple
                 url: Style::default().bold(),
                 keyword: Style::default().reverse(),
+                warning: Style::rgb(0x8b, 0x00, 0x00).bold(), // dark red
                 track_nick: Style::default().reverse(),
                 track_keyword: Style::default().bold(),
             },
