@@ -141,13 +141,17 @@ fn numeric_or_generic(message: &Message) -> Event {
         },
         _ => {
             let code = message.command.as_str();
-            let text = if code.len() == 3 && code.chars().all(|c| c.is_ascii_digit()) {
+            let numeric = code.len() == 3 && code.chars().all(|c| c.is_ascii_digit());
+            let text = if numeric {
                 join(&args[1.min(args.len())..])
             } else {
                 join(args)
             };
+            // A numeric's second argument is often the channel it concerns.
+            let target = args.get(1).filter(|a| is_channel(a)).cloned();
             Event::ServerText {
                 command: code.to_string(),
+                target,
                 text,
             }
         }
@@ -182,6 +186,13 @@ fn split_first_word(s: &str) -> (&str, &str) {
 
 fn join(args: &[String]) -> String {
     args.join(" ")
+}
+
+fn is_channel(s: &str) -> bool {
+    matches!(
+        s.chars().next(),
+        Some('#') | Some('&') | Some('!') | Some('+')
+    )
 }
 
 /// Exported for callers that need the nick from a prefix.
@@ -238,7 +249,7 @@ mod tests {
     #[test]
     fn unknown_is_server_text() {
         match ev(":srv 401 me othernick :No such nick") {
-            Event::ServerText { command, text } => {
+            Event::ServerText { command, text, .. } => {
                 assert_eq!(command, "401");
                 assert_eq!(text, "othernick No such nick");
             }

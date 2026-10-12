@@ -116,6 +116,8 @@ pub enum Event {
     },
     ServerText {
         command: String,
+        /// Channel the numeric refers to, if any (for routing).
+        target: Option<String>,
         text: String,
     },
 

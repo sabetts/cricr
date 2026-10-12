@@ -315,7 +315,7 @@ impl App {
 
     fn bump_activity(&mut self, buf: usize, mentioned: bool) {
         if buf != self.current
-            && self.buffers[buf].kind != Kind::Scratch
+            && !matches!(self.buffers[buf].kind, Kind::Scratch | Kind::Server)
             && !self.buffers[buf].ignore_activity
         {
             self.activity_seq += 1;
@@ -523,6 +523,7 @@ impl App {
                 }
             }
             ParsedInput::Send(cmd) => {
+                let mut echoed = false;
                 if let ClientCommand::Privmsg { target: t, text } = &cmd {
                     if *t == target {
                         let nick = self.our_nick(server);
@@ -532,7 +533,13 @@ impl App {
                             self.chat_line(server, buf, &[], &nick, text)
                         };
                         self.push_current(line);
+                        echoed = true;
                     }
+                }
+                // Echo commands (e.g. `/topic`) so they don't just vanish.
+                if !echoed {
+                    let line = self.command_echo_line(buf, &input);
+                    self.push_line(buf, line);
                 }
                 let quitting = matches!(cmd, ClientCommand::Quit { .. });
                 self.send(server, cmd);
@@ -1704,6 +1711,17 @@ impl App {
         self.server_line(buf, None, "", text)
     }
 
+    /// Echo a user-issued command (`>>> /topic ...`) in the current buffer.
+    fn command_echo_line(&mut self, buf: usize, text: &str) -> Line {
+        let ts = now_hhmm();
+        let prefix = self.time_prefix(buf, &ts);
+        Line::from_spans(vec![
+            Span::new(prefix, self.theme.timestamp),
+            Span::new(format!(">>> {text}"), Style::fg(Color::Gray)),
+        ])
+        .indented(10)
+    }
+
     /// An error/warning line (`!!! text`) in `font-lock-warning-face`.
     fn error_line(&mut self, buf: usize, text: &str) -> Line {
         let ts = now_hhmm();
@@ -1881,12 +1899,14 @@ impl App {
                 self.buffers[idx].topic = Some(topic.clone());
                 let line = self.server_line(idx, Some(&by), "TOPIC", &topic);
                 self.push_line(idx, line);
+                self.bump_activity(idx, false);
             }
             Event::TopicReply { channel, topic, .. } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
                 let line = self.server_line(idx, None, "TOPIC", &format!("{channel} :{topic}"));
                 self.push_line(idx, line);
+                self.bump_activity(idx, false);
             }
             Event::Mode { target, modes } => {
                 let idx = self.ensure_buffer(server, target.clone(), Kind::Channel);
@@ -1917,11 +1937,23 @@ impl App {
                     self.push_line(idx, l);
                 }
             }
-            Event::ServerText { command, text } => {
-                let idx = self.servers[server].buffer;
+            Event::ServerText {
+                command,
+                target,
+                text,
+            } => {
                 if !text.is_empty() {
-                    let l = self.server_line(idx, None, &command, &text);
-                    self.push_line(idx, l);
+                    // Show channel-related numerics (e.g. topic errors) in the
+                    // channel buffer, not the server buffer.
+                    let idx = target
+                        .as_deref()
+                        .and_then(|t| self.find_buffer(server, t, Kind::Channel))
+                        .or_else(|| self.servers.get(server).map(|s| s.buffer));
+                    if let Some(idx) = idx {
+                        let l = self.server_line(idx, None, &command, &text);
+                        self.push_line(idx, l);
+                        self.bump_activity(idx, false);
+                    }
                 }
             }
             Event::Isupport { tokens } => {
@@ -1953,21 +1985,7 @@ impl App {
                 let line = self.system_line(idx, &format!("{level}: {text}"));
                 self.push_line(idx, line);
             }
-            Event::Sent { line } => {
-                let noisy = line.starts_with("PRIVMSG")
-                    || line.starts_with("NOTICE")
-                    || line.starts_with("PASS")
-                    || line.starts_with("AUTHENTICATE")
-                    || line.starts_with("CAP")
-                    || line.starts_with("PING")
-                    || line.starts_with("PONG");
-                if !noisy {
-                    let idx = self.servers[server].buffer;
-                    let l = self.system_line(idx, &line);
-                    self.push_line(idx, l);
-                }
-            }
-            Event::Received { .. } | Event::RawMessage { .. } => {}
+            Event::Sent { .. } | Event::Received { .. } | Event::RawMessage { .. } => {}
         }
     }
 
@@ -2521,6 +2539,38 @@ mod tests {
             },
         );
         assert!(app.buffers.iter().all(|b| b.target != "#a"));
+    }
+
+    #[test]
+    fn channel_numeric_routes_to_channel_and_records_activity() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.handle_event(
+            0,
+            Event::ServerText {
+                command: "482".to_string(),
+                target: Some("#c".to_string()),
+                text: "#c :You're not channel operator".to_string(),
+            },
+        );
+        let text: Vec<String> = (0..app.buffers[ch].buffer.len())
+            .map(|r| app.buffers[ch].buffer.line(r).text())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("482")));
+        assert_eq!(app.buffers[ch].unread, 1, "activity recorded");
+    }
+
+    #[test]
+    fn issued_command_is_echoed_in_current_buffer() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("/topic blah");
+        app.submit_input();
+        let text: Vec<String> = (0..app.buffers[ch].buffer.len())
+            .map(|r| app.buffers[ch].buffer.line(r).text())
+            .collect();
+        assert!(text.iter().any(|l| l.contains(">>> /topic blah")));
     }
 
     #[test]
