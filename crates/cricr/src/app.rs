@@ -163,10 +163,6 @@ impl App {
                         connected: false,
                         buffer: buf,
                     });
-                    let name = server.name.clone();
-                    self.buffers[buf]
-                        .buffer
-                        .push_plain(format!("*** Connecting to {name}..."));
                     // Forward this connection's events into the shared channel.
                     let forward = self.event_tx.clone();
                     tokio::spawn(async move {
@@ -1283,15 +1279,7 @@ impl App {
                 text,
                 tags,
             } => {
-                let our = self.our_nick(server);
-                let (target_name, kind) = if is_channel(&target) {
-                    (target, Kind::Channel)
-                } else if target == our {
-                    (from.clone(), Kind::Query)
-                } else {
-                    (target, Kind::Query)
-                };
-                let idx = self.ensure_buffer(server, target_name, kind);
+                let idx = self.route_message(server, &from, &target);
                 let mentioned = self.message_spans(server, &text).1;
                 let line = self.chat_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
@@ -1303,15 +1291,7 @@ impl App {
                 text,
                 tags,
             } => {
-                let our = self.our_nick(server);
-                let (target_name, kind) = if is_channel(&target) {
-                    (target, Kind::Channel)
-                } else if target == our {
-                    (from.clone(), Kind::Query)
-                } else {
-                    (target, Kind::Query)
-                };
-                let idx = self.ensure_buffer(server, target_name, kind);
+                let idx = self.route_message(server, &from, &target);
                 let mentioned = self.message_spans(server, &text).1;
                 let line = self.notice_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
@@ -1323,7 +1303,7 @@ impl App {
                 text,
                 tags,
             } => {
-                let idx = self.buffer_for_sender(server, &from, &target);
+                let idx = self.route_message(server, &from, &target);
                 let mentioned = self.message_spans(server, &text).1;
                 let line = self.action_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
@@ -1335,7 +1315,7 @@ impl App {
                 request,
                 body,
             } => {
-                let idx = self.buffer_for_sender(server, &from, &target);
+                let idx = self.route_message(server, &from, &target);
                 let text = if body.is_empty() {
                     request
                 } else {
@@ -1477,6 +1457,7 @@ impl App {
                     || line.starts_with("NOTICE")
                     || line.starts_with("PASS")
                     || line.starts_with("AUTHENTICATE")
+                    || line.starts_with("CAP")
                     || line.starts_with("PING")
                     || line.starts_with("PONG");
                 if !noisy {
@@ -1489,14 +1470,21 @@ impl App {
         }
     }
 
-    fn buffer_for_sender(&mut self, server: usize, from: &str, target: &str) -> usize {
-        let our = self.our_nick(server);
-        if is_channel(target) {
-            self.ensure_buffer(server, target.to_string(), Kind::Channel)
-        } else if target == our {
-            self.ensure_buffer(server, from.to_string(), Kind::Query)
-        } else {
-            self.ensure_buffer(server, target.to_string(), Kind::Query)
+    /// Route an incoming message to a buffer. Server notices (target `*` or an
+    /// empty target, or sent by the server itself) go to the server buffer;
+    /// channel targets go to the channel; everything else opens a query named
+    /// after the other party.
+    fn route_message(&mut self, server: usize, from: &str, target: &str) -> usize {
+        let route = classify(
+            from,
+            target,
+            &self.our_nick(server),
+            &self.server_name(server),
+        );
+        match route {
+            Route::Server => self.servers[server].buffer,
+            Route::Channel(channel) => self.ensure_buffer(server, channel, Kind::Channel),
+            Route::Query(nick) => self.ensure_buffer(server, nick, Kind::Query),
         }
     }
 
@@ -1540,6 +1528,29 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+/// Where an incoming message should be shown.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Server,
+    Channel(String),
+    Query(String),
+}
+
+/// Decide the destination buffer for a message from `from` addressed to
+/// `target`. Server-originated traffic (`target` of `*`/empty, or sent by the
+/// server itself) belongs in the server buffer; not a `#channel` → a query.
+fn classify(from: &str, target: &str, our: &str, server_name: &str) -> Route {
+    if target == "*" || target.is_empty() || from == server_name {
+        Route::Server
+    } else if is_channel(target) {
+        Route::Channel(target.to_string())
+    } else if target == our {
+        Route::Query(from.to_string())
+    } else {
+        Route::Query(target.to_string())
     }
 }
 
@@ -1652,6 +1663,25 @@ mod tests {
     fn common_prefix_works() {
         let items = vec!["hello".to_string(), "help".to_string(), "helm".to_string()];
         assert_eq!(common_prefix(&items), "hel");
+    }
+
+    #[test]
+    fn server_targets_fold_into_server_buffer() {
+        let s = "irc.libera.chat";
+        // registration notices: NOTICE * :***
+        assert_eq!(classify(s, "*", "me", s), Route::Server);
+        // a service notice addressed to us is a query with the service
+        assert_eq!(
+            classify("NickServ", "me", "me", s),
+            Route::Query("NickServ".into())
+        );
+        // channel traffic
+        assert_eq!(
+            classify("bob", "#rust", "me", s),
+            Route::Channel("#rust".into())
+        );
+        // a private message from another user
+        assert_eq!(classify("bob", "me", "me", s), Route::Query("bob".into()));
     }
 
     #[test]
