@@ -1,0 +1,23 @@
+[package]
+name = "cricr"
+description = "A standalone, cross-platform TUI IRC client with Emacs-style editing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cricr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+cricr-irc.workspace = true
+crossterm = "0.29.0"
+directories = "6.0.0"
+ratatui = "0.29.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.2", features = ["full"] }
+toml = "1.1.8"
+unicode-width = "=0.2.0"
