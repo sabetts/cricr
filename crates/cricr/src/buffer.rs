@@ -350,6 +350,48 @@ impl Buffer {
         self.push_line(Line::plain(text));
     }
 
+    /// Insert a line at an arbitrary row, keeping point/scroll/mark attached
+    /// to the same content.
+    pub fn insert_line(&mut self, row: usize, line: Line) {
+        let row = row.min(self.lines.len());
+        self.lines.insert(row, line);
+        if self.point.row >= row {
+            self.point.row += 1;
+        }
+        if let Some(mark) = &mut self.mark {
+            if mark.row >= row {
+                mark.row += 1;
+            }
+        }
+        if self.scroll >= row {
+            self.scroll += 1;
+        }
+    }
+
+    /// Remove the line at `row`, adjusting point/scroll/mark. Returns it.
+    pub fn remove_line(&mut self, row: usize) -> Option<Line> {
+        if row >= self.lines.len() {
+            return None;
+        }
+        let removed = self.lines.remove(row);
+        let last = self.lines.len() - 1;
+        if self.point.row > row {
+            self.point.row -= 1;
+        }
+        self.point.row = self.point.row.min(last);
+        self.point.col = self.clamp_col(self.point.row, self.point.col);
+        if let Some(mark) = &mut self.mark {
+            if mark.row > row {
+                mark.row -= 1;
+            }
+            mark.row = mark.row.min(last);
+        }
+        if self.scroll > row {
+            self.scroll -= 1;
+        }
+        Some(removed)
+    }
+
     /// Drop the oldest `n` scrollback lines, adjusting point/scroll/mark.
     pub fn truncate_front(&mut self, n: usize) {
         if n == 0 || self.lines.len() <= 1 {

@@ -12,7 +12,7 @@ use cricr_irc::commands::{self, LocalCommand, ParsedInput};
 use cricr_irc::message::Tag;
 use cricr_irc::{ClientCommand, ClientHandle, Event};
 
-use crate::buffer::{Buffer, Line, Pos, Span, Style};
+use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
 use crate::config::Config;
 use crate::input::History;
 use crate::keymap::{self, Action};
@@ -78,6 +78,8 @@ pub struct Chan {
     pub mentioned: bool,
     /// Row of the first unread line since the last visit.
     pub first_unread: Option<usize>,
+    /// Row of the inserted "read up to here" separator line, if present.
+    pub marker_row: Option<usize>,
     /// When set, activity in this buffer is not tracked (`C-c C-i`).
     pub ignore_activity: bool,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
@@ -226,6 +228,7 @@ impl App {
             unread: 0,
             mentioned: false,
             first_unread: None,
+            marker_row: None,
             ignore_activity: false,
             last_activity: 0,
             last_visited: 0,
@@ -279,6 +282,9 @@ impl App {
             if let Some(row) = &mut self.buffers[buf].first_unread {
                 *row = row.saturating_sub(excess);
             }
+            if let Some(row) = &mut self.buffers[buf].marker_row {
+                *row = row.saturating_sub(excess);
+            }
         }
     }
 
@@ -291,11 +297,35 @@ impl App {
             self.buffers[buf].unread += 1;
             self.buffers[buf].last_activity = self.activity_seq;
             if self.buffers[buf].first_unread.is_none() {
-                // The first line of the message just added.
-                self.buffers[buf].first_unread = Some(self.last_push_row);
+                // Insert a "read up to here" separator before the first unread
+                // message, so it's visible when the buffer is visited.
+                let row = self.last_push_row;
+                let marker = self.marker_line();
+                self.buffers[buf].buffer.insert_line(row, marker);
+                self.buffers[buf].marker_row = Some(row);
+                self.buffers[buf].first_unread = Some(row + 1);
             }
             if mentioned {
                 self.buffers[buf].mentioned = true;
+            }
+        }
+    }
+
+    fn marker_line(&self) -> Line {
+        Line::styled(
+            "-".repeat(self.fill_column.max(1)),
+            Style::fg(Color::DarkGray),
+        )
+    }
+
+    /// Remove a buffer's read-marker separator, if present.
+    fn remove_marker(&mut self, buf: usize) {
+        if let Some(row) = self.buffers[buf].marker_row.take() {
+            if row < self.buffers[buf].buffer.len() {
+                self.buffers[buf].buffer.remove_line(row);
+            }
+            if let Some(first) = &mut self.buffers[buf].first_unread {
+                *first = first.saturating_sub(1);
             }
         }
     }
@@ -305,12 +335,15 @@ impl App {
             return;
         }
         if idx != self.current {
-            self.previous = self.current;
+            // Leaving a buffer: its unread separator has been seen.
+            let old = self.current;
+            self.remove_marker(old);
+            self.previous = old;
         }
         self.current = idx;
         self.buffers[idx].unread = 0;
         self.buffers[idx].mentioned = false;
-        self.buffers[idx].first_unread = None;
+        // Keep the read marker / first-unread of the buffer we just entered.
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
         self.buffers[idx].buffer.end_of_buffer();
@@ -681,9 +714,6 @@ impl App {
             }
             None => self.buffers[i].buffer.end_of_buffer(),
         }
-        self.buffers[i].unread = 0;
-        self.buffers[i].mentioned = false;
-        self.buffers[i].first_unread = None;
     }
 
     fn insert_format(&mut self, code: char) {
@@ -946,6 +976,7 @@ impl App {
         self.buffers[i].ignore_activity = !self.buffers[i].ignore_activity;
         // Clear any activity already recorded for this buffer.
         if self.buffers[i].ignore_activity {
+            self.remove_marker(i);
             self.buffers[i].unread = 0;
             self.buffers[i].mentioned = false;
             self.buffers[i].first_unread = None;
@@ -2044,6 +2075,40 @@ mod tests {
             Prompt::Topic { input } => assert_eq!(input, "hello world"),
             other => panic!("expected Topic prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn activity_inserts_read_marker_and_switch_removes_it() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.push_line(a, Line::plain("hello"));
+        app.bump_activity(a, false);
+
+        assert!(app.buffers[a].marker_row.is_some());
+        let has_marker = (0..app.buffers[a].buffer.len())
+            .any(|r| app.buffers[a].buffer.line(r).text().starts_with("---"));
+        assert!(has_marker, "separator line inserted");
+        // first unread sits just below the marker
+        assert_eq!(
+            app.buffers[a].first_unread,
+            app.buffers[a].marker_row.map(|r| r + 1)
+        );
+
+        // visiting the buffer keeps the marker visible
+        app.switch_to(a);
+        assert!(app.buffers[a].marker_row.is_some());
+
+        // leaving the buffer removes it
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        assert!(app.buffers[a].marker_row.is_none());
+        let still = (0..app.buffers[a].buffer.len())
+            .any(|r| app.buffers[a].buffer.line(r).text().starts_with("---"));
+        assert!(!still, "separator removed on leaving");
     }
 
     #[test]
