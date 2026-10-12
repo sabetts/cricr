@@ -811,6 +811,36 @@ impl Buffer {
         true
     }
 
+    /// Kill the word before point (`M-DEL`), returning the killed text.
+    pub fn backward_kill_word(&mut self) -> String {
+        if !self.editable() {
+            return String::new();
+        }
+        let row = self.point.row;
+        let min = self.min_col(row);
+        let chars = self.lines[row].chars();
+        let mut col = self.point.col.min(chars.len());
+        while col > min && !is_word(chars[col - 1]) {
+            col -= 1;
+        }
+        while col > min && is_word(chars[col - 1]) {
+            col -= 1;
+        }
+        if col == self.point.col {
+            // At the line start: join with the previous line (kills the newline).
+            if self.is_irc() || row == 0 {
+                return String::new();
+            }
+            self.delete_backward();
+            return "\n".to_string();
+        }
+        let start = Pos::new(row, col);
+        let end = self.point;
+        let text = self.text_between(start, end);
+        self.delete_region(start, end);
+        text
+    }
+
     // ---- search ------------------------------------------------------------
 
     /// Find the next occurrence of `query` from `from` in the given direction.
@@ -1040,6 +1070,17 @@ mod tests {
         b.delete_forward();
         assert_eq!(b.len(), 1);
         assert_eq!(b.line(0).text(), "ab");
+    }
+
+    #[test]
+    fn backward_kill_word_deletes_word() {
+        let mut b = Buffer::new("> ");
+        b.set_input("hello world");
+        assert_eq!(b.backward_kill_word(), "world");
+        assert_eq!(b.input(), "hello ");
+        assert_eq!(b.backward_kill_word(), "hello ");
+        assert_eq!(b.input(), "");
+        assert_eq!(b.backward_kill_word(), "");
     }
 
     #[test]

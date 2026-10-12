@@ -1080,6 +1080,11 @@ impl App {
             PageDown => self.page_down(),
             DeleteBackward => self.current_mut().buffer.delete_backward(),
             DeleteForward => self.current_mut().buffer.delete_forward(),
+            BackwardKillWord => {
+                let killed = self.current_mut().buffer.backward_kill_word();
+                self.kill_ring.push(&killed, prev == LastCommand::Kill);
+                self.last_command = LastCommand::Kill;
+            }
             KillLine => {
                 let killed = self.current_mut().buffer.kill_line();
                 self.kill_ring.push(&killed, prev == LastCommand::Kill);

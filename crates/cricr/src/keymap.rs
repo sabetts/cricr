@@ -22,6 +22,7 @@ pub enum Action {
     PageDown,
     DeleteBackward,
     DeleteForward,
+    BackwardKillWord,
     KillLine,
     SetMark,
     KillRegion,
@@ -78,6 +79,8 @@ pub fn translate(key: KeyEvent) -> Action {
         KeyCode::Char(c) => SelfInsert(c),
         KeyCode::Enter => Send,
         KeyCode::Tab => Complete,
+        // M-DEL / M-Backspace: kill the word before point.
+        KeyCode::Backspace if alt => BackwardKillWord,
         KeyCode::Backspace => DeleteBackward,
         KeyCode::Delete => DeleteForward,
         KeyCode::Up => PrevLine,
@@ -190,6 +193,18 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Send
+        );
+    }
+
+    #[test]
+    fn alt_backspace_kills_word() {
+        assert_eq!(
+            translate(key(KeyCode::Backspace, KeyModifiers::ALT)),
+            Action::BackwardKillWord
+        );
+        assert_eq!(
+            translate(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Action::DeleteBackward
         );
     }
 }
