@@ -32,11 +32,13 @@ pub enum Kind {
 #[derive(Debug, Clone)]
 pub enum Prompt {
     None,
-    SwitchBuffer { input: String },
+    SwitchBuffer { input: String, selected: usize },
+    BrowseUrl { input: String, selected: usize },
 }
 
 /// One connection's shared state.
 pub struct ServerState {
+    pub name: String,
     pub handle: ClientHandle,
     pub our_nick: String,
     pub connected: bool,
@@ -53,6 +55,10 @@ pub struct Chan {
     pub unread: usize,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
     pub last_activity: u64,
+    /// Monotonic stamp of the most recent visit, for buffer-list ordering.
+    pub last_visited: u64,
+    /// Last timestamp printed, so repeats can be blanked.
+    pub last_timestamp: String,
     pub topic: Option<String>,
 }
 
@@ -94,6 +100,7 @@ pub struct App {
     pub prompt: Prompt,
     previous: usize,
     activity_seq: u64,
+    visit_seq: u64,
     ctrl_x: bool,
     ctrl_c: bool,
     quoted: bool,
@@ -117,6 +124,7 @@ impl App {
             prompt: Prompt::None,
             previous: 0,
             activity_seq: 0,
+            visit_seq: 0,
             ctrl_x: false,
             ctrl_c: false,
             quoted: false,
@@ -140,6 +148,7 @@ impl App {
                     let index = self.servers.len();
                     let buf = self.new_buffer(index, server.name.clone(), Kind::Server);
                     self.servers.push(ServerState {
+                        name: server.name.clone(),
                         handle,
                         our_nick: server
                             .nick
@@ -185,6 +194,8 @@ impl App {
             nicks: Vec::new(),
             unread: 0,
             last_activity: 0,
+            last_visited: 0,
+            last_timestamp: String::new(),
             topic: None,
         });
         self.buffers.len() - 1
@@ -249,6 +260,8 @@ impl App {
         }
         self.current = idx;
         self.buffers[idx].unread = 0;
+        self.visit_seq += 1;
+        self.buffers[idx].last_visited = self.visit_seq;
         self.buffers[idx].buffer.end_of_buffer();
     }
 
@@ -306,12 +319,21 @@ impl App {
         self.current().target.clone()
     }
 
-    /// The major-mode indicator shown in the mode line.
-    pub fn mode_line_mode(&self) -> &'static str {
-        match self.current().kind {
-            Kind::Scratch => "Fundamental",
-            _ => "rcirc",
+    /// The indicator shown in parentheses in the mode line: the server name
+    /// for IRC buffers, or the major mode for the scratch buffer.
+    pub fn mode_line_mode(&self) -> String {
+        let chan = self.current();
+        match chan.kind {
+            Kind::Scratch => "Fundamental".to_string(),
+            _ => self.server_name(chan.server),
         }
+    }
+
+    fn server_name(&self, server: usize) -> String {
+        self.servers
+            .get(server)
+            .map(|s| s.name.clone())
+            .unwrap_or_default()
     }
 
     // ---- input -------------------------------------------------------------
@@ -321,6 +343,7 @@ impl App {
         if input.trim().is_empty() {
             return;
         }
+        let buf = self.current;
         let (server, target, kind) = {
             let c = self.current();
             (c.server, c.target.clone(), c.kind)
@@ -335,15 +358,15 @@ impl App {
             ParsedInput::Message { text } => {
                 if kind == Kind::Server {
                     self.send(server, ClientCommand::Raw(text.clone()));
-                    self.echo_plain(server, target, format!(">>> {text}"));
+                    self.echo_plain(server, target, text);
                 } else {
                     if let Some(action) = action_body(&text) {
                         let nick = self.our_nick(server);
-                        let line = self.action_line(server, &[], &nick, action);
+                        let line = self.action_line(server, buf, &[], &nick, action);
                         self.push_current(line);
                     } else {
                         let nick = self.our_nick(server);
-                        let line = self.chat_line(server, &[], &nick, &text);
+                        let line = self.chat_line(server, buf, &[], &nick, &text);
                         self.push_current(line);
                     }
                     self.send(
@@ -360,9 +383,9 @@ impl App {
                     if *t == target {
                         let nick = self.our_nick(server);
                         let line = if let Some(action) = action_body(text) {
-                            self.action_line(server, &[], &nick, action)
+                            self.action_line(server, buf, &[], &nick, action)
                         } else {
-                            self.chat_line(server, &[], &nick, text)
+                            self.chat_line(server, buf, &[], &nick, text)
                         };
                         self.push_current(line);
                     }
@@ -387,7 +410,9 @@ impl App {
                 self.switch_to(idx);
             }
             LocalCommand::Clear => {
-                self.current_mut().buffer.clear();
+                let i = self.current;
+                self.buffers[i].buffer.clear();
+                self.buffers[i].last_timestamp.clear();
             }
             LocalCommand::Disconnect => {
                 self.servers[server].handle.send(ClientCommand::Disconnect);
@@ -430,7 +455,7 @@ impl App {
 
     fn echo_plain(&mut self, server: usize, target: String, text: String) {
         let idx = self.ensure_buffer(server, target, Kind::Server);
-        let line = self.system_line(&text);
+        let line = self.system_line(idx, &text);
         self.push_line(idx, line);
     }
 
@@ -486,14 +511,18 @@ impl App {
         if self.ctrl_c {
             self.ctrl_c = false;
             self.message = None;
-            if ctrl
-                && matches!(
-                    key.code,
-                    KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0')
-                )
-            {
-                self.next_active();
-                return;
+            if ctrl {
+                match key.code {
+                    KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => {
+                        self.next_active();
+                        return;
+                    }
+                    KeyCode::Char('b') => {
+                        self.start_browse_url();
+                        return;
+                    }
+                    _ => {}
+                }
             }
         } else if ctrl && key.code == KeyCode::Char('c') {
             self.ctrl_c = true;
@@ -509,72 +538,103 @@ impl App {
     fn start_switch_buffer(&mut self) {
         self.prompt = Prompt::SwitchBuffer {
             input: String::new(),
+            selected: 0,
         };
     }
 
-    fn handle_prompt_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
-            KeyCode::Esc => self.prompt = Prompt::None,
-            KeyCode::Enter => self.commit_switch_buffer(),
-            KeyCode::Tab => self.complete_prompt(),
-            KeyCode::Backspace => {
-                if let Prompt::SwitchBuffer { input } = &mut self.prompt {
-                    input.pop();
-                }
-            }
-            KeyCode::Char(c) if !ctrl => {
-                if let Prompt::SwitchBuffer { input } = &mut self.prompt {
-                    input.push(c);
-                }
-            }
-            _ => {}
-        }
+    fn start_browse_url(&mut self) {
+        self.prompt = Prompt::BrowseUrl {
+            input: String::new(),
+            selected: 0,
+        };
     }
 
-    fn commit_switch_buffer(&mut self) {
-        let input = match std::mem::replace(&mut self.prompt, Prompt::None) {
-            Prompt::SwitchBuffer { input } => input,
-            Prompt::None => return,
-        };
-        let name = input.trim();
-        if name.is_empty() {
-            let prev = self.previous;
-            if prev < self.buffers.len() {
-                self.switch_to(prev);
-            }
-            return;
-        }
-        let exact = self.buffers.iter().position(|b| b.target == name);
-        let candidate = exact.or_else(|| {
-            let matches: Vec<usize> = self
-                .buffers
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| b.target.starts_with(name))
-                .map(|(i, _)| i)
-                .collect();
-            (matches.len() == 1).then(|| matches[0])
-        });
-        match candidate {
-            Some(i) => self.switch_to(i),
-            None => self.message = Some(format!("No such buffer: {name}")),
-        }
-    }
-
-    fn complete_prompt(&mut self) {
-        let input = match &self.prompt {
-            Prompt::SwitchBuffer { input } => input.clone(),
-            Prompt::None => return,
-        };
-        let candidates: Vec<String> = self
+    /// Buffers matching `input` (case-insensitive substring), most recently
+    /// visited first, excluding the current buffer.
+    fn switch_candidates(&self, input: &str) -> Vec<usize> {
+        let needle = input.to_lowercase();
+        let mut v: Vec<usize> = self
             .buffers
             .iter()
-            .map(|b| b.target.clone())
-            .filter(|t| t.starts_with(&input))
+            .enumerate()
+            .filter(|(i, b)| {
+                *i != self.current
+                    && (needle.is_empty() || b.target.to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
             .collect();
+        v.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_visited));
+        v.truncate(5);
+        v
+    }
+
+    /// URLs in the current buffer matching `input`, most recent first.
+    fn url_candidates(&self, input: &str) -> Vec<String> {
+        let needle = input.to_lowercase();
+        self.buffer_urls()
+            .into_iter()
+            .filter(|u| needle.is_empty() || u.to_lowercase().contains(&needle))
+            .take(5)
+            .collect()
+    }
+
+    fn buffer_urls(&self) -> Vec<String> {
+        let buf = &self.current().buffer;
+        let mut urls: Vec<String> = Vec::new();
+        for row in 0..buf.len() {
+            for token in buf.line(row).text().split_whitespace() {
+                if let Some(url) = extract_url(token) {
+                    if !urls.contains(&url) {
+                        urls.push(url);
+                    }
+                }
+            }
+        }
+        urls.reverse();
+        urls
+    }
+
+    fn prompt_move(&mut self, count: usize, delta: isize) {
+        let selected = match &mut self.prompt {
+            Prompt::SwitchBuffer { selected, .. } | Prompt::BrowseUrl { selected, .. } => selected,
+            Prompt::None => return,
+        };
+        if count == 0 {
+            *selected = 0;
+            return;
+        }
+        let next = *selected as isize + delta;
+        *selected = next.clamp(0, count as isize - 1) as usize;
+    }
+
+    fn prompt_push(&mut self, c: char) {
+        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
+            &mut self.prompt
+        {
+            input.push(c);
+            *selected = 0;
+        }
+    }
+
+    fn prompt_backspace(&mut self) {
+        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
+            &mut self.prompt
+        {
+            input.pop();
+            *selected = 0;
+        }
+    }
+
+    fn prompt_complete(&mut self) {
+        let candidates = match &self.prompt {
+            Prompt::SwitchBuffer { input, .. } => self
+                .switch_candidates(input)
+                .into_iter()
+                .map(|i| self.buffers[i].target.clone())
+                .collect::<Vec<_>>(),
+            Prompt::BrowseUrl { input, .. } => self.url_candidates(input),
+            Prompt::None => return,
+        };
         if candidates.is_empty() {
             return;
         }
@@ -583,9 +643,108 @@ impl App {
         } else {
             common_prefix(&candidates)
         };
-        if let Prompt::SwitchBuffer { input } = &mut self.prompt {
+        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
+            &mut self.prompt
+        {
             *input = completion;
+            *selected = 0;
         }
+    }
+
+    fn handle_prompt_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = match &self.prompt {
+            Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
+            Prompt::BrowseUrl { input, .. } => self.url_candidates(input).len(),
+            Prompt::None => 0,
+        };
+        match key.code {
+            KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
+            KeyCode::Esc => self.prompt = Prompt::None,
+            KeyCode::Enter => self.commit_prompt(),
+            KeyCode::Tab => self.prompt_complete(),
+            KeyCode::Char('n') if ctrl => self.prompt_move(count, 1),
+            KeyCode::Char('p') if ctrl => self.prompt_move(count, -1),
+            KeyCode::Down => self.prompt_move(count, 1),
+            KeyCode::Up => self.prompt_move(count, -1),
+            KeyCode::Backspace => self.prompt_backspace(),
+            KeyCode::Char(c) if !ctrl => self.prompt_push(c),
+            _ => {}
+        }
+    }
+
+    fn commit_prompt(&mut self) {
+        match std::mem::replace(&mut self.prompt, Prompt::None) {
+            Prompt::None => {}
+            Prompt::SwitchBuffer { input, selected } => {
+                let candidates = self.switch_candidates(&input);
+                if let Some(&i) = candidates.get(selected) {
+                    self.switch_to(i);
+                } else if input.trim().is_empty() {
+                    let prev = self.previous;
+                    if prev < self.buffers.len() {
+                        self.switch_to(prev);
+                    }
+                } else if let Some(i) = self.buffers.iter().position(|b| b.target == input.trim()) {
+                    self.switch_to(i);
+                } else {
+                    self.message = Some(format!("No such buffer: {}", input.trim()));
+                }
+            }
+            Prompt::BrowseUrl { input, selected } => {
+                let urls = self.url_candidates(&input);
+                let url = urls
+                    .get(selected)
+                    .cloned()
+                    .or_else(|| (!input.trim().is_empty()).then(|| input.trim().to_string()));
+                if let Some(url) = url {
+                    self.open_url(&url);
+                }
+            }
+        }
+    }
+
+    fn open_url(&mut self, url: &str) {
+        if let Err(err) = platform_open(url) {
+            self.message = Some(format!("Could not open {url}: {err}"));
+        }
+    }
+
+    /// The active prompt as (prompt line, candidate list, selected index).
+    pub fn prompt_view(&self) -> Option<(String, Vec<String>, usize)> {
+        match &self.prompt {
+            Prompt::None => None,
+            Prompt::SwitchBuffer { input, selected } => {
+                let names = self
+                    .switch_candidates(input)
+                    .into_iter()
+                    .map(|i| self.buffers[i].target.clone())
+                    .collect();
+                Some((
+                    format!(
+                        "Switch to buffer (default {}): {input}",
+                        self.previous_buffer_name()
+                    ),
+                    names,
+                    *selected,
+                ))
+            }
+            Prompt::BrowseUrl { input, selected } => Some((
+                format!("Browse URL: {input}"),
+                self.url_candidates(input),
+                *selected,
+            )),
+        }
+    }
+
+    /// Height of the minibuffer area, expanded to show prompt candidates.
+    pub fn minibuffer_height(&self) -> u16 {
+        let extra = self
+            .prompt_view()
+            .map(|(_, candidates, _)| candidates.len().min(5))
+            .unwrap_or(0);
+        (1 + extra) as u16
     }
 
     fn perform(&mut self, action: Action) {
@@ -815,41 +974,73 @@ impl App {
         }
     }
 
-    fn chat_line(&self, server: usize, tags: &[Tag], nick: &str, text: &str) -> Line {
+    /// The 6-column timestamp field for `buf`. Repeated timestamps are blanked
+    /// so only the first line of a run carries the time.
+    fn time_prefix(&mut self, buf: usize, ts: &str) -> String {
+        if self.buffers[buf].last_timestamp == ts {
+            "      ".to_string()
+        } else {
+            self.buffers[buf].last_timestamp = ts.to_string();
+            format!("{ts} ")
+        }
+    }
+
+    fn chat_line(
+        &mut self,
+        server: usize,
+        buf: usize,
+        tags: &[Tag],
+        nick: &str,
+        text: &str,
+    ) -> Line {
+        let ts = timestamp(tags);
+        let prefix = self.time_prefix(buf, &ts);
+        let nstyle = self.nick_style(server, nick);
         Line::from_spans(vec![
-            Span::new(
-                format!("[{}] ", timestamp(tags)),
-                Style::fg(Color::DarkGray),
-            ),
-            Span::new(format!("<{nick}>"), self.nick_style(server, nick)),
+            Span::new(prefix, Style::fg(Color::DarkGray)),
+            Span::new(format!("<{nick}>"), nstyle),
             Span::new(format!(" {text}"), Style::default()),
         ])
     }
 
-    fn action_line(&self, server: usize, tags: &[Tag], nick: &str, body: &str) -> Line {
+    fn action_line(
+        &mut self,
+        server: usize,
+        buf: usize,
+        tags: &[Tag],
+        nick: &str,
+        body: &str,
+    ) -> Line {
+        let ts = timestamp(tags);
+        let prefix = self.time_prefix(buf, &ts);
+        let nstyle = self.nick_style(server, nick);
         Line::from_spans(vec![
-            Span::new(
-                format!("[{}] ", timestamp(tags)),
-                Style::fg(Color::DarkGray),
-            ),
+            Span::new(prefix, Style::fg(Color::DarkGray)),
             Span::new("* ", Style::fg(Color::Magenta)),
-            Span::new(nick.to_string(), self.nick_style(server, nick)),
+            Span::new(nick.to_string(), nstyle),
             Span::new(format!(" {body}"), Style::default()),
         ])
     }
 
-    fn system_line(&self, text: &str) -> Line {
+    /// A server/system message, prefixed with `***`.
+    fn system_line(&mut self, buf: usize, text: &str) -> Line {
+        let ts = now_hhmm();
+        let prefix = self.time_prefix(buf, &ts);
         Line::from_spans(vec![
-            Span::new(format!("[{}] ", now_hhmm()), Style::default().dim()),
+            Span::new(prefix, Style::default().dim()),
+            Span::new("*** ", Style::fg(Color::DarkGray)),
             Span::new(text.to_string(), Style::fg(Color::DarkGray)),
         ])
     }
 
-    fn event_line(&self, spans: Vec<Span>) -> Line {
-        let mut all = vec![Span::new(
-            format!("[{}] ", now_hhmm()),
-            Style::default().dim(),
-        )];
+    /// A server/event message built from `spans`, prefixed with `***`.
+    fn event_line(&mut self, buf: usize, spans: Vec<Span>) -> Line {
+        let ts = now_hhmm();
+        let prefix = self.time_prefix(buf, &ts);
+        let mut all = vec![
+            Span::new(prefix, Style::default().dim()),
+            Span::new("*** ", Style::fg(Color::DarkGray)),
+        ];
         all.extend(spans);
         Line::from_spans(all)
     }
@@ -860,36 +1051,36 @@ impl App {
         match event {
             Event::Connecting { server: name } => {
                 let idx = self.servers[server].buffer;
-                let line = self.system_line(&format!("*** Connecting to {name}..."));
+                let line = self.system_line(idx, &format!("Connecting to {name}..."));
                 self.push_line(idx, line);
             }
             Event::Connected => {
                 let idx = self.servers[server].buffer;
-                let line = self.system_line("*** Connected");
+                let line = self.system_line(idx, "Connected");
                 self.push_line(idx, line);
                 self.servers[server].connected = true;
             }
             Event::TlsEstablished => {
                 let idx = self.servers[server].buffer;
-                let line = self.system_line("*** TLS established");
+                let line = self.system_line(idx, "TLS established");
                 self.push_line(idx, line);
             }
             Event::Registered { nick } => {
                 self.servers[server].our_nick = nick.clone();
                 let idx = self.servers[server].buffer;
-                let line = self.system_line(&format!("*** Registered as {nick}"));
+                let line = self.system_line(idx, &format!("Registered as {nick}"));
                 self.push_line(idx, line);
             }
             Event::Disconnected { reason } => {
                 self.servers[server].connected = false;
                 let idx = self.servers[server].buffer;
-                let line = self.system_line(&format!("*** Disconnected: {reason}"));
+                let line = self.system_line(idx, &format!("Disconnected: {reason}"));
                 self.push_line(idx, line);
             }
             Event::ConnectionError { error } => {
                 self.servers[server].connected = false;
                 let idx = self.servers[server].buffer;
-                let line = self.system_line(&format!("*** Error: {error}"));
+                let line = self.system_line(idx, &format!("Error: {error}"));
                 self.push_line(idx, line);
             }
             Event::Privmsg {
@@ -907,7 +1098,7 @@ impl App {
                     (target, Kind::Query)
                 };
                 let idx = self.ensure_buffer(server, target_name, kind);
-                let line = self.chat_line(server, &tags, &from, &text);
+                let line = self.chat_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
                 self.bump_activity(idx);
             }
@@ -923,11 +1114,13 @@ impl App {
                     (target, Kind::Query)
                 };
                 let idx = self.ensure_buffer(server, target_name, kind);
-                let line = self.event_line(vec![
-                    Span::new("-".to_string(), Style::fg(Color::Yellow)),
-                    Span::new(format!("{from}- "), Style::fg(Color::Yellow).bold()),
-                    Span::new(text, Style::fg(Color::Yellow)),
-                ]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{from}: {text}"),
+                        Style::fg(Color::Yellow),
+                    )],
+                );
                 self.push_line(idx, line);
                 self.bump_activity(idx);
             }
@@ -938,7 +1131,7 @@ impl App {
                 tags,
             } => {
                 let idx = self.buffer_for_sender(server, &from, &target);
-                let line = self.action_line(server, &tags, &from, &text);
+                let line = self.action_line(server, idx, &tags, &from, &text);
                 self.push_line(idx, line);
                 self.bump_activity(idx);
             }
@@ -949,21 +1142,26 @@ impl App {
                 body,
             } => {
                 let idx = self.buffer_for_sender(server, &from, &target);
-                let line = self.event_line(vec![Span::new(
-                    format!("CTCP {request} from {from}: {body}"),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("CTCP {request} from {from}: {body}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Join { channel, nick } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.add_nick(idx, &nick);
                 let style = self.nick_style(server, &nick);
-                let line = self.event_line(vec![
-                    Span::new("--> ".to_string(), Style::fg(Color::Green)),
-                    Span::new(nick.clone(), style),
-                    Span::new(format!(" joined {channel}"), Style::fg(Color::DarkGray)),
-                ]);
+                let line = self.event_line(
+                    idx,
+                    vec![
+                        Span::new(nick.clone(), style),
+                        Span::new(format!(" joined {channel}"), Style::fg(Color::DarkGray)),
+                    ],
+                );
                 self.push_line(idx, line);
             }
             Event::Part {
@@ -979,14 +1177,16 @@ impl App {
                     format!(" ({reason})")
                 };
                 let style = self.nick_style(server, &nick);
-                let line = self.event_line(vec![
-                    Span::new("<-- ".to_string(), Style::fg(Color::Red)),
-                    Span::new(nick.clone(), style),
-                    Span::new(
-                        format!(" left {channel}{suffix}"),
-                        Style::fg(Color::DarkGray),
-                    ),
-                ]);
+                let line = self.event_line(
+                    idx,
+                    vec![
+                        Span::new(nick.clone(), style),
+                        Span::new(
+                            format!(" left {channel}{suffix}"),
+                            Style::fg(Color::DarkGray),
+                        ),
+                    ],
+                );
                 self.push_line(idx, line);
             }
             Event::Kick {
@@ -1002,10 +1202,13 @@ impl App {
                 } else {
                     format!(" ({reason})")
                 };
-                let line = self.event_line(vec![Span::new(
-                    format!("{by} kicked {nick} from {channel}{suffix}"),
-                    Style::fg(Color::Red),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{by} kicked {nick} from {channel}{suffix}"),
+                        Style::fg(Color::Red),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Quit { nick, reason } => {
@@ -1020,10 +1223,14 @@ impl App {
                         && self.buffers[idx].nicks.iter().any(|n| n == &nick)
                     {
                         self.remove_nick(idx, &nick);
-                        let line = self.event_line(vec![Span::new(
-                            format!("<-- {nick} quit{suffix}"),
-                            Style::fg(Color::Red),
-                        )]);
+                        let style = self.nick_style(server, &nick);
+                        let line = self.event_line(
+                            idx,
+                            vec![
+                                Span::new(nick.clone(), style),
+                                Span::new(format!(" quit{suffix}"), Style::fg(Color::Red)),
+                            ],
+                        );
                         self.push_line(idx, line);
                     }
                 }
@@ -1039,37 +1246,49 @@ impl App {
                         }
                     }
                 }
-                let line = self.event_line(vec![Span::new(
-                    format!("{old} is now known as {new}"),
-                    Style::fg(Color::DarkGray),
-                )]);
                 let idx = self.servers[server].buffer;
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{old} is now known as {new}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::TopicChanged { channel, topic, by } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
-                let line = self.event_line(vec![Span::new(
-                    format!("{by} changed the topic of {channel} to: {topic}"),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{by} changed the topic of {channel} to: {topic}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::TopicReply { channel, topic, .. } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
-                let line = self.event_line(vec![Span::new(
-                    format!("Topic for {channel}: {topic}"),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("Topic for {channel}: {topic}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Mode { target, modes } => {
                 let idx = self.ensure_buffer(server, target.clone(), Kind::Channel);
-                let line = self.event_line(vec![Span::new(
-                    format!("mode {target}: {modes}"),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("mode {target}: {modes}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Names { channel, nicks } => {
@@ -1081,56 +1300,71 @@ impl App {
             Event::NamesEnd { .. } => {}
             Event::Whois { nick, line } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(vec![Span::new(
-                    format!("{nick}: {line}"),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{nick}: {line}"),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Motd { text } | Event::ServerText { text, .. } => {
                 let idx = self.servers[server].buffer;
                 if !text.is_empty() {
-                    let l = self.server_text_line(&text);
+                    let l = self.system_line(idx, &text);
                     self.push_line(idx, l);
                 }
             }
             Event::Isupport { tokens } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(vec![Span::new(
-                    format!("*** Supported: {}", tokens.join(" ")),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("Supported: {}", tokens.join(" ")),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Ping { .. } | Event::Pong { .. } => {}
             Event::CapAck { caps } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(vec![Span::new(
-                    format!("*** Capabilities enabled: {}", caps.join(" ")),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("Capabilities enabled: {}", caps.join(" ")),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::CapNak { caps } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(vec![Span::new(
-                    format!("*** Capabilities rejected: {}", caps.join(" ")),
-                    Style::fg(Color::DarkGray),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("Capabilities rejected: {}", caps.join(" ")),
+                        Style::fg(Color::DarkGray),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::CapList { .. } | Event::Authenticate => {}
             Event::LoggedIn => {
                 let idx = self.servers[server].buffer;
-                let line = self.system_line("*** SASL authentication succeeded");
+                let line = self.system_line(idx, "SASL authentication succeeded");
                 self.push_line(idx, line);
             }
             Event::StandardReply { level, text } => {
                 let idx = self.servers[server].buffer;
-                let line = self.event_line(vec![Span::new(
-                    format!("{level}: {text}"),
-                    Style::fg(Color::Yellow),
-                )]);
+                let line = self.event_line(
+                    idx,
+                    vec![Span::new(
+                        format!("{level}: {text}"),
+                        Style::fg(Color::Yellow),
+                    )],
+                );
                 self.push_line(idx, line);
             }
             Event::Sent { line } => {
@@ -1142,7 +1376,7 @@ impl App {
                     || line.starts_with("PONG");
                 if !noisy {
                     let idx = self.servers[server].buffer;
-                    let l = self.system_line(&format!(">>> {line}"));
+                    let l = self.system_line(idx, &line);
                     self.push_line(idx, l);
                 }
             }
@@ -1159,13 +1393,6 @@ impl App {
         } else {
             self.ensure_buffer(server, target.to_string(), Kind::Query)
         }
-    }
-
-    fn server_text_line(&self, text: &str) -> Line {
-        Line::from_spans(vec![
-            Span::new(format!("[{}] ", now_hhmm()), Style::default().dim()),
-            Span::new(format!("-!- {text}"), Style::fg(Color::DarkGray)),
-        ])
     }
 
     fn add_nick(&mut self, buf: usize, nick: &str) {
@@ -1241,6 +1468,42 @@ fn common_prefix(items: &[String]) -> String {
         end = end.min(limit);
     }
     first.chars().take(end).collect()
+}
+
+/// Extract an http(s) URL from a whitespace-delimited token.
+fn extract_url(token: &str) -> Option<String> {
+    let start = token.find("http://").or_else(|| token.find("https://"))?;
+    let trimmed = token[start..].trim_end_matches(|c: char| {
+        matches!(
+            c,
+            ')' | '>' | ',' | '.' | ';' | '"' | '\'' | ']' | '}' | '\u{1}'
+        )
+    });
+    (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn platform_open(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn platform_open(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_open(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
 
 fn now_hhmm() -> String {
@@ -1353,9 +1616,42 @@ mod tests {
         let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
         app.prompt = Prompt::SwitchBuffer {
             input: "#a".to_string(),
+            selected: 0,
         };
-        app.commit_switch_buffer();
+        app.commit_prompt();
         assert_eq!(app.current, a);
         assert!(matches!(app.prompt, Prompt::None));
+    }
+
+    #[test]
+    fn switch_candidates_are_substring_and_recent_first() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#alpha".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#beta".to_string(), Kind::Channel);
+        // visiting b last makes it most recent
+        app.switch_to(a);
+        app.switch_to(b);
+        app.prompt = Prompt::SwitchBuffer {
+            input: String::new(),
+            selected: 0,
+        };
+        let names: Vec<String> = app
+            .switch_candidates("")
+            .into_iter()
+            .map(|i| app.buffers[i].target.clone())
+            .collect();
+        // current is #beta (excluded); recency order: #alpha then *scratch*
+        assert_eq!(names, vec!["#alpha", "*scratch*"]);
+        assert_eq!(app.switch_candidates("alp"), vec![a]);
+    }
+
+    #[test]
+    fn extract_url_trims_punctuation() {
+        assert_eq!(
+            extract_url("see (https://example.com/x).").as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(extract_url("http://a.b"), Some("http://a.b".to_string()));
+        assert_eq!(extract_url("not-a-url"), None);
     }
 }

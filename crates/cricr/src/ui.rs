@@ -6,15 +6,16 @@ use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Prompt};
+use crate::app::App;
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::SearchDirection;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    let minibuffer = app.minibuffer_height().max(1);
     let rows = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(minibuffer),
     ])
     .split(frame.area());
 
@@ -75,22 +76,30 @@ fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
-    let text = match &app.prompt {
-        Prompt::SwitchBuffer { input } => {
-            format!(
-                "Switch to buffer (default {}): {input}",
-                app.previous_buffer_name()
-            )
-        }
-        Prompt::None if app.search.active => {
-            let prefix = match app.search.direction {
-                SearchDirection::Forward => "I-search",
-                SearchDirection::Backward => "I-search backward",
+    if let Some((prompt, candidates, selected)) = app.prompt_view() {
+        let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
+        lines.push(RLine::from(prompt));
+        for (i, candidate) in candidates.iter().enumerate() {
+            let style = if i == selected {
+                RStyle::default().add_modifier(Modifier::REVERSED)
+            } else {
+                RStyle::default()
             };
-            let suffix = if app.search.failed { " [failing]" } else { "" };
-            format!("{prefix}: {}{suffix}", app.search.query)
+            lines.push(RLine::from(RSpan::styled(format!("  {candidate}"), style)));
         }
-        Prompt::None => app.message.clone().unwrap_or_default(),
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
+    let text = if app.search.active {
+        let prefix = match app.search.direction {
+            SearchDirection::Forward => "I-search",
+            SearchDirection::Backward => "I-search backward",
+        };
+        let suffix = if app.search.failed { " [failing]" } else { "" };
+        format!("{prefix}: {}{suffix}", app.search.query)
+    } else {
+        app.message.clone().unwrap_or_default()
     };
     frame.render_widget(Paragraph::new(text), area);
 }
