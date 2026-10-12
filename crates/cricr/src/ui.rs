@@ -62,9 +62,10 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = app.current().buffer.point().row + 1;
     let base = RStyle::default().add_modifier(Modifier::REVERSED);
+    let minor = if app.ignore_activity() { " Ignore" } else { "" };
     let mut spans = vec![RSpan::styled(
         format!(
-            " {}  ({})  L{} ",
+            " {}  ({}){minor}  L{} ",
             app.mode_line_name(),
             app.mode_line_mode(),
             line

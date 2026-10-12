@@ -33,8 +33,18 @@ pub enum Kind {
 #[derive(Debug, Clone)]
 pub enum Prompt {
     None,
-    SwitchBuffer { input: String, selected: usize },
-    BrowseUrl { input: String, selected: usize },
+    SwitchBuffer {
+        input: String,
+        selected: usize,
+    },
+    BrowseUrl {
+        input: String,
+        selected: usize,
+    },
+    /// Set the channel topic, prefilled with the current one (`C-c C-t`).
+    Topic {
+        input: String,
+    },
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, or `C-c C-f`).
@@ -68,6 +78,8 @@ pub struct Chan {
     pub mentioned: bool,
     /// Row of the first unread line since the last visit.
     pub first_unread: Option<usize>,
+    /// When set, activity in this buffer is not tracked (`C-c C-i`).
+    pub ignore_activity: bool,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
     pub last_activity: u64,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
@@ -208,6 +220,7 @@ impl App {
             unread: 0,
             mentioned: false,
             first_unread: None,
+            ignore_activity: false,
             last_activity: 0,
             last_visited: 0,
             last_timestamp: String::new(),
@@ -261,7 +274,10 @@ impl App {
     }
 
     fn bump_activity(&mut self, buf: usize, mentioned: bool) {
-        if buf != self.current && self.buffers[buf].kind != Kind::Scratch {
+        if buf != self.current
+            && self.buffers[buf].kind != Kind::Scratch
+            && !self.buffers[buf].ignore_activity
+        {
             self.activity_seq += 1;
             self.buffers[buf].unread += 1;
             self.buffers[buf].last_activity = self.activity_seq;
@@ -361,6 +377,11 @@ impl App {
             .get(self.previous)
             .map(|b| b.target.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether activity in the current buffer is ignored.
+    pub fn ignore_activity(&self) -> bool {
+        self.current().ignore_activity
     }
 
     /// The buffer name shown in the mode line.
@@ -586,10 +607,11 @@ impl App {
                     self.message = Some("C-c C-f-".to_string());
                 }
                 KeyCode::Char('n') if ctrl => self.cmd_names(),
+                KeyCode::Char('i') if ctrl => self.toggle_ignore_activity(),
                 KeyCode::Char('j') if ctrl => self.prefill("/join "),
                 KeyCode::Char('p') if ctrl => self.prefill("/part "),
                 KeyCode::Char('q') if ctrl => self.prefill("/query "),
-                KeyCode::Char('t') if ctrl => self.prefill("/topic "),
+                KeyCode::Char('t') if ctrl => self.start_topic(),
                 KeyCode::Char('w') if ctrl => self.prefill("/whois "),
                 KeyCode::Char('m') if ctrl => self.prefill("/msg "),
                 KeyCode::Char('k') if ctrl => self.prefill("/kick "),
@@ -762,7 +784,7 @@ impl App {
     fn prompt_move(&mut self, count: usize, delta: isize) {
         let selected = match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. } | Prompt::BrowseUrl { selected, .. } => selected,
-            Prompt::None => return,
+            Prompt::None | Prompt::Topic { .. } => return,
         };
         if count == 0 {
             *selected = 0;
@@ -773,20 +795,26 @@ impl App {
     }
 
     fn prompt_push(&mut self, c: char) {
-        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
-            &mut self.prompt
-        {
-            input.push(c);
-            *selected = 0;
+        match &mut self.prompt {
+            Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } => {
+                input.push(c);
+                *selected = 0;
+            }
+            Prompt::Topic { input } => input.push(c),
+            Prompt::None => {}
         }
     }
 
     fn prompt_backspace(&mut self) {
-        if let Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } =
-            &mut self.prompt
-        {
-            input.pop();
-            *selected = 0;
+        match &mut self.prompt {
+            Prompt::SwitchBuffer { input, selected } | Prompt::BrowseUrl { input, selected } => {
+                input.pop();
+                *selected = 0;
+            }
+            Prompt::Topic { input } => {
+                input.pop();
+            }
+            Prompt::None => {}
         }
     }
 
@@ -798,7 +826,7 @@ impl App {
                 .map(|i| self.buffers[i].target.clone())
                 .collect::<Vec<_>>(),
             Prompt::BrowseUrl { input, .. } => self.url_candidates(input),
-            Prompt::None => return,
+            Prompt::None | Prompt::Topic { .. } => return,
         };
         if candidates.is_empty() {
             return;
@@ -822,7 +850,7 @@ impl App {
         let count = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::BrowseUrl { input, .. } => self.url_candidates(input).len(),
-            Prompt::None => 0,
+            Prompt::None | Prompt::Topic { .. } => 0,
         };
         match key.code {
             KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
@@ -868,7 +896,60 @@ impl App {
                     self.open_url(&url);
                 }
             }
+            Prompt::Topic { input } => {
+                let (server, kind, target) = {
+                    let c = self.current();
+                    (c.server, c.kind, c.target.clone())
+                };
+                if kind != Kind::Channel {
+                    self.message = Some("Not a channel buffer".to_string());
+                    return;
+                }
+                let current = self.current().topic.clone();
+                if input.is_empty() {
+                    // No new topic: just query.
+                    self.send(
+                        server,
+                        ClientCommand::Topic {
+                            channel: target,
+                            topic: None,
+                        },
+                    );
+                } else if Some(input.clone()) != current {
+                    self.send(
+                        server,
+                        ClientCommand::Topic {
+                            channel: target,
+                            topic: Some(input),
+                        },
+                    );
+                }
+            }
         }
+    }
+
+    fn start_topic(&mut self) {
+        let topic = self.current().topic.clone().unwrap_or_default();
+        self.prompt = Prompt::Topic { input: topic };
+    }
+
+    fn toggle_ignore_activity(&mut self) {
+        let i = self.current;
+        self.buffers[i].ignore_activity = !self.buffers[i].ignore_activity;
+        // Clear any activity already recorded for this buffer.
+        if self.buffers[i].ignore_activity {
+            self.buffers[i].unread = 0;
+            self.buffers[i].mentioned = false;
+            self.buffers[i].first_unread = None;
+        }
+        self.message = Some(
+            if self.buffers[i].ignore_activity {
+                "Ignore activity in this buffer"
+            } else {
+                "Notice activity in this buffer"
+            }
+            .to_string(),
+        );
     }
 
     fn open_url(&mut self, url: &str) {
@@ -901,6 +982,7 @@ impl App {
                 self.url_candidates(input),
                 *selected,
             )),
+            Prompt::Topic { input } => Some((format!("Topic: {input}"), Vec::new(), 0)),
         }
     }
 
@@ -1891,6 +1973,39 @@ mod tests {
         press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert_eq!(app.current().buffer.input(), "\u{2}\u{f}");
+    }
+
+    #[test]
+    fn toggle_ignore_activity_suppresses_activity() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.switch_to(a);
+        app.toggle_ignore_activity();
+        assert!(app.buffers[a].ignore_activity);
+        assert!(app.ignore_activity());
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        app.bump_activity(a, false);
+        assert_eq!(app.buffers[a].unread, 0, "ignored buffer gets no activity");
+    }
+
+    #[test]
+    fn c_c_c_t_prefills_current_topic() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.switch_to(a);
+        app.buffers[a].topic = Some("hello world".to_string());
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        match &app.prompt {
+            Prompt::Topic { input } => assert_eq!(input, "hello world"),
+            other => panic!("expected Topic prompt, got {other:?}"),
+        }
     }
 
     #[test]
