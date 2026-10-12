@@ -1,6 +1,7 @@
 //! Asynchronous IRC connection: TCP + optional TLS, IRCv3 negotiation, SASL,
 //! registration, and command handling.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -82,9 +83,104 @@ pub fn spawn(config: ClientConfig) -> (ClientHandle, mpsc::UnboundedReceiver<Eve
 }
 
 enum Out {
+    /// Send immediately (control traffic: registration, PONG, keepalive).
     Send(String),
+    /// Send subject to flood protection (user messages).
+    Queue(String),
     Emit(Event),
     Close,
+}
+
+/// A simple token bucket limiting how fast user messages are sent.
+struct FloodLimiter {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last: std::time::Instant,
+}
+
+impl FloodLimiter {
+    fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        FloodLimiter {
+            tokens: capacity,
+            capacity,
+            refill_per_sec,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Replenish tokens based on elapsed time.
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+    }
+
+    fn take(&mut self) -> bool {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Maximum length of an IRC protocol line (including CRLF).
+const MAX_LINE: usize = 510;
+
+/// Split `text` into chunks of at most `max` characters, preferring to break
+/// on whitespace. Very long words are hard-split.
+fn split_message(text: &str, max: usize) -> Vec<String> {
+    if max == 0 || text.chars().count() <= max {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if wlen > max {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            let mut chars: Vec<char> = word.chars().collect();
+            while chars.len() > max {
+                out.push(chars.drain(..max).collect());
+            }
+            cur.extend(chars);
+            continue;
+        }
+        let cur_len = cur.chars().count();
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur_len + 1 + wlen <= max {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Build the queued `PRIVMSG`/`NOTICE` lines for a user message, splitting it
+/// to fit the protocol line limit. CTCP messages are not split (framing).
+fn message_lines(command: &str, target: &str, text: &str) -> Vec<Out> {
+    if text.starts_with('\u{1}') {
+        return vec![Out::Queue(format!("{command} {target} :{text}"))];
+    }
+    let overhead = command.len() + 1 + target.len() + 2 + 2;
+    let max = MAX_LINE.saturating_sub(overhead).clamp(16, 400);
+    split_message(text, max)
+        .into_iter()
+        .map(|chunk| Out::Queue(format!("{command} {target} :{chunk}")))
+        .collect()
 }
 
 enum Connection {
@@ -165,13 +261,21 @@ async fn run(
     let mut writer = write_half;
     let mut state = State::new(config);
 
+    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut limiter = FloodLimiter::new(4.0, 0.7);
+
     for out in state.on_connected() {
-        apply(out, &mut writer, evt_tx).await?;
+        apply(out, &mut writer, evt_tx, &mut pending).await?;
     }
 
     let mut ping = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
+
+    // Drain the flood-protected queue frequently.
+    let mut drain = tokio::time::interval(Duration::from_millis(100));
+    drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    drain.tick().await;
 
     loop {
         tokio::select! {
@@ -182,7 +286,7 @@ async fn run(
                         if let Ok(msg) = Message::parse(&line) {
                             for out in state.on_message(&msg) {
                                 if let Out::Close = out { break; }
-                                apply(out, &mut writer, evt_tx).await?;
+                                apply(out, &mut writer, evt_tx, &mut pending).await?;
                             }
                         }
                     }
@@ -198,7 +302,7 @@ async fn run(
                         let mut closing = false;
                         for out in state.on_command(cmd) {
                             if let Out::Close = out { closing = true; continue; }
-                            apply(out, &mut writer, evt_tx).await?;
+                            apply(out, &mut writer, evt_tx, &mut pending).await?;
                         }
                         if closing {
                             let _ = evt_tx.send(Event::Disconnected { reason: "Quit".into() });
@@ -208,30 +312,54 @@ async fn run(
                     None => return Ok(()),
                 }
             }
+            _ = drain.tick() => {
+                while !pending.is_empty() && limiter.take() {
+                    let line = pending.pop_front().expect("checked non-empty");
+                    write_line(&mut writer, &line, evt_tx).await?;
+                }
+            }
             _ = ping.tick() => {
                 let line = state.keepalive();
-                apply(Out::Send(line), &mut writer, evt_tx).await?;
+                apply(Out::Send(line), &mut writer, evt_tx, &mut pending).await?;
             }
         }
     }
 }
 
-async fn apply<W>(out: Out, writer: &mut W, evt_tx: &mpsc::UnboundedSender<Event>) -> io::Result<()>
+async fn apply<W>(
+    out: Out,
+    writer: &mut W,
+    evt_tx: &mpsc::UnboundedSender<Event>,
+    pending: &mut VecDeque<String>,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     match out {
-        Out::Send(line) => {
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\r\n").await?;
-            writer.flush().await?;
-            let _ = evt_tx.send(Event::Sent { line });
-        }
+        Out::Send(line) => write_line(writer, &line, evt_tx).await?,
+        Out::Queue(line) => pending.push_back(line),
         Out::Emit(event) => {
             let _ = evt_tx.send(event);
         }
         Out::Close => {}
     }
+    Ok(())
+}
+
+async fn write_line<W>(
+    writer: &mut W,
+    line: &str,
+    evt_tx: &mpsc::UnboundedSender<Event>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\r\n").await?;
+    writer.flush().await?;
+    let _ = evt_tx.send(Event::Sent {
+        line: line.to_string(),
+    });
     Ok(())
 }
 
@@ -441,8 +569,8 @@ impl State {
         use ClientCommand::*;
         match command {
             Raw(line) => vec![Out::Send(line)],
-            Privmsg { target, text } => vec![Out::Send(format!("PRIVMSG {target} :{text}"))],
-            Notice { target, text } => vec![Out::Send(format!("NOTICE {target} :{text}"))],
+            Privmsg { target, text } => message_lines("PRIVMSG", &target, &text),
+            Notice { target, text } => message_lines("NOTICE", &target, &text),
             Join { channel, keys } => match keys {
                 Some(k) => vec![Out::Send(format!("JOIN {channel} {k}"))],
                 None => vec![Out::Send(format!("JOIN {channel}"))],
@@ -482,5 +610,61 @@ impl State {
             },
             Disconnect => vec![Out::Send("QUIT :cricr".into()), Out::Close],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_message_keeps_short_text() {
+        assert_eq!(split_message("hello world", 400), vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_message_hard_breaks_long_words() {
+        let text = "a".repeat(50);
+        let chunks = split_message(&text, 20);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 20));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn split_message_breaks_on_words() {
+        let text = "word ".repeat(40);
+        let chunks = split_message(text.trim(), 20);
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().count() <= 20));
+    }
+
+    #[test]
+    fn message_lines_splits_and_fits() {
+        let outs = message_lines("PRIVMSG", "#channel", &"x".repeat(2000));
+        assert!(outs.len() > 1);
+        for out in outs {
+            match out {
+                Out::Queue(line) => assert!(line.len() <= MAX_LINE),
+                _ => panic!("expected queued line"),
+            }
+        }
+    }
+
+    #[test]
+    fn message_lines_keeps_ctcp_whole() {
+        let text = format!("\u{1}ACTION {}\u{1}", "z".repeat(2000));
+        let outs = message_lines("PRIVMSG", "#c", &text);
+        assert_eq!(outs.len(), 1);
+    }
+
+    #[test]
+    fn flood_limiter_bursts_then_throttles() {
+        let mut limiter = FloodLimiter::new(2.0, 0.7);
+        assert!(limiter.take());
+        assert!(limiter.take());
+        assert!(!limiter.take());
     }
 }
