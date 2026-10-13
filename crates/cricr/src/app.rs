@@ -1114,7 +1114,8 @@ impl App {
     }
 
     fn open_url(&mut self, url: &str) {
-        if let Err(err) = platform_open(url) {
+        let url = normalize_url(url);
+        if let Err(err) = platform_open(&url) {
             self.message = Some(format!("Could not open {url}: {err}"));
         }
     }
@@ -2217,26 +2218,52 @@ fn extract_url(token: &str) -> Option<String> {
     (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
 }
 
+/// Give a bare host (`example.com`) a scheme so the OS opener treats it as a
+/// URL rather than a program/file.
+fn normalize_url(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.contains("://") || trimmed.starts_with("mailto:") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn platform_open(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd")
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("cmd")
         .args(["/C", "start", "", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
 }
 
 #[cfg(target_os = "macos")]
 fn platform_open(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("open")
+    use std::process::{Command, Stdio};
+    Command::new("open")
         .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn platform_open(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
+    use std::process::{Command, Stdio};
+    Command::new("xdg-open")
         .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
 }
@@ -2960,6 +2987,14 @@ mod tests {
         assert!(url_spans
             .iter()
             .any(|s| s.style.bold && s.text == "https://example.com/x"));
+    }
+
+    #[test]
+    fn normalize_url_adds_scheme() {
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+        assert_eq!(normalize_url("  example.com/x  "), "https://example.com/x");
+        assert_eq!(normalize_url("http://x"), "http://x");
+        assert_eq!(normalize_url("mailto:a@b"), "mailto:a@b");
     }
 
     #[test]
