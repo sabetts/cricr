@@ -23,6 +23,9 @@ use crate::sasl::SaslCredentials;
 use crate::{caps, handlers, sasl};
 
 const KEEPALIVE_SECS: u64 = 60;
+/// How long without *any* server traffic before the connection is treated as
+/// dead (we probe with a keepalive PING every `KEEPALIVE_SECS`).
+const LIVENESS_TIMEOUT_SECS: u64 = KEEPALIVE_SECS * 2;
 /// How long to wait for NickServ to confirm before joining channels anyway.
 const NICKSERV_TIMEOUT_SECS: u64 = 5;
 
@@ -303,6 +306,9 @@ async fn run(
     let mut reader = BufReader::new(read_half);
     let mut writer = write_half;
     let mut state = State::new(config);
+    // Time of the last line received; used to detect half-open connections.
+    // Uses `tokio::time` so the timeout is testable under a paused clock.
+    let mut last_rx = tokio::time::Instant::now();
 
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut limiter = FloodLimiter::new(4.0, 0.7);
@@ -325,6 +331,7 @@ async fn run(
             line = read_line(&mut reader) => {
                 match line? {
                     Some(line) => {
+                        last_rx = tokio::time::Instant::now();
                         let _ = evt_tx.send(Event::Received { line: line.clone() });
                         if let Ok(msg) = Message::parse(&line) {
                             for out in state.on_message(&msg) {
@@ -365,6 +372,15 @@ async fn run(
                 }
             }
             _ = ping.tick() => {
+                // No traffic since well before the last keepalive probe: the
+                // connection is half-open (e.g. a silent network drop). Bail so
+                // the UI can reconnect.
+                if last_rx.elapsed() > Duration::from_secs(LIVENESS_TIMEOUT_SECS) {
+                    let _ = evt_tx.send(Event::ConnectionError {
+                        error: "Ping timeout".into(),
+                    });
+                    return Ok(());
+                }
                 let line = state.keepalive();
                 apply(Out::Send(line), &mut writer, evt_tx, &mut pending).await?;
             }

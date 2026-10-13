@@ -12,6 +12,8 @@ pub enum LocalCommand {
     Close,
     /// Close the current buffer's connection.
     Disconnect,
+    /// Reconnect the current buffer's server.
+    Reconnect,
     /// Clear the current buffer's scrollback.
     Clear,
     /// Switch to another buffer by name.
@@ -166,6 +168,7 @@ pub fn parse(input: &str, current_target: Option<&str>) -> ParsedInput {
         "close" => ParsedInput::Local(LocalCommand::Close),
         "clear" => ParsedInput::Local(LocalCommand::Clear),
         "disconnect" => ParsedInput::Local(LocalCommand::Disconnect),
+        "reconnect" => ParsedInput::Local(LocalCommand::Reconnect),
         "buffer" if !first.is_empty() => {
             ParsedInput::Local(LocalCommand::Switch(first.to_string()))
         }
@@ -277,6 +280,18 @@ mod tests {
                 target: "NickServ".into(),
                 text: "ghost me".into()
             })
+        );
+    }
+
+    #[test]
+    fn reconnect_command() {
+        assert_eq!(
+            parse("/reconnect", Some("#c")),
+            ParsedInput::Local(LocalCommand::Reconnect)
+        );
+        assert_eq!(
+            parse("/disconnect", Some("#c")),
+            ParsedInput::Local(LocalCommand::Disconnect)
         );
     }
 

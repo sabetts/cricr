@@ -163,6 +163,59 @@ async fn sends_topic_command() {
     let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn ping_timeout_reports_connection_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let _server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(read_half);
+        while let Some(line) = read_line(&mut rd).await {
+            let upper = line.to_ascii_uppercase();
+            if upper.starts_with("CAP LS") {
+                wr.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+            } else if upper.starts_with("CAP END") {
+                wr.write_all(b":srv 001 nick :Welcome\r\n").await.unwrap();
+                break;
+            }
+        }
+        // Go silent: never answer the client's keepalive PING.
+        std::future::pending::<()>().await;
+    });
+
+    let (_handle, mut rx) = spawn(ClientConfig {
+        server: "127.0.0.1".to_string(),
+        port: addr.port(),
+        tls: false,
+        nick: "nick".to_string(),
+        user_name: "u".to_string(),
+        full_name: "n".to_string(),
+        server_password: None,
+        sasl: None,
+        nickserv: None,
+        client_cert: None,
+        channels: vec![],
+    });
+
+    let error = tokio::time::timeout(Duration::from_secs(10_000), async {
+        while let Some(event) = rx.recv().await {
+            if let Event::ConnectionError { error } = event {
+                return error;
+            }
+        }
+        String::new()
+    })
+    .await
+    .expect("timed out waiting for a ping-timeout error");
+
+    assert!(
+        error.to_ascii_lowercase().contains("ping"),
+        "unexpected error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn nickserv_identifies_before_joining() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
