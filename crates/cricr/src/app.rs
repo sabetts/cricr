@@ -28,6 +28,8 @@ pub enum Kind {
     Query,
     /// A free text buffer (no prompt), like Emacs's `*scratch*`.
     Scratch,
+    /// The `*Help*` buffer (also a free text buffer, but killable).
+    Help,
 }
 
 /// The minibuffer prompt, if one is active.
@@ -244,7 +246,7 @@ impl App {
     }
 
     fn new_buffer(&mut self, server: usize, target: String, kind: Kind) -> usize {
-        let mut buffer = if kind == Kind::Scratch {
+        let mut buffer = if matches!(kind, Kind::Scratch | Kind::Help) {
             Buffer::text()
         } else {
             Buffer::new("> ")
@@ -324,7 +326,7 @@ impl App {
 
     fn bump_activity(&mut self, buf: usize, mentioned: bool) {
         if buf != self.current
-            && self.buffers[buf].kind != Kind::Scratch
+            && !matches!(self.buffers[buf].kind, Kind::Scratch | Kind::Help)
             && !self.buffers[buf].ignore_activity
         {
             self.activity_seq += 1;
@@ -478,6 +480,7 @@ impl App {
         let chan = self.current();
         match chan.kind {
             Kind::Scratch => "Fundamental".to_string(),
+            Kind::Help => "Help".to_string(),
             _ => self.server_name(chan.server),
         }
     }
@@ -615,7 +618,7 @@ impl App {
                     },
                 );
             }
-            Kind::Query => {}
+            Kind::Query | Kind::Help => {}
         }
         self.buffers.remove(idx);
         if self.current > idx {
@@ -777,7 +780,7 @@ impl App {
                 idx
             }
             None => {
-                let idx = self.new_buffer(0, "*Help*".to_string(), Kind::Scratch);
+                let idx = self.new_buffer(0, "*Help*".to_string(), Kind::Help);
                 self.buffers[idx].buffer.set_content(lines);
                 idx
             }
@@ -1223,7 +1226,7 @@ impl App {
             None => {}
             SelfInsert(c) => self.current_mut().buffer.insert_char(c),
             Send => {
-                if self.current().kind == Kind::Scratch {
+                if matches!(self.current().kind, Kind::Scratch | Kind::Help) {
                     self.current_mut().buffer.insert_newline();
                 } else {
                     self.submit_input();
@@ -1261,7 +1264,7 @@ impl App {
             HistoryPrev => self.history_prev(),
             HistoryNext => self.history_next(),
             Complete => {
-                if self.current().kind == Kind::Scratch {
+                if matches!(self.current().kind, Kind::Scratch | Kind::Help) {
                     self.current_mut().buffer.insert_str("    ");
                 } else {
                     self.complete();
@@ -2787,6 +2790,23 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.buffers.iter().all(|x| x.target != "#b"));
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn help_buffer_is_killable() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        let help = app
+            .buffers
+            .iter()
+            .position(|b| b.target == "*Help*")
+            .unwrap();
+        let before = app.buffers.len();
+        app.kill_buffer(help);
+        assert_eq!(app.buffers.len(), before - 1);
+        assert!(app.buffers.iter().all(|b| b.target != "*Help*"));
     }
 
     #[test]
