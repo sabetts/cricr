@@ -160,7 +160,7 @@ impl Default for UiConfig {
             scrollback_lines: 100_000,
             fill_column: 70,
             clipboard: true,
-            title_badge: false,
+            title_badge: true,
             background: Background::Dark,
         }
     }
@@ -181,7 +181,7 @@ timestamp_format = "%H:%M"
 scrollback_lines = 100000
 fill_column = 70      # word-wrap messages at this column (0 = off)
 clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
-title_badge = false   # show buffers with activity in the terminal title (OSC 2)
+title_badge = true    # show buffers with activity in the terminal title (OSC 2)
 background = "dark"   # or "light"
 
 # After an unexpected drop cricr reconnects with exponential backoff: it waits
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
         assert_eq!(cfg.ui.fill_column, 70);
         assert!(cfg.ui.clipboard);
-        assert!(!cfg.ui.title_badge);
+        assert!(cfg.ui.title_badge);
         assert!(TEMPLATE.contains("title_badge"));
         assert_eq!(cfg.ui.background, Background::Dark);
     }
@@ -364,10 +364,10 @@ mod tests {
     #[test]
     fn title_badge_defaults_and_overrides() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(!cfg.ui.title_badge);
-
-        let cfg: Config = toml::from_str("[ui]\ntitle_badge = true\n").unwrap();
         assert!(cfg.ui.title_badge);
+
+        let cfg: Config = toml::from_str("[ui]\ntitle_badge = false\n").unwrap();
+        assert!(!cfg.ui.title_badge);
     }
 
     #[test]

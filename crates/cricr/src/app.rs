@@ -4214,9 +4214,10 @@ mod tests {
     #[test]
     fn title_badge_off_does_not_touch_title() {
         let mut app = app_without_servers();
+        app.config.ui.title_badge = false;
         let b = app.new_buffer(0, "bob".to_string(), Kind::Query);
         app.bump_activity(b, false);
-        // Default is off: sync is a no-op and nothing is cached.
+        // Disabled: sync is a no-op and nothing is cached (or written).
         app.sync_title();
         assert!(app.last_title.is_empty());
     }
