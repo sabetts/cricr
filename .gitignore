@@ -1,3 +1,4 @@
 /target
 **/*.rs.bk
 /contrib/rcirc.el
+/test-config.toml
