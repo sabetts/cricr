@@ -1079,6 +1079,18 @@ impl Buffer {
             self.scroll = self.point.row;
         }
     }
+
+    /// Keep point within a window `height` rows tall, scrolling only when point
+    /// reaches the top or bottom edge (Emacs-style). Unlike `scroll_into_view`,
+    /// this also scrolls *down* when point falls below the window.
+    pub fn ensure_point_visible(&mut self, height: usize) {
+        let height = height.max(1);
+        if self.point.row < self.scroll {
+            self.scroll = self.point.row;
+        } else if self.point.row >= self.scroll + height {
+            self.scroll = self.point.row + 1 - height;
+        }
+    }
 }
 
 fn is_word(c: char) -> bool {

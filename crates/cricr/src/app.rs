@@ -2089,6 +2089,14 @@ impl App {
         self.viewport_rows.saturating_sub(2).max(1)
     }
 
+    /// Scroll the current buffer's window so point stays visible, moving the
+    /// window only when point reaches the top or bottom edge (Emacs-style).
+    fn ensure_scroll_visible(&mut self) {
+        let height = self.viewport_rows.max(1);
+        let cur = self.current;
+        self.buffers[cur].buffer.ensure_point_visible(height);
+    }
+
     fn page_up(&mut self) {
         let n = self.page_lines();
         self.current_mut().buffer.page_backward(n);
@@ -3105,6 +3113,7 @@ impl App {
                 // Buffer view height = terminal rows minus mode line + minibuffer.
                 self.viewport_rows = size.height.saturating_sub(2) as usize;
             }
+            self.ensure_scroll_visible();
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
             self.sync_title();
             if self.should_quit {
@@ -3714,6 +3723,38 @@ mod tests {
         assert_eq!(app.current().buffer.point().row, bottom - 8);
         app.perform(Action::PageDown);
         assert_eq!(app.current().buffer.point().row, bottom);
+    }
+
+    #[test]
+    fn window_scrolls_only_at_the_edges() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..20 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.viewport_rows = 5;
+        app.current_mut().buffer.end_of_buffer();
+        app.ensure_scroll_visible();
+        let bottom = app.current().buffer.scroll();
+        // At the end, the window shows the last `height` rows.
+        assert_eq!(bottom, app.current().buffer.last_row() + 1 - 5);
+
+        // Moving up one line keeps the window put; point moves within it.
+        app.perform(Action::PrevLine);
+        app.ensure_scroll_visible();
+        assert_eq!(
+            app.current().buffer.scroll(),
+            bottom,
+            "should not scroll yet"
+        );
+
+        // Only when point reaches the top edge does the window scroll by one.
+        for _ in 0..4 {
+            app.perform(Action::PrevLine);
+            app.ensure_scroll_visible();
+        }
+        assert_eq!(app.current().buffer.scroll(), bottom - 1);
     }
 
     #[test]
