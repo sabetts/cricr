@@ -226,6 +226,8 @@ pub struct App {
     last_push_row: usize,
     /// Scrollback cache directory (`None` when history caching is disabled).
     history_dir: Option<PathBuf>,
+    /// The terminal title last written, so it is only emitted when it changes.
+    last_title: String,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
 }
 
@@ -264,6 +266,7 @@ impl App {
             copy_flash: None,
             last_push_row: 0,
             history_dir,
+            last_title: String::new(),
             event_tx,
         };
         app.connect_all();
@@ -701,6 +704,51 @@ impl App {
         } else {
             format!("[{}]", targets.join(","))
         }
+    }
+
+    /// The terminal title: the app name, with the buffers that have pending
+    /// activity appended (e.g. `cricr [bob,#emacs]`).
+    fn terminal_title(&self) -> String {
+        let entries = self.activity_entries();
+        if entries.is_empty() {
+            return "cricr".to_string();
+        }
+        let shown: Vec<&str> = entries.iter().take(4).map(|(n, _)| n.as_str()).collect();
+        let mut title = format!("cricr [{}", shown.join(","));
+        if entries.len() > shown.len() {
+            title.push_str(&format!(" +{}", entries.len() - shown.len()));
+        }
+        title.push(']');
+        title
+    }
+
+    /// Emit the terminal title when the activity badge changes (`[ui]
+    /// title_badge`).
+    fn sync_title(&mut self) {
+        if !self.config.ui.title_badge {
+            return;
+        }
+        let title = self.terminal_title();
+        if title == self.last_title {
+            return;
+        }
+        self.write_title(&title);
+        self.last_title = title;
+    }
+
+    /// Reset the terminal title on exit, leaving it for the shell to reclaim.
+    fn reset_title(&mut self) {
+        if !self.config.ui.title_badge {
+            return;
+        }
+        self.write_title("");
+        self.last_title.clear();
+    }
+
+    fn write_title(&self, title: &str) {
+        let mut out = std::io::stdout();
+        let _ = std::io::Write::write_all(&mut out, title_sequence(title).as_bytes());
+        let _ = std::io::Write::flush(&mut out);
     }
 
     /// The name of the previously-current buffer (the `C-x b` default).
@@ -3055,7 +3103,9 @@ impl App {
                 self.viewport_rows = size.height.saturating_sub(2) as usize;
             }
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            self.sync_title();
             if self.should_quit {
+                self.reset_title();
                 self.save_all_history();
                 for state in &self.servers {
                     state.handle.quit("cricr");
@@ -3359,6 +3409,18 @@ fn osc52_sequence(text: &str) -> Option<String> {
     use base64::Engine;
     let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     Some(format!("\u{1b}]52;c;{payload}\u{7}"))
+}
+
+/// The OSC 2 escape sequence that sets the terminal title. Control characters
+/// are stripped so a buffer name can never inject an escape sequence, and the
+/// result is length-capped.
+fn title_sequence(title: &str) -> String {
+    let sanitized: String = title
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\u{7f}')
+        .take(120)
+        .collect();
+    format!("\u{1b}]2;{sanitized}\u{7}")
 }
 
 /// A one-line, length-limited rendering of region text for the `M-w` echo.
@@ -4121,6 +4183,42 @@ mod tests {
             Some("\u{1b}]52;c;aGk=\u{7}")
         );
         assert_eq!(osc52_sequence(""), None);
+    }
+
+    #[test]
+    fn title_sequence_sanitizes_and_wraps() {
+        assert_eq!(title_sequence("cricr"), "\u{1b}]2;cricr\u{7}");
+        // Control characters (a stray BEL/ESC) can't inject escapes.
+        assert_eq!(title_sequence("a\u{7}b\u{1b}c"), "\u{1b}]2;abc\u{7}");
+    }
+
+    #[test]
+    fn terminal_title_lists_active_buffers() {
+        let mut app = app_without_servers();
+        app.config.ui.title_badge = true;
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "bob".to_string(), Kind::Query);
+        app.switch_to(a);
+        assert_eq!(app.terminal_title(), "cricr");
+
+        app.bump_activity(b, false);
+        let title = app.terminal_title();
+        assert!(title.starts_with("cricr ["), "unexpected title: {title}");
+        assert!(title.contains('b'), "activity buffer missing: {title}");
+
+        // Visiting the buffer clears its activity, dropping it from the title.
+        app.switch_to(b);
+        assert_eq!(app.terminal_title(), "cricr");
+    }
+
+    #[test]
+    fn title_badge_off_does_not_touch_title() {
+        let mut app = app_without_servers();
+        let b = app.new_buffer(0, "bob".to_string(), Kind::Query);
+        app.bump_activity(b, false);
+        // Default is off: sync is a no-op and nothing is cached.
+        app.sync_title();
+        assert!(app.last_title.is_empty());
     }
 
     #[test]
