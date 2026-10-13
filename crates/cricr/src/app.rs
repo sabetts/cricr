@@ -1,5 +1,6 @@
 //! Application state and the event loop.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -10,7 +11,7 @@ use tokio::sync::mpsc;
 
 use cricr_irc::commands::{self, LocalCommand, ParsedInput};
 use cricr_irc::message::Tag;
-use cricr_irc::{ClientCommand, ClientHandle, Event};
+use cricr_irc::{ClientCommand, ClientConfig, ClientHandle, Event};
 
 use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
 use crate::config::Config;
@@ -89,6 +90,15 @@ pub struct ServerState {
     pub our_nick: String,
     pub connected: bool,
     pub buffer: usize,
+    /// Template used to (re)spawn the connection (channels are refreshed from
+    /// `channels` on each attempt).
+    client_config: ClientConfig,
+    /// Channels we are currently joined to, and thus rejoin after a reconnect.
+    channels: BTreeSet<String>,
+    /// Failed reconnect attempts since the last successful connection.
+    attempt: u32,
+    /// When the next reconnect attempt is due, if one is scheduled.
+    next_at: Option<Instant>,
 }
 
 /// One buffer (target).
@@ -138,6 +148,7 @@ const COMMANDS: &[&str] = &[
     "/close",
     "/clear",
     "/disconnect",
+    "/reconnect",
     "/buffer",
 ];
 
@@ -226,9 +237,10 @@ impl App {
         for server in &servers {
             match self.config.client_config(server) {
                 Ok(client_config) => {
-                    let (handle, rx) = cricr_irc::spawn(client_config);
                     let index = self.servers.len();
                     let buf = self.new_buffer(index, server.name.clone(), Kind::Server);
+                    let channels = client_config.channels.iter().cloned().collect();
+                    let handle = self.spawn_client_events(index, client_config.clone());
                     self.servers.push(ServerState {
                         name: server.name.clone(),
                         handle,
@@ -238,14 +250,10 @@ impl App {
                             .unwrap_or_else(|| self.config.defaults.nick.clone()),
                         connected: false,
                         buffer: buf,
-                    });
-                    // Forward this connection's events into the shared channel.
-                    let forward = self.event_tx.clone();
-                    tokio::spawn(async move {
-                        let mut rx = rx;
-                        while let Some(event) = rx.recv().await {
-                            let _ = forward.send((index, event));
-                        }
+                        client_config,
+                        channels,
+                        attempt: 0,
+                        next_at: None,
                     });
                 }
                 Err(err) => {
@@ -255,6 +263,82 @@ impl App {
                         .push_plain(format!("*** Failed to configure {}: {err:#}", server.name));
                 }
             }
+        }
+    }
+
+    /// Spawn a connection task for `config` and forward its events under
+    /// `server`.
+    fn spawn_client_events(&self, server: usize, config: ClientConfig) -> ClientHandle {
+        let (handle, rx) = cricr_irc::spawn(config);
+        let forward = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(event) = rx.recv().await {
+                let _ = forward.send((server, event));
+            }
+        });
+        handle
+    }
+
+    /// (Re)connect `server`, rejoining the channels we were in.
+    fn spawn_connection(&mut self, server: usize) {
+        let mut config = self.servers[server].client_config.clone();
+        config.channels = self.servers[server].channels.iter().cloned().collect();
+        let handle = self.spawn_client_events(server, config);
+        self.servers[server].handle = handle;
+        self.servers[server].connected = false;
+        // Membership from the previous session is stale; NAMES repopulates it.
+        for buf in self
+            .buffers
+            .iter_mut()
+            .filter(|b| b.server == server && b.kind == Kind::Channel)
+        {
+            buf.nicks.clear();
+        }
+    }
+
+    /// Schedule the next reconnect attempt for `server`, with exponential
+    /// backoff, and report it in the server buffer.
+    fn schedule_reconnect(&mut self, server: usize) {
+        if !self.config.reconnect.enabled {
+            return;
+        }
+        let attempt = self.servers[server].attempt + 1;
+        self.servers[server].attempt = attempt;
+        let delay = reconnect_delay(
+            attempt,
+            self.config.reconnect.initial_secs,
+            self.config.reconnect.max_secs,
+        );
+        self.servers[server].next_at = Some(Instant::now() + Duration::from_secs_f64(delay));
+        let idx = self.servers[server].buffer;
+        let name = self.servers[server].name.clone();
+        let secs = (delay.round() as u64).max(1);
+        let line = self.error_line(
+            idx,
+            &format!("Reconnecting to {name} in {secs}s (attempt {attempt})"),
+        );
+        self.push_line(idx, line);
+    }
+
+    /// Earliest scheduled reconnect deadline across all servers, if any.
+    fn next_reconnect_deadline(&self) -> Option<Instant> {
+        self.servers.iter().filter_map(|s| s.next_at).min()
+    }
+
+    /// Start any reconnect attempts whose deadline has passed.
+    fn run_due_reconnects(&mut self) {
+        let now = Instant::now();
+        let due: Vec<usize> = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.next_at.is_some_and(|t| t <= now))
+            .map(|(i, _)| i)
+            .collect();
+        for server in due {
+            self.servers[server].next_at = None;
+            self.spawn_connection(server);
         }
     }
 
@@ -572,7 +656,12 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            ParsedInput::Local(local) => self.handle_local(server, local),
+            ParsedInput::Local(local) => {
+                // Echo client-local commands too (e.g. `/reconnect`).
+                let line = self.command_echo_line(buf, &input);
+                self.push_line(buf, line);
+                self.handle_local(server, local);
+            }
             ParsedInput::Unknown { command } => {
                 self.message = Some(format!("Unknown command: /{command}"));
             }
@@ -591,7 +680,23 @@ impl App {
                 self.buffers[i].last_timestamp.clear();
             }
             LocalCommand::Disconnect => {
+                // An explicit disconnect should not queue a retry.
+                self.servers[server].next_at = None;
                 self.servers[server].handle.send(ClientCommand::Disconnect);
+            }
+            LocalCommand::Reconnect => {
+                self.servers[server].attempt = 0;
+                if self.servers[server].connected {
+                    // Close the live connection; its `Quit` result does not
+                    // schedule a retry, so queue an immediate reconnect behind it.
+                    self.servers[server].next_at = Some(Instant::now());
+                    self.servers[server].handle.send(ClientCommand::Quit {
+                        reason: Some("reconnect".into()),
+                    });
+                } else {
+                    self.servers[server].next_at = None;
+                    self.spawn_connection(server);
+                }
             }
             LocalCommand::Close => {
                 let cur = self.current;
@@ -1190,9 +1295,21 @@ impl App {
         } else {
             common_prefix(&candidates)
         };
-        if let Prompt::SwitchBuffer { input, cursor, selected }
-        | Prompt::BrowseUrl { input, cursor, selected }
-        | Prompt::KillBuffer { input, cursor, selected } = &mut self.prompt
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+        }
+        | Prompt::BrowseUrl {
+            input,
+            cursor,
+            selected,
+        }
+        | Prompt::KillBuffer {
+            input,
+            cursor,
+            selected,
+        } = &mut self.prompt
         {
             *cursor = completion.chars().count();
             *input = completion;
@@ -1251,7 +1368,9 @@ impl App {
     fn commit_prompt(&mut self) {
         match std::mem::replace(&mut self.prompt, Prompt::None) {
             Prompt::None => {}
-            Prompt::SwitchBuffer { input, selected, .. } => {
+            Prompt::SwitchBuffer {
+                input, selected, ..
+            } => {
                 let candidates = self.switch_candidates(&input);
                 if let Some(&i) = candidates.get(selected) {
                     self.switch_to(i);
@@ -1266,7 +1385,9 @@ impl App {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
             }
-            Prompt::BrowseUrl { input, selected, .. } => {
+            Prompt::BrowseUrl {
+                input, selected, ..
+            } => {
                 let urls = self.url_candidates(&input);
                 let url = urls
                     .get(selected)
@@ -1276,7 +1397,9 @@ impl App {
                     self.open_url(&url);
                 }
             }
-            Prompt::KillBuffer { input, selected, .. } => {
+            Prompt::KillBuffer {
+                input, selected, ..
+            } => {
                 let candidates = self.kill_candidates(&input);
                 if let Some(&i) = candidates.get(selected) {
                     self.kill_buffer(i);
@@ -2102,8 +2225,16 @@ impl App {
                 self.push_line(idx, line);
             }
             Event::Connected => {
+                let reconnected = self.servers[server].attempt > 0;
+                self.servers[server].attempt = 0;
+                self.servers[server].next_at = None;
                 let idx = self.servers[server].buffer;
-                let line = self.system_line(idx, "Connected");
+                let text = if reconnected {
+                    "Reconnected"
+                } else {
+                    "Connected"
+                };
+                let line = self.system_line(idx, text);
                 self.push_line(idx, line);
                 self.servers[server].connected = true;
             }
@@ -2121,10 +2252,15 @@ impl App {
             Event::Disconnected { reason } => {
                 self.servers[server].connected = false;
                 self.broadcast_error(server, &reason);
+                // `Quit` is emitted for our own /disconnect and /quit.
+                if reason != "Quit" {
+                    self.schedule_reconnect(server);
+                }
             }
             Event::ConnectionError { error } => {
                 self.servers[server].connected = false;
                 self.broadcast_error(server, &error);
+                self.schedule_reconnect(server);
             }
             Event::Privmsg {
                 from,
@@ -2178,12 +2314,14 @@ impl App {
                 self.push_line(idx, line);
             }
             Event::Join { channel, nick } => {
-                let idx = self.ensure_buffer(server, channel, Kind::Channel);
+                let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.add_nick(idx, &nick);
                 let line = self.server_line(idx, Some(&nick), "JOIN", "");
                 self.push_line(idx, line);
-                // Our own /join should surface the new channel as activity.
+                // Our own /join should surface the new channel as activity,
+                // and marks it to be rejoined after a reconnect.
                 if nick == self.our_nick(server) {
+                    self.servers[server].channels.insert(channel);
                     self.bump_activity(idx, false);
                 }
             }
@@ -2192,6 +2330,9 @@ impl App {
                 nick,
                 reason,
             } => {
+                if nick == self.our_nick(server) {
+                    self.servers[server].channels.remove(&channel);
+                }
                 // Do not recreate a channel buffer we've killed/parted.
                 if let Some(idx) = self.find_buffer(server, &channel, Kind::Channel) {
                     self.remove_nick(idx, &nick);
@@ -2206,6 +2347,9 @@ impl App {
                 by,
                 reason,
             } => {
+                if nick == self.our_nick(server) {
+                    self.servers[server].channels.remove(&channel);
+                }
                 if let Some(idx) = self.find_buffer(server, &channel, Kind::Channel) {
                     self.remove_nick(idx, &nick);
                     let text = format!("{nick} {channel} {reason}");
@@ -2426,6 +2570,7 @@ impl App {
                 break;
             }
             let flash_deadline = self.copy_flash.map(|(_, deadline)| deadline);
+            let reconnect_deadline = self.next_reconnect_deadline();
             tokio::select! {
                 Some((server, event)) = net_rx.recv() => {
                     self.handle_event(server, event);
@@ -2453,6 +2598,17 @@ impl App {
                     if let Some((restore, _)) = self.copy_flash.take() {
                         self.current_mut().buffer.set_point(restore);
                     }
+                }
+                // Fire any due reconnect attempts.
+                _ = async {
+                    match reconnect_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.run_due_reconnects();
                 }
                 else => break,
             }
@@ -2529,6 +2685,15 @@ fn is_word_char(c: char) -> bool {
 /// Byte offset of the `idx`-th char in `s`, clamped to the end.
 fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Exponential backoff delay (in seconds) for reconnect `attempt` (1-based),
+/// capped at `max`.
+fn reconnect_delay(attempt: u32, initial: f64, max: f64) -> f64 {
+    let initial = initial.max(0.1);
+    let max = max.max(initial);
+    let exp = attempt.saturating_sub(1).min(20) as i32;
+    (initial * 2f64.powi(exp)).min(max)
 }
 
 fn is_channel(target: &str) -> bool {
@@ -2897,9 +3062,7 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         match &app.prompt {
-            Prompt::Topic {
-                input, default, ..
-            } => {
+            Prompt::Topic { input, default, .. } => {
                 // The current topic is a default, not inserted editable text.
                 assert_eq!(input, "");
                 assert_eq!(default, "hello world");
@@ -3175,6 +3338,18 @@ mod tests {
             .map(|r| app.buffers[ch].buffer.line(r).text())
             .collect();
         assert!(text.iter().any(|l| l.contains(">>> /topic blah")));
+    }
+
+    #[tokio::test]
+    async fn local_command_is_echoed() {
+        let mut app = app_with_unreachable_server();
+        let buf = app.servers[0].buffer;
+        app.current_mut().buffer.set_input("/reconnect");
+        app.submit_input();
+        let text: Vec<String> = (0..app.buffers[buf].buffer.len())
+            .map(|r| app.buffers[buf].buffer.line(r).text())
+            .collect();
+        assert!(text.iter().any(|l| l.contains(">>> /reconnect")));
     }
 
     #[tokio::test]
@@ -3470,6 +3645,149 @@ mod tests {
     fn app_without_servers() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         App::new(Config::default(), tx)
+    }
+
+    /// An app with one server pointed at an unreachable port, so the client
+    /// task spawns (and fails) without needing a real server.
+    fn app_with_unreachable_server() -> App {
+        let cfg: Config = toml::from_str(
+            "[[servers]]\nname = \"127.0.0.1\"\nport = 1\ntls = false\nnick = \"nick\"\n",
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(cfg, tx)
+    }
+
+    #[test]
+    fn reconnect_delay_is_exponential_and_capped() {
+        assert_eq!(reconnect_delay(1, 1.0, 120.0), 1.0);
+        assert_eq!(reconnect_delay(2, 1.0, 120.0), 2.0);
+        assert_eq!(reconnect_delay(3, 1.0, 120.0), 4.0);
+        assert_eq!(reconnect_delay(8, 1.0, 120.0), 120.0); // 128 -> capped
+        assert_eq!(reconnect_delay(3, 5.0, 20.0), 20.0); // 20 -> capped
+    }
+
+    #[tokio::test]
+    async fn unexpected_disconnect_schedules_reconnect() {
+        let mut app = app_with_unreachable_server();
+        assert_eq!(app.servers.len(), 1);
+        app.handle_event(
+            0,
+            Event::Disconnected {
+                reason: "Connection closed".into(),
+            },
+        );
+        assert!(app.servers[0].next_at.is_some());
+        assert_eq!(app.servers[0].attempt, 1);
+
+        app.handle_event(
+            0,
+            Event::ConnectionError {
+                error: "boom".into(),
+            },
+        );
+        assert_eq!(app.servers[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn quit_and_disabled_config_do_not_reconnect() {
+        let mut app = app_with_unreachable_server();
+        app.handle_event(
+            0,
+            Event::Disconnected {
+                reason: "Quit".into(),
+            },
+        );
+        assert!(app.servers[0].next_at.is_none());
+        assert_eq!(app.servers[0].attempt, 0);
+
+        app.config.reconnect.enabled = false;
+        app.handle_event(
+            0,
+            Event::ConnectionError {
+                error: "boom".into(),
+            },
+        );
+        assert!(app.servers[0].next_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn connected_event_resets_backoff() {
+        let mut app = app_with_unreachable_server();
+        app.handle_event(
+            0,
+            Event::Disconnected {
+                reason: "dropped".into(),
+            },
+        );
+        assert_eq!(app.servers[0].attempt, 1);
+        app.handle_event(0, Event::Connected);
+        assert_eq!(app.servers[0].attempt, 0);
+        assert!(app.servers[0].next_at.is_none());
+        assert!(app.servers[0].connected);
+    }
+
+    #[tokio::test]
+    async fn join_part_kick_track_channels_for_reconnect() {
+        let mut app = app_with_unreachable_server();
+        let nick = app.servers[0].our_nick.clone();
+        app.handle_event(
+            0,
+            Event::Join {
+                channel: "#a".into(),
+                nick: nick.clone(),
+            },
+        );
+        assert!(app.servers[0].channels.contains("#a"));
+
+        // Someone else's join is not remembered.
+        app.handle_event(
+            0,
+            Event::Join {
+                channel: "#b".into(),
+                nick: "someone".into(),
+            },
+        );
+        assert!(!app.servers[0].channels.contains("#b"));
+
+        app.handle_event(
+            0,
+            Event::Part {
+                channel: "#a".into(),
+                nick: nick.clone(),
+                reason: String::new(),
+            },
+        );
+        assert!(!app.servers[0].channels.contains("#a"));
+
+        app.handle_event(
+            0,
+            Event::Join {
+                channel: "#c".into(),
+                nick: nick.clone(),
+            },
+        );
+        app.handle_event(
+            0,
+            Event::Kick {
+                channel: "#c".into(),
+                nick,
+                by: "op".into(),
+                reason: String::new(),
+            },
+        );
+        assert!(!app.servers[0].channels.contains("#c"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_command_clears_pending_attempt() {
+        use cricr_irc::commands::LocalCommand;
+        let mut app = app_with_unreachable_server();
+        app.servers[0].attempt = 3;
+        app.servers[0].next_at = Some(Instant::now() + Duration::from_secs(60));
+        app.handle_local(0, LocalCommand::Reconnect);
+        assert_eq!(app.servers[0].attempt, 0);
+        assert!(app.servers[0].next_at.is_none());
     }
 
     #[test]

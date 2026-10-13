@@ -16,6 +16,29 @@ pub struct Config {
     pub defaults: Defaults,
     pub servers: Vec<ServerConfig>,
     pub ui: UiConfig,
+    pub reconnect: ReconnectConfig,
+}
+
+/// Automatic reconnection behavior for unexpected disconnects.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReconnectConfig {
+    /// Reconnect automatically after an unexpected disconnect.
+    pub enabled: bool,
+    /// Delay before the first retry, in seconds.
+    pub initial_secs: f64,
+    /// Upper bound on the retry delay, in seconds.
+    pub max_secs: f64,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        ReconnectConfig {
+            enabled: true,
+            initial_secs: 1.0,
+            max_secs: 120.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +156,11 @@ scrollback_lines = 100000
 fill_column = 70      # word-wrap messages at this column (0 = off)
 clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
 background = "dark"   # or "light"
+
+[reconnect]
+enabled = true        # reconnect automatically after an unexpected drop
+initial_secs = 1      # delay before the first retry
+max_secs = 120        # cap on the retry delay
 
 [[servers]]
 name = "irc.libera.chat"
@@ -292,6 +320,20 @@ mod tests {
         assert_eq!(cc.port, 6697);
         assert!(cc.tls);
         assert_eq!(cc.nick, cfg.defaults.nick);
+    }
+
+    #[test]
+    fn reconnect_defaults_and_overrides() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.reconnect.enabled);
+        assert_eq!(cfg.reconnect.initial_secs, 1.0);
+        assert_eq!(cfg.reconnect.max_secs, 120.0);
+
+        let cfg: Config =
+            toml::from_str("[reconnect]\nenabled = false\ninitial_secs = 5\n").unwrap();
+        assert!(!cfg.reconnect.enabled);
+        assert_eq!(cfg.reconnect.initial_secs, 5.0);
+        assert_eq!(cfg.reconnect.max_secs, 120.0);
     }
 
     #[test]
