@@ -103,13 +103,12 @@ fn track_style(base: RStyle, style: Style) -> RStyle {
 }
 
 fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
-    if let Some((prompt, candidates, selected)) = app.prompt_view() {
+    if let Some((prompt, cursor, candidates, selected)) = app.prompt_view() {
         let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
-        // The point is at the end of the prompt input; show the cursor there.
+        // Show the cursor at the edit position within the prompt input.
         let mut cells: Vec<(char, Style)> =
             prompt.chars().map(|c| (c, Style::default())).collect();
-        let col = cells.len();
-        place_cursor(&mut cells, col);
+        place_cursor(&mut cells, cursor);
         lines.push(to_rline(&cells));
         for (i, candidate) in candidates.iter().enumerate() {
             let style = if i == selected {

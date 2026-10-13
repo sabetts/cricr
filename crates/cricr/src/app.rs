@@ -38,21 +38,26 @@ pub enum Prompt {
     None,
     SwitchBuffer {
         input: String,
+        /// Cursor position within `input`, as a char index.
+        cursor: usize,
         selected: usize,
     },
     BrowseUrl {
         input: String,
+        cursor: usize,
         selected: usize,
     },
     /// Set the channel topic; the current topic is shown as a default
     /// (`C-c C-t`).
     Topic {
         input: String,
+        cursor: usize,
         default: String,
     },
     /// Kill (and part from) a buffer chosen from a list (`C-x k`).
     KillBuffer {
         input: String,
+        cursor: usize,
         selected: usize,
     },
 }
@@ -883,6 +888,7 @@ impl App {
     fn start_switch_buffer(&mut self) {
         self.prompt = Prompt::SwitchBuffer {
             input: String::new(),
+            cursor: 0,
             selected: 0,
         };
     }
@@ -890,6 +896,7 @@ impl App {
     fn start_browse_url(&mut self) {
         self.prompt = Prompt::BrowseUrl {
             input: String::new(),
+            cursor: 0,
             selected: 0,
         };
     }
@@ -897,6 +904,7 @@ impl App {
     fn start_kill_buffer(&mut self) {
         self.prompt = Prompt::KillBuffer {
             input: String::new(),
+            cursor: 0,
             selected: 0,
         };
     }
@@ -971,31 +979,191 @@ impl App {
         *selected = next.clamp(0, count as isize - 1) as usize;
     }
 
-    fn prompt_push(&mut self, c: char) {
+    /// Apply `f` to the active prompt's editable text and cursor. Returns
+    /// `None` when no prompt is active.
+    fn prompt_edit<R>(&mut self, f: impl FnOnce(&mut String, &mut usize) -> R) -> Option<R> {
+        let (input, cursor) = match &mut self.prompt {
+            Prompt::SwitchBuffer { input, cursor, .. }
+            | Prompt::BrowseUrl { input, cursor, .. }
+            | Prompt::KillBuffer { input, cursor, .. }
+            | Prompt::Topic { input, cursor, .. } => (input, cursor),
+            Prompt::None => return None,
+        };
+        Some(f(input, cursor))
+    }
+
+    /// Reset the candidate selection after the input text changes.
+    fn prompt_reset_selection(&mut self) {
         match &mut self.prompt {
-            Prompt::SwitchBuffer { input, selected }
-            | Prompt::BrowseUrl { input, selected }
-            | Prompt::KillBuffer { input, selected } => {
-                input.push(c);
-                *selected = 0;
-            }
-            Prompt::Topic { input, .. } => input.push(c),
-            Prompt::None => {}
+            Prompt::SwitchBuffer { selected, .. }
+            | Prompt::BrowseUrl { selected, .. }
+            | Prompt::KillBuffer { selected, .. } => *selected = 0,
+            _ => {}
         }
     }
 
-    fn prompt_backspace(&mut self) {
-        match &mut self.prompt {
-            Prompt::SwitchBuffer { input, selected }
-            | Prompt::BrowseUrl { input, selected }
-            | Prompt::KillBuffer { input, selected } => {
-                input.pop();
-                *selected = 0;
+    fn prompt_insert(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        self.prompt_insert_str(c.encode_utf8(&mut buf));
+    }
+
+    /// Insert `text` at the cursor.
+    fn prompt_insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self
+            .prompt_edit(|input, cursor| {
+                let idx = (*cursor).min(input.chars().count());
+                input.insert_str(char_to_byte(input, idx), text);
+                *cursor = idx + text.chars().count();
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
+    fn prompt_delete_backward(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                if *cursor > 0 {
+                    let start = char_to_byte(input, *cursor - 1);
+                    let end = char_to_byte(input, *cursor);
+                    input.replace_range(start..end, "");
+                    *cursor -= 1;
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
+    fn prompt_delete_forward(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                if *cursor < input.chars().count() {
+                    let start = char_to_byte(input, *cursor);
+                    let end = char_to_byte(input, *cursor + 1);
+                    input.replace_range(start..end, "");
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
+    fn prompt_move_cursor(&mut self, delta: isize) {
+        self.prompt_edit(|input, cursor| {
+            let len = input.chars().count();
+            *cursor = (*cursor as isize + delta).clamp(0, len as isize) as usize;
+        });
+        self.last_command = LastCommand::Other;
+    }
+
+    fn prompt_cursor_start(&mut self) {
+        self.prompt_edit(|_, cursor| *cursor = 0);
+        self.last_command = LastCommand::Other;
+    }
+
+    fn prompt_cursor_end(&mut self) {
+        self.prompt_edit(|input, cursor| *cursor = input.chars().count());
+        self.last_command = LastCommand::Other;
+    }
+
+    fn prompt_forward_word(&mut self) {
+        self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let mut i = *cursor;
+            while i < chars.len() && !is_word_char(chars[i]) {
+                i += 1;
             }
-            Prompt::Topic { input, .. } => {
-                input.pop();
+            while i < chars.len() && is_word_char(chars[i]) {
+                i += 1;
             }
-            Prompt::None => {}
+            *cursor = i;
+        });
+        self.last_command = LastCommand::Other;
+    }
+
+    fn prompt_backward_word(&mut self) {
+        self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let mut i = *cursor;
+            while i > 0 && !is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+            *cursor = i;
+        });
+        self.last_command = LastCommand::Other;
+    }
+
+    /// Kill from the cursor to the end of the input (`C-k`).
+    fn prompt_kill_line(&mut self) {
+        let killed = self.prompt_edit(|input, cursor| {
+            let at = char_to_byte(input, (*cursor).min(input.chars().count()));
+            let killed = input[at..].to_string();
+            input.truncate(at);
+            killed
+        });
+        if let Some(killed) = killed {
+            let append = self.last_command == LastCommand::Kill;
+            self.kill_ring.push(&killed, append);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
+    /// Kill the word before the cursor (`M-DEL`).
+    fn prompt_backward_kill_word(&mut self) {
+        let killed = self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let mut i = *cursor;
+            while i > 0 && !is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word_char(chars[i - 1]) {
+                i -= 1;
+            }
+            let start = char_to_byte(input, i);
+            let end = char_to_byte(input, *cursor);
+            let killed = input[start..end].to_string();
+            input.replace_range(start..end, "");
+            *cursor = i;
+            killed
+        });
+        if let Some(killed) = killed {
+            let append = self.last_command == LastCommand::Kill;
+            self.kill_ring.push(&killed, append);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
+    /// Insert the most recent kill at the cursor (`C-y`).
+    fn prompt_yank(&mut self) {
+        let text = match self.kill_ring.current() {
+            Some(text) => text,
+            None => return,
+        };
+        if self
+            .prompt_edit(|input, cursor| {
+                let idx = (*cursor).min(input.chars().count());
+                input.insert_str(char_to_byte(input, idx), &text);
+                *cursor = idx + text.chars().count();
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Yank;
         }
     }
 
@@ -1022,10 +1190,11 @@ impl App {
         } else {
             common_prefix(&candidates)
         };
-        if let Prompt::SwitchBuffer { input, selected }
-        | Prompt::BrowseUrl { input, selected }
-        | Prompt::KillBuffer { input, selected } = &mut self.prompt
+        if let Prompt::SwitchBuffer { input, cursor, selected }
+        | Prompt::BrowseUrl { input, cursor, selected }
+        | Prompt::KillBuffer { input, cursor, selected } = &mut self.prompt
         {
+            *cursor = completion.chars().count();
             *input = completion;
             *selected = 0;
         }
@@ -1033,25 +1202,48 @@ impl App {
 
     fn handle_prompt_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = Prompt::None;
+                return;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt = Prompt::None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.commit_prompt();
+                return;
+            }
+            KeyCode::Tab => {
+                self.prompt_complete();
+                return;
+            }
+            _ => {}
+        }
         let count = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::BrowseUrl { input, .. } => self.url_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::None | Prompt::Topic { .. } => 0,
         };
-        match key.code {
-            KeyCode::Char('g') if ctrl => self.prompt = Prompt::None,
-            KeyCode::Char('c') if ctrl => self.prompt = Prompt::None,
-            KeyCode::Esc => self.prompt = Prompt::None,
-            KeyCode::Enter => self.commit_prompt(),
-            KeyCode::Tab => self.prompt_complete(),
-            KeyCode::Char('n') if ctrl => self.prompt_move(count, 1),
-            KeyCode::Char('p') if ctrl => self.prompt_move(count, -1),
-            KeyCode::Down => self.prompt_move(count, 1),
-            KeyCode::Up => self.prompt_move(count, -1),
-            KeyCode::Backspace => self.prompt_backspace(),
-            KeyCode::Char(c) if !ctrl => self.prompt_push(c),
+        use Action::*;
+        match keymap::translate(key) {
+            Abort => self.prompt = Prompt::None,
+            SelfInsert(c) => self.prompt_insert(c),
+            DeleteBackward => self.prompt_delete_backward(),
+            DeleteForward => self.prompt_delete_forward(),
+            BackwardChar => self.prompt_move_cursor(-1),
+            ForwardChar => self.prompt_move_cursor(1),
+            BeginningOfLine => self.prompt_cursor_start(),
+            EndOfLine => self.prompt_cursor_end(),
+            BackwardWord => self.prompt_backward_word(),
+            ForwardWord => self.prompt_forward_word(),
+            BackwardKillWord => self.prompt_backward_kill_word(),
+            KillLine => self.prompt_kill_line(),
+            Yank => self.prompt_yank(),
+            PrevLine => self.prompt_move(count, -1),
+            NextLine => self.prompt_move(count, 1),
             _ => {}
         }
     }
@@ -1059,7 +1251,7 @@ impl App {
     fn commit_prompt(&mut self) {
         match std::mem::replace(&mut self.prompt, Prompt::None) {
             Prompt::None => {}
-            Prompt::SwitchBuffer { input, selected } => {
+            Prompt::SwitchBuffer { input, selected, .. } => {
                 let candidates = self.switch_candidates(&input);
                 if let Some(&i) = candidates.get(selected) {
                     self.switch_to(i);
@@ -1074,7 +1266,7 @@ impl App {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
             }
-            Prompt::BrowseUrl { input, selected } => {
+            Prompt::BrowseUrl { input, selected, .. } => {
                 let urls = self.url_candidates(&input);
                 let url = urls
                     .get(selected)
@@ -1084,7 +1276,7 @@ impl App {
                     self.open_url(&url);
                 }
             }
-            Prompt::KillBuffer { input, selected } => {
+            Prompt::KillBuffer { input, selected, .. } => {
                 let candidates = self.kill_candidates(&input);
                 if let Some(&i) = candidates.get(selected) {
                     self.kill_buffer(i);
@@ -1097,7 +1289,7 @@ impl App {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
             }
-            Prompt::Topic { input, default } => {
+            Prompt::Topic { input, default, .. } => {
                 let (server, kind, target) = {
                     let c = self.current();
                     (c.server, c.kind, c.target.clone())
@@ -1139,6 +1331,7 @@ impl App {
         let topic = self.current().topic.clone().unwrap_or_default();
         self.prompt = Prompt::Topic {
             input: String::new(),
+            cursor: 0,
             default: topic,
         };
     }
@@ -1170,49 +1363,79 @@ impl App {
         }
     }
 
-    /// The active prompt as (prompt line, candidate list, selected index).
-    pub fn prompt_view(&self) -> Option<(String, Vec<String>, usize)> {
+    /// The active prompt as (prompt line, cursor column, candidate list,
+    /// selected index).
+    pub fn prompt_view(&self) -> Option<(String, usize, Vec<String>, usize)> {
         match &self.prompt {
             Prompt::None => None,
-            Prompt::SwitchBuffer { input, selected } => {
+            Prompt::SwitchBuffer {
+                input,
+                cursor,
+                selected,
+            } => {
                 let names = self
                     .switch_candidates(input)
                     .into_iter()
                     .map(|i| self.buffers[i].target.clone())
                     .collect();
+                let prefix = format!(
+                    "Switch to buffer (default {}): ",
+                    self.previous_buffer_name()
+                );
                 Some((
-                    format!(
-                        "Switch to buffer (default {}): {input}",
-                        self.previous_buffer_name()
-                    ),
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
                     names,
                     *selected,
                 ))
             }
-            Prompt::BrowseUrl { input, selected } => Some((
-                format!("Browse URL: {input}"),
-                self.url_candidates(input),
-                *selected,
-            )),
-            Prompt::KillBuffer { input, selected } => {
+            Prompt::BrowseUrl {
+                input,
+                cursor,
+                selected,
+            } => {
+                let prefix = "Browse URL: ";
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    self.url_candidates(input),
+                    *selected,
+                ))
+            }
+            Prompt::KillBuffer {
+                input,
+                cursor,
+                selected,
+            } => {
                 let names = self
                     .kill_candidates(input)
                     .into_iter()
                     .map(|i| self.buffers[i].target.clone())
                     .collect();
+                let prefix = format!("Kill buffer (default {}): ", self.mode_line_name());
                 Some((
-                    format!("Kill buffer (default {}): {input}", self.mode_line_name()),
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
                     names,
                     *selected,
                 ))
             }
-            Prompt::Topic { input, default } => {
-                let prompt = if default.is_empty() {
-                    format!("Topic: {input}")
+            Prompt::Topic {
+                input,
+                cursor,
+                default,
+            } => {
+                let prefix = if default.is_empty() {
+                    "Topic: ".to_string()
                 } else {
-                    format!("Topic (default {default}): {input}")
+                    format!("Topic (default {default}): ")
                 };
-                Some((prompt, Vec::new(), 0))
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    Vec::new(),
+                    0,
+                ))
             }
         }
     }
@@ -1226,7 +1449,7 @@ impl App {
     pub fn minibuffer_height(&mut self) -> u16 {
         let desired = self
             .prompt_view()
-            .map(|(_, candidates, _)| (1 + candidates.len().min(5)) as u16)
+            .map(|(_, _, candidates, _)| (1 + candidates.len().min(5)) as u16)
             .unwrap_or(1);
         self.minibuffer_rows = if matches!(self.prompt, Prompt::None) {
             desired
@@ -2257,9 +2480,7 @@ impl App {
             if filtered.is_empty() {
                 return;
             }
-            for ch in filtered.chars() {
-                self.prompt_push(ch);
-            }
+            self.prompt_insert_str(&filtered);
             self.kill_ring.push(&filtered, false);
             return;
         }
@@ -2303,6 +2524,11 @@ fn classify(from: &str, target: &str, our: &str, server_name: &str) -> Route {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Byte offset of the `idx`-th char in `s`, clamped to the end.
+fn char_to_byte(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 fn is_channel(target: &str) -> bool {
@@ -2671,7 +2897,9 @@ mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         match &app.prompt {
-            Prompt::Topic { input, default } => {
+            Prompt::Topic {
+                input, default, ..
+            } => {
                 // The current topic is a default, not inserted editable text.
                 assert_eq!(input, "");
                 assert_eq!(default, "hello world");
@@ -3281,6 +3509,7 @@ mod tests {
         let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
         app.prompt = Prompt::SwitchBuffer {
             input: "#a".to_string(),
+            cursor: 2,
             selected: 0,
         };
         app.commit_prompt();
@@ -3298,6 +3527,7 @@ mod tests {
         app.switch_to(b);
         app.prompt = Prompt::SwitchBuffer {
             input: String::new(),
+            cursor: 0,
             selected: 0,
         };
         let names: Vec<String> = app
@@ -3308,6 +3538,84 @@ mod tests {
         // current is #beta (excluded); recency order: #alpha then *scratch*
         assert_eq!(names, vec!["#alpha", "*scratch*"]);
         assert_eq!(app.switch_candidates("alp"), vec![a]);
+    }
+
+    fn prompt_input(app: &App) -> String {
+        match &app.prompt {
+            Prompt::SwitchBuffer { input, .. }
+            | Prompt::BrowseUrl { input, .. }
+            | Prompt::KillBuffer { input, .. }
+            | Prompt::Topic { input, .. } => input.clone(),
+            Prompt::None => String::new(),
+        }
+    }
+
+    fn prompt_cursor(app: &App) -> usize {
+        match &app.prompt {
+            Prompt::SwitchBuffer { cursor, .. }
+            | Prompt::BrowseUrl { cursor, .. }
+            | Prompt::KillBuffer { cursor, .. }
+            | Prompt::Topic { cursor, .. } => *cursor,
+            Prompt::None => 0,
+        }
+    }
+
+    #[test]
+    fn prompt_motion_and_insert_in_the_middle() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "hello".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_cursor(&app), 3);
+        press(&mut app, KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(prompt_input(&app), "helXlo");
+        assert_eq!(prompt_cursor(&app), 4);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_cursor(&app), 0);
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_cursor(&app), 6);
+    }
+
+    #[test]
+    fn prompt_forward_and_backward_delete() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "abc".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Backspace at end removes 'c'.
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(prompt_input(&app), "ab");
+        // C-a then C-d removes 'a' (forward delete).
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_input(&app), "b");
+    }
+
+    #[test]
+    fn prompt_word_motion_and_kill_yank() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "one two".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::ALT);
+        assert_eq!(prompt_cursor(&app), 3);
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_input(&app), "one");
+        assert_eq!(app.kill_ring.current().as_deref(), Some(" two"));
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_input(&app), "one two");
+        // M-b moves back to the start of "two".
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(prompt_cursor(&app), 4);
     }
 
     #[test]
