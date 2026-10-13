@@ -442,7 +442,17 @@ impl App {
             let line = self.render_log_line(idx, time, &body);
             wrapped.extend(line.wrap(self.fill_column));
         }
+        let had_history = !wrapped.is_empty();
         self.buffers[idx].buffer.load_scrollback(wrapped);
+        if had_history {
+            // Separate the preloaded history from anything that arrives next,
+            // so it's clear where the cached history ends.
+            let row = self.buffers[idx].buffer.last_row();
+            let marker = self.marker_line();
+            self.buffers[idx].buffer.insert_line(row, marker);
+            self.buffers[idx].marker_row = Some(row);
+            self.buffers[idx].first_unread = Some(row + 1);
+        }
     }
 
     /// Write every dirty channel/query buffer's scrollback to disk.
@@ -790,8 +800,18 @@ impl App {
                     let line = self.command_echo_line(buf, &input);
                     self.push_line(buf, line);
                 }
+                // `/join`: jump straight to the channel buffer (creating it if
+                // needed, which also preloads any cached history).
+                let joining = match &cmd {
+                    ClientCommand::Join { channel, .. } => Some(channel.clone()),
+                    _ => None,
+                };
                 let quitting = matches!(cmd, ClientCommand::Quit { .. });
                 self.send(server, cmd);
+                if let Some(channel) = joining {
+                    let idx = self.ensure_buffer(server, channel, Kind::Channel);
+                    self.switch_to(idx);
+                }
                 if quitting {
                     self.should_quit = true;
                 }
@@ -3878,6 +3898,21 @@ mod tests {
         assert!(text.iter().any(|l| l.contains(">>> /reconnect")));
     }
 
+    #[test]
+    fn slash_join_switches_to_the_channel() {
+        let mut app = app_without_servers();
+        let start = app.new_buffer(0, "#start".to_string(), Kind::Channel);
+        app.switch_to(start);
+        app.current_mut().buffer.set_input("/join #new");
+        app.submit_input();
+        let idx = app
+            .buffers
+            .iter()
+            .position(|b| b.target == "#new" && b.kind == Kind::Channel)
+            .expect("channel buffer created");
+        assert_eq!(app.current, idx, "should switch to the joined channel");
+    }
+
     #[tokio::test]
     async fn own_join_records_activity() {
         use tokio::net::TcpListener;
@@ -4105,6 +4140,17 @@ mod tests {
             text.iter().any(|l| l.contains("hello there")),
             "preloaded history missing: {text:?}"
         );
+        // An unread separator marks where the preloaded history ends.
+        let marker = app.buffers[ch]
+            .marker_row
+            .expect("history separator inserted");
+        assert!(
+            text[marker].starts_with("---"),
+            "not a separator: {:?}",
+            text[marker]
+        );
+        let hello = text.iter().position(|l| l.contains("hello there")).unwrap();
+        assert!(marker > hello, "separator should follow the history");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
