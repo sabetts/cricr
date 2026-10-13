@@ -1840,6 +1840,10 @@ impl App {
                 self.add_nick(idx, &nick);
                 let line = self.server_line(idx, Some(&nick), "JOIN", "");
                 self.push_line(idx, line);
+                // Our own /join should surface the new channel as activity.
+                if nick == self.our_nick(server) {
+                    self.bump_activity(idx, false);
+                }
             }
             Event::Part {
                 channel,
@@ -2571,6 +2575,48 @@ mod tests {
             .map(|r| app.buffers[ch].buffer.line(r).text())
             .collect();
         assert!(text.iter().any(|l| l.contains(">>> /topic blah")));
+    }
+
+    #[tokio::test]
+    async fn own_join_records_activity() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.servers.push(crate::config::ServerConfig {
+            name: "127.0.0.1".to_string(),
+            port: Some(addr.port()),
+            tls: Some(false),
+            nick: Some("me".to_string()),
+            user_name: None,
+            full_name: None,
+            password: None,
+            channels: Vec::new(),
+            sasl: None,
+            cert: None,
+            key: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+
+        app.handle_event(
+            0,
+            Event::Join {
+                channel: "#new".to_string(),
+                nick: "me".to_string(),
+            },
+        );
+        let idx = app
+            .buffers
+            .iter()
+            .position(|b| b.target == "#new")
+            .expect("channel buffer created");
+        assert_eq!(app.buffers[idx].unread, 1, "own join records activity");
+        assert!(!app.activity_entries().is_empty());
     }
 
     #[test]
