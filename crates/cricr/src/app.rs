@@ -155,6 +155,9 @@ pub struct App {
     pub theme: Theme,
     pub should_quit: bool,
     pub prompt: Prompt,
+    /// Height of the minibuffer during the current prompt, never shrinking as
+    /// the candidate list narrows (extra rows are padded with blank lines).
+    minibuffer_rows: u16,
     previous: usize,
     activity_seq: u64,
     visit_seq: u64,
@@ -192,6 +195,7 @@ impl App {
             theme,
             should_quit: false,
             prompt: Prompt::None,
+            minibuffer_rows: 1,
             previous: 0,
             activity_seq: 0,
             visit_seq: 0,
@@ -1214,12 +1218,22 @@ impl App {
     }
 
     /// Height of the minibuffer area, expanded to show prompt candidates.
-    pub fn minibuffer_height(&self) -> u16 {
-        let extra = self
+    ///
+    /// Within a single prompt the height only ever grows: narrowing the
+    /// candidate list keeps the previously reserved rows (padded with blank
+    /// lines) rather than shrinking the echo area. The height resets once the
+    /// prompt closes.
+    pub fn minibuffer_height(&mut self) -> u16 {
+        let desired = self
             .prompt_view()
-            .map(|(_, candidates, _)| candidates.len().min(5))
-            .unwrap_or(0);
-        (1 + extra) as u16
+            .map(|(_, candidates, _)| (1 + candidates.len().min(5)) as u16)
+            .unwrap_or(1);
+        self.minibuffer_rows = if matches!(self.prompt, Prompt::None) {
+            desired
+        } else {
+            self.minibuffer_rows.max(desired)
+        };
+        self.minibuffer_rows
     }
 
     fn perform(&mut self, action: Action) {

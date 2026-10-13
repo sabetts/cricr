@@ -6,11 +6,11 @@ use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, Prompt};
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::SearchDirection;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let minibuffer = app.minibuffer_height().max(1);
     let rows = Layout::vertical([
         Constraint::Min(0),
@@ -50,7 +50,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     for row in top..buf.len().min(top + height) {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
-        if row == point.row {
+        if row == point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, point.col);
         }
         lines.push(to_rline(&cells));
@@ -105,7 +105,12 @@ fn track_style(base: RStyle, style: Style) -> RStyle {
 fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((prompt, candidates, selected)) = app.prompt_view() {
         let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
-        lines.push(RLine::from(prompt));
+        // The point is at the end of the prompt input; show the cursor there.
+        let mut cells: Vec<(char, Style)> =
+            prompt.chars().map(|c| (c, Style::default())).collect();
+        let col = cells.len();
+        place_cursor(&mut cells, col);
+        lines.push(to_rline(&cells));
         for (i, candidate) in candidates.iter().enumerate() {
             let style = if i == selected {
                 RStyle::default().add_modifier(Modifier::REVERSED)
