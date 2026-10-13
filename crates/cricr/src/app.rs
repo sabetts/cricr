@@ -227,6 +227,9 @@ impl App {
         // Emacs always has a *scratch* buffer; start there unless a server
         // buffer exists so connection output is visible immediately.
         let scratch = app.new_buffer(0, "*scratch*".to_string(), Kind::Scratch);
+        app.buffers[scratch]
+            .buffer
+            .set_content(scratch_lines().into_iter().map(Line::plain).collect());
         app.current = app.servers.first().map(|s| s.buffer).unwrap_or(scratch);
         app.previous = scratch;
         app
@@ -479,7 +482,11 @@ impl App {
         // Keep the read marker / first-unread of the buffer we just entered.
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
-        self.buffers[idx].buffer.end_of_buffer();
+        // Follow the newest output only if we were already at the end there;
+        // otherwise leave point where the user last had it.
+        if self.buffers[idx].buffer.at_end() {
+            self.buffers[idx].buffer.end_of_buffer();
+        }
     }
 
     fn scratch_index(&self) -> Option<usize> {
@@ -904,6 +911,8 @@ impl App {
             }
         };
         self.switch_to(idx);
+        // Show the list from the top (switch_to moves point to the end).
+        self.buffers[idx].buffer.beginning_of_buffer();
     }
 
     fn undefined(&mut self, prefix: &str, key: crossterm::event::KeyEvent) {
@@ -1211,6 +1220,48 @@ impl App {
         self.last_command = LastCommand::Other;
     }
 
+    fn prompt_upcase_word(&mut self) {
+        self.prompt_case_word(|word| word.iter().flat_map(|c| c.to_uppercase()).collect());
+    }
+
+    fn prompt_downcase_word(&mut self) {
+        self.prompt_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
+    }
+
+    /// Change the case of the word after the cursor, moving the cursor past it.
+    fn prompt_case_word(&mut self, transform: impl Fn(&[char]) -> String) {
+        if self
+            .prompt_edit(|input, cursor| {
+                let chars: Vec<char> = input.chars().collect();
+                let mut i = (*cursor).min(chars.len());
+                while i < chars.len() && !is_word_char(chars[i]) {
+                    i += 1;
+                }
+                let start = i;
+                while i < chars.len() && is_word_char(chars[i]) {
+                    i += 1;
+                }
+                let end = i;
+                if start == end {
+                    *cursor = end;
+                    return;
+                }
+                let changed = transform(&chars[start..end]);
+                let new_len = changed.chars().count();
+                let mut out: Vec<char> = Vec::with_capacity(chars.len());
+                out.extend_from_slice(&chars[..start]);
+                out.extend(changed.chars());
+                out.extend_from_slice(&chars[end..]);
+                *input = out.into_iter().collect();
+                *cursor = start + new_len;
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
     /// Kill from the cursor to the end of the input (`C-k`).
     fn prompt_kill_line(&mut self) {
         let killed = self.prompt_edit(|input, cursor| {
@@ -1356,6 +1407,8 @@ impl App {
             EndOfLine => self.prompt_cursor_end(),
             BackwardWord => self.prompt_backward_word(),
             ForwardWord => self.prompt_forward_word(),
+            UpcaseWord => self.prompt_upcase_word(),
+            DowncaseWord => self.prompt_downcase_word(),
             BackwardKillWord => self.prompt_backward_kill_word(),
             KillLine => self.prompt_kill_line(),
             Yank => self.prompt_yank(),
@@ -1604,6 +1657,8 @@ impl App {
             EndOfLine => self.current_mut().buffer.end_of_line(),
             ForwardWord => self.current_mut().buffer.forward_word(),
             BackwardWord => self.current_mut().buffer.backward_word(),
+            UpcaseWord => self.current_mut().buffer.upcase_word(),
+            DowncaseWord => self.current_mut().buffer.downcase_word(),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
             PageUp => self.page_up(),
@@ -2758,6 +2813,36 @@ fn extract_url(token: &str) -> Option<String> {
     (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
 }
 
+/// The introductory text placed in the `*scratch*` buffer at startup.
+fn scratch_lines() -> Vec<String> {
+    let path = crate::config::default_path();
+    [
+        "cricr — a standalone IRC client with Emacs-style editing".to_string(),
+        String::new(),
+        "Welcome to the *scratch* buffer: a free-text buffer for notes and".to_string(),
+        "drafts. Nothing typed here is sent to a server.".to_string(),
+        String::new(),
+        "Configuration".to_string(),
+        "  By default cricr reads its config from:".to_string(),
+        format!("      {}", path.display()),
+        String::new(),
+        "  A commented template is written there on first run. Edit it to add".to_string(),
+        "  servers, SASL/NickServ credentials, channels, and UI options. Pass".to_string(),
+        "  `cricr --config <file>` to use a different file.".to_string(),
+        String::new(),
+        "Discovering commands".to_string(),
+        "  C-h b          list all key bindings in a *Help* buffer".to_string(),
+        "  C-x b          switch buffers".to_string(),
+        "  C-x C-c        quit".to_string(),
+        "  Commands typed in a buffer start with `/` (e.g. /join, /whois).".to_string(),
+        String::new(),
+        "Notes".to_string(),
+        "  Pasted text is added to the kill ring (recall with C-y / M-y).".to_string(),
+        "  C-w / M-w / C-k mirror the kill to the system clipboard (OSC 52).".to_string(),
+    ]
+    .to_vec()
+}
+
 /// The text of the `*Help*` buffer (`C-h b`).
 fn help_lines() -> Vec<String> {
     [
@@ -3223,6 +3308,8 @@ mod tests {
         assert!(text.contains("cricr key bindings"));
         assert!(text.contains("C-x b"));
         assert_eq!(app.current, help);
+        // The list is shown from the top.
+        assert_eq!(app.buffers[help].buffer.point(), Pos::new(0, 0));
     }
 
     #[test]
@@ -3520,9 +3607,27 @@ mod tests {
     #[test]
     fn paste_into_scratch_keeps_newlines() {
         let mut app = app_without_servers();
+        // Clear the seeded startup text so the paste lands at the top.
+        app.current_mut().buffer.clear();
         app.handle_paste("a\nb".to_string());
         assert_eq!(app.current().buffer.line(0).text(), "a");
         assert_eq!(app.current().buffer.line(1).text(), "b");
+    }
+
+    #[test]
+    fn scratch_buffer_shows_startup_help() {
+        let app = app_without_servers();
+        let scratch = app.current();
+        let text: String = (0..scratch.buffer.len())
+            .map(|r| scratch.buffer.line(r).text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("C-h b"), "should mention C-h b for bindings");
+        assert!(
+            text.contains("cricr --config"),
+            "should explain config file"
+        );
+        assert!(text.to_lowercase().contains("configuration"));
     }
 
     #[test]
@@ -3822,6 +3927,35 @@ mod tests {
     }
 
     #[test]
+    fn switching_preserves_point_unless_it_was_at_the_end() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        for i in 0..20 {
+            app.push_line(a, Line::plain(format!("line {i}")));
+        }
+
+        // Left in the middle: returning keeps the same point.
+        app.switch_to(a);
+        app.current_mut().buffer.beginning_of_buffer();
+        let top = app.buffers[a].buffer.point();
+        app.switch_to(b);
+        app.switch_to(a);
+        assert_eq!(app.buffers[a].buffer.point(), top);
+
+        // Left at the end: returning follows new output to the new end.
+        app.current_mut().buffer.end_of_buffer();
+        app.switch_to(b);
+        app.push_line(a, Line::plain("newest"));
+        app.switch_to(a);
+        assert!(app.buffers[a].buffer.at_end());
+        assert_eq!(
+            app.buffers[a].buffer.point().row,
+            app.buffers[a].buffer.last_row()
+        );
+    }
+
+    #[test]
     fn switch_buffer_prompt_resolves_names() {
         let mut app = app_without_servers();
         let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
@@ -3934,6 +4068,37 @@ mod tests {
         // M-b moves back to the start of "two".
         press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
         assert_eq!(prompt_cursor(&app), 4);
+    }
+
+    #[test]
+    fn prompt_upcase_and_downcase_word() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "hello world".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::ALT);
+        assert_eq!(prompt_input(&app), "HELLO world");
+        assert_eq!(prompt_cursor(&app), 5);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::ALT);
+        assert_eq!(prompt_input(&app), "hello world");
+    }
+
+    #[test]
+    fn upcase_word_action_edits_buffer_input() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello there");
+        app.current_mut().buffer.beginning_of_line();
+        app.perform(Action::UpcaseWord);
+        assert_eq!(app.current().buffer.input(), "HELLO there");
+        app.current_mut().buffer.beginning_of_line();
+        app.perform(Action::DowncaseWord);
+        assert_eq!(app.current().buffer.input(), "hello there");
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub enum Action {
     EndOfLine,
     ForwardWord,
     BackwardWord,
+    UpcaseWord,
+    DowncaseWord,
     BeginningOfBuffer,
     EndOfBuffer,
     PageUp,
@@ -67,6 +69,8 @@ pub fn translate(key: KeyEvent) -> Action {
         KeyCode::Char(c) if alt => match c {
             'f' | 'F' => ForwardWord,
             'b' | 'B' => BackwardWord,
+            'u' | 'U' => UpcaseWord,
+            'l' | 'L' => DowncaseWord,
             'v' | 'V' => PageUp,
             '<' => BeginningOfBuffer,
             '>' => EndOfBuffer,
@@ -177,6 +181,18 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('<'), KeyModifiers::ALT)),
             Action::BeginningOfBuffer
+        );
+    }
+
+    #[test]
+    fn alt_case_words() {
+        assert_eq!(
+            translate(key(KeyCode::Char('u'), KeyModifiers::ALT)),
+            Action::UpcaseWord
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('l'), KeyModifiers::ALT)),
+            Action::DowncaseWord
         );
     }
 

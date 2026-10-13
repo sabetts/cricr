@@ -535,6 +535,12 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Whether point is at the very end of the buffer (following new output).
+    pub fn at_end(&self) -> bool {
+        let row = self.last_row();
+        self.point.row == row && self.point.col == self.lines[row].char_len()
+    }
+
     pub fn forward_word(&mut self) {
         let chars = self.lines[self.point.row].chars();
         let mut col = self.point.col;
@@ -564,6 +570,75 @@ impl Buffer {
             col -= 1;
         }
         self.point.col = col;
+        self.scroll_into_view();
+    }
+
+    /// Upcase the word after point (Emacs `upcase-word`), moving point past it.
+    pub fn upcase_word(&mut self) {
+        self.case_word(|word| word.iter().flat_map(|c| c.to_uppercase()).collect());
+    }
+
+    /// Downcase the word after point (Emacs `downcase-word`).
+    pub fn downcase_word(&mut self) {
+        self.case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
+    }
+
+    /// Transform the word after point with `transform`, leaving point at the
+    /// end of the (possibly length-changing) result.
+    fn case_word(&mut self, transform: impl Fn(&[char]) -> String) {
+        if !self.editable() {
+            return;
+        }
+        if self.is_irc() {
+            let base = self.prompt_len;
+            let chars: Vec<char> = self.input().chars().collect();
+            let mut col = self.point.col.saturating_sub(base).min(chars.len());
+            while col < chars.len() && !is_word(chars[col]) {
+                col += 1;
+            }
+            let start = col;
+            while col < chars.len() && is_word(chars[col]) {
+                col += 1;
+            }
+            let end = col;
+            if start == end {
+                self.point.col = base + end;
+                return;
+            }
+            let changed = transform(&chars[start..end]);
+            let new_len = changed.chars().count();
+            let mut out: Vec<char> = Vec::with_capacity(chars.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(changed.chars());
+            out.extend_from_slice(&chars[end..]);
+            let text: String = out.into_iter().collect();
+            self.input_set(&text);
+            self.point = Pos::new(self.last_row(), base + start + new_len);
+        } else {
+            let row = self.point.row;
+            let chars: Vec<char> = self.lines[row].chars();
+            let mut col = self.point.col.min(chars.len());
+            while col < chars.len() && !is_word(chars[col]) {
+                col += 1;
+            }
+            let start = col;
+            while col < chars.len() && is_word(chars[col]) {
+                col += 1;
+            }
+            let end = col;
+            if start == end {
+                self.point.col = end;
+                return;
+            }
+            let changed = transform(&chars[start..end]);
+            let new_len = changed.chars().count();
+            let mut out: Vec<char> = Vec::with_capacity(chars.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(changed.chars());
+            out.extend_from_slice(&chars[end..]);
+            self.lines[row] = Line::plain(out.into_iter().collect::<String>());
+            self.point.col = start + new_len;
+        }
         self.scroll_into_view();
     }
 
@@ -970,6 +1045,30 @@ mod tests {
         b.backward_char();
         b.insert_char('X');
         assert_eq!(b.input(), "helXl");
+    }
+
+    #[test]
+    fn upcase_and_downcase_word() {
+        let mut b = Buffer::new("> ");
+        for c in "hello world".chars() {
+            b.insert_char(c);
+        }
+        b.beginning_of_line();
+        b.upcase_word();
+        assert_eq!(b.input(), "HELLO world");
+        assert_eq!(b.point().col, 2 + 5);
+        b.beginning_of_line();
+        b.downcase_word();
+        assert_eq!(b.input(), "hello world");
+    }
+
+    #[test]
+    fn case_word_in_free_text() {
+        let mut b = Buffer::text();
+        b.insert_str("foo bar");
+        b.beginning_of_buffer();
+        b.upcase_word();
+        assert_eq!(b.line(0).text(), "FOO bar");
     }
 
     #[test]
