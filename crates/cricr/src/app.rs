@@ -315,7 +315,7 @@ impl App {
 
     fn bump_activity(&mut self, buf: usize, mentioned: bool) {
         if buf != self.current
-            && !matches!(self.buffers[buf].kind, Kind::Scratch | Kind::Server)
+            && self.buffers[buf].kind != Kind::Scratch
             && !self.buffers[buf].ignore_activity
         {
             self.activity_seq += 1;
@@ -1884,7 +1884,8 @@ impl App {
                 }
             }
             Event::Nick { old, new } => {
-                if old == self.our_nick(server) {
+                let ours = old == self.our_nick(server);
+                if ours {
                     self.servers[server].our_nick = new.clone();
                 }
                 for idx in 0..self.buffers.len() {
@@ -1897,6 +1898,10 @@ impl App {
                 let idx = self.servers[server].buffer;
                 let line = self.server_line(idx, Some(&old), "NICK", &new);
                 self.push_line(idx, line);
+                // Our own /nick should register as activity.
+                if ours {
+                    self.bump_activity(idx, false);
+                }
             }
             Event::TopicChanged { channel, topic, by } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
@@ -2688,6 +2693,51 @@ mod tests {
             .map(|r| app.buffers[server_buf].buffer.line(r).text())
             .collect();
         assert!(text.iter().any(|l| l.contains("+Ziw")));
+    }
+
+    #[tokio::test]
+    async fn own_nick_change_records_activity() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.servers.push(crate::config::ServerConfig {
+            name: "127.0.0.1".to_string(),
+            port: Some(addr.port()),
+            tls: Some(false),
+            nick: Some("me".to_string()),
+            user_name: None,
+            full_name: None,
+            password: None,
+            channels: Vec::new(),
+            sasl: None,
+            cert: None,
+            key: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        // Look at a channel so the server buffer is not current.
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        let server_buf = app.servers[0].buffer;
+
+        app.handle_event(
+            0,
+            Event::Nick {
+                old: "me".to_string(),
+                new: "me2".to_string(),
+            },
+        );
+
+        assert_eq!(app.servers[0].our_nick, "me2");
+        assert_eq!(
+            app.buffers[server_buf].unread, 1,
+            "own /nick records activity"
+        );
     }
 
     #[test]
