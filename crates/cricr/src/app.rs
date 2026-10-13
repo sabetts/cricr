@@ -1,6 +1,6 @@
 //! Application state and the event loop.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{Event as TermEvent, KeyEventKind};
@@ -156,6 +156,8 @@ pub struct App {
     last_command: LastCommand,
     /// (start, end) positions of the text inserted by the last `yank`.
     last_yank: Option<(Pos, Pos)>,
+    /// Pending `M-w` indication: (position to restore, deadline).
+    copy_flash: Option<(Pos, Instant)>,
     /// Row of the first line inserted by the most recent `push_line`.
     last_push_row: usize,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
@@ -188,6 +190,7 @@ impl App {
             quoted: false,
             last_command: LastCommand::Other,
             last_yank: None,
+            copy_flash: None,
             last_push_row: 0,
             event_tx,
         };
@@ -646,6 +649,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Any keystroke cancels a pending `M-w` indication.
+        self.copy_flash = None;
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
             return;
@@ -1258,12 +1263,45 @@ impl App {
 
     /// `M-w`: save the region to the kill ring (no deletion).
     fn copy_region(&mut self, prev: LastCommand) {
-        let Some(text) = self.current().buffer.region_text() else {
+        let i = self.current;
+        let Some((start, end)) = self.buffers[i].buffer.region() else {
             self.message = Some("The mark is not set now, so there is no region".to_string());
+            return;
+        };
+        let Some(text) = self.buffers[i].buffer.region_text() else {
             return;
         };
         self.kill_ring.push(&text, prev == LastCommand::Kill);
         self.last_command = LastCommand::Kill;
+
+        if start == end {
+            return;
+        }
+        // Emacs `indicate-copied-region`: flash the far end of the region, or
+        // echo `Saved text until "…"` if it is off screen.
+        let point = self.buffers[i].buffer.point();
+        let other = if point == end { start } else { end };
+        if self.visible_row(i, other.row) {
+            self.copy_flash = Some((point, Instant::now() + Duration::from_millis(220)));
+            self.buffers[i].buffer.set_point(other);
+        } else {
+            let snippet = snippet(&text);
+            self.message = Some(format!("Saved text until \"{snippet}\""));
+        }
+    }
+
+    /// Whether `row` is currently within the buffer viewport.
+    fn visible_row(&self, buf: usize, row: usize) -> bool {
+        let height = self.viewport_rows.max(1);
+        let point = self.buffers[buf].buffer.point();
+        let mut top = self.buffers[buf].buffer.scroll();
+        if point.row < top {
+            top = point.row;
+        }
+        if point.row >= top + height {
+            top = point.row + 1 - height;
+        }
+        row >= top && row < top + height
     }
 
     /// `C-w`: kill the region (delete and save to the kill ring).
@@ -2072,6 +2110,7 @@ impl App {
                 }
                 break;
             }
+            let flash_deadline = self.copy_flash.map(|(_, deadline)| deadline);
             tokio::select! {
                 Some((server, event)) = net_rx.recv() => {
                     self.handle_event(server, event);
@@ -2085,6 +2124,19 @@ impl App {
                     // Batch a burst of input (e.g. a paste) into one redraw.
                     while let Ok(event) = term_rx.try_recv() {
                         self.handle_term(event);
+                    }
+                }
+                // Restore the point after the `M-w` indication flashes.
+                _ = async {
+                    match flash_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if let Some((restore, _)) = self.copy_flash.take() {
+                        self.current_mut().buffer.set_point(restore);
                     }
                 }
                 else => break,
@@ -2216,6 +2268,16 @@ fn extract_url(token: &str) -> Option<String> {
         )
     });
     (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
+}
+
+/// A one-line, length-limited rendering of region text for the `M-w` echo.
+fn snippet(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() > 40 {
+        joined.chars().take(40).collect::<String>() + "…"
+    } else {
+        joined
+    }
 }
 
 /// Give a bare host (`example.com`) a scheme so the OS opener treats it as a
@@ -2478,6 +2540,29 @@ mod tests {
         assert_eq!(app.current().buffer.input(), "one");
         app.perform(Action::YankPop);
         assert_eq!(app.current().buffer.input(), "two");
+    }
+
+    #[test]
+    fn copy_region_flashes_the_other_end() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello world");
+        app.current_mut().buffer.set_point(Pos::new(0, 8));
+        app.current_mut().buffer.set_mark();
+        app.current_mut().buffer.set_point(Pos::new(0, 13));
+        app.viewport_rows = 20;
+        app.perform(Action::CopyRegion);
+        // point was the region end, so it flashes the start
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 8));
+        assert!(app.copy_flash.is_some());
+    }
+
+    #[test]
+    fn snippet_is_single_line_and_limited() {
+        assert_eq!(snippet("a\nb   c"), "a b c");
+        let long = "x".repeat(100);
+        assert!(snippet(&long).chars().count() <= 41);
     }
 
     #[test]
