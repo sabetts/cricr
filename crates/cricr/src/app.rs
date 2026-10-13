@@ -784,16 +784,30 @@ impl App {
             ParsedInput::Send(cmd) => {
                 let mut echoed = false;
                 if let ClientCommand::Privmsg { target: t, text } = &cmd {
-                    if *t == target {
-                        let nick = self.our_nick(server);
-                        let line = if let Some(action) = action_body(text) {
-                            self.action_line(server, buf, &[], &nick, action)
+                    // Show the sent message in `t`'s own buffer, creating a
+                    // query buffer for a nick (as rcirc's `rcirc-send-message`
+                    // does). The current buffer is left unchanged.
+                    let idx = if *t == target {
+                        buf
+                    } else {
+                        let kind = if is_channel(t) {
+                            Kind::Channel
                         } else {
-                            self.chat_line(server, buf, &[], &nick, text)
+                            Kind::Query
                         };
-                        self.push_current(line);
-                        echoed = true;
-                    }
+                        self.ensure_buffer(server, t.clone(), kind)
+                    };
+                    let nick = self.our_nick(server);
+                    let line = if let Some(action) = action_body(text) {
+                        self.action_line(server, idx, &[], &nick, action)
+                    } else {
+                        self.chat_line(server, idx, &[], &nick, text)
+                    };
+                    self.push_line(idx, line);
+                    // Sending to a buffer other than the current one is
+                    // activity there, just like any other printed message.
+                    self.bump_activity(idx, false);
+                    echoed = true;
                 }
                 // Echo commands (e.g. `/topic`) so they don't just vanish.
                 if !echoed {
@@ -3911,6 +3925,37 @@ mod tests {
             .position(|b| b.target == "#new" && b.kind == Kind::Channel)
             .expect("channel buffer created");
         assert_eq!(app.current, idx, "should switch to the joined channel");
+    }
+
+    #[test]
+    fn slash_msg_creates_query_buffer_and_echoes() {
+        let mut app = app_without_servers();
+        let start = app.new_buffer(0, "#chan".to_string(), Kind::Channel);
+        app.switch_to(start);
+        app.current_mut().buffer.set_input("/msg bob hi there");
+        app.submit_input();
+        let idx = app
+            .buffers
+            .iter()
+            .position(|b| b.target == "bob" && b.kind == Kind::Query)
+            .expect("query buffer created for the nick");
+        let text: Vec<String> = (0..app.buffers[idx].buffer.len())
+            .map(|r| app.buffers[idx].buffer.line(r).text())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("hi there")),
+            "sent message should appear in the query buffer: {text:?}"
+        );
+        assert_eq!(app.current, start, "stays in the originating buffer");
+        // The sent line shows up as activity in the mode line.
+        assert_eq!(app.buffers[idx].unread, 1, "query buffer has activity");
+        let targets: Vec<String> = app.buffers.iter().map(|b| b.target.clone()).collect();
+        let short = abbreviate(&targets);
+        let bob = short[app.buffers.iter().position(|b| b.target == "bob").unwrap()].clone();
+        assert!(
+            app.activity_entries().iter().any(|(name, _)| *name == bob),
+            "mode line should list the query buffer ({bob})"
+        );
     }
 
     #[tokio::test]
