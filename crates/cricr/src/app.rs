@@ -139,7 +139,9 @@ pub struct Chan {
     pub target: String,
     pub kind: Kind,
     pub buffer: Buffer,
-    /// Unwrapped logical lines for the history cache (channel/query only).
+    /// Unwrapped logical lines not yet written to the history cache
+    /// (channel/query only). The on-disk cache is append-only and grows
+    /// without bound; this only holds the lines awaiting the next flush.
     pub history: Vec<HistoryLine>,
     /// Whether `history` has lines not yet written to disk.
     pub history_dirty: bool,
@@ -434,7 +436,8 @@ impl App {
         };
         let server = server.name.clone();
         let target = self.buffers[idx].target.clone();
-        let entries = history::load(&dir, &server, &target);
+        // Only the visible tail is needed for display; the file keeps growing.
+        let entries = history::load(&dir, &server, &target, self.scrollback.max(1));
         if entries.is_empty() {
             return;
         }
@@ -447,6 +450,8 @@ impl App {
         }
         let had_history = !wrapped.is_empty();
         self.buffers[idx].buffer.load_scrollback(wrapped);
+        // Cap the visible scrollback (the cache itself is not truncated).
+        self.trim_scrollback(idx);
         if had_history {
             // Separate the preloaded history from anything that arrives next,
             // so it's clear where the cached history ends.
@@ -489,10 +494,18 @@ impl App {
             .iter()
             .map(|h| (h.time, line_body(&h.line)))
             .collect();
-        if let Err(err) = history::save(dir, &server, &target, &entries) {
-            self.message = Some(format!("Could not write history for {target}: {err}"));
+        // The cache is append-only, so only the lines added since the last
+        // flush need writing; they are then dropped from memory.
+        match history::append(dir, &server, &target, &entries) {
+            Ok(()) => {
+                self.buffers[idx].history.clear();
+                self.buffers[idx].history_dirty = false;
+            }
+            Err(err) => {
+                // Leave the lines (and the dirty flag) so the next flush retries.
+                self.message = Some(format!("Could not write history for {target}: {err}"));
+            }
         }
-        self.buffers[idx].history_dirty = false;
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -538,22 +551,12 @@ impl App {
                 line: line.clone(),
             });
             self.buffers[buf].history_dirty = true;
-            self.trim_history(buf);
         }
         self.last_push_row = self.buffers[buf].buffer.len().saturating_sub(1);
         for wrapped in line.wrap(self.fill_column) {
             self.buffers[buf].buffer.push_line(wrapped);
         }
         self.trim_scrollback(buf);
-    }
-
-    fn trim_history(&mut self, buf: usize) {
-        let limit = self.scrollback.max(1);
-        let history = &mut self.buffers[buf].history;
-        if history.len() > limit {
-            let excess = history.len() - limit;
-            history.drain(0..excess);
-        }
     }
 
     fn trim_scrollback(&mut self, buf: usize) {
@@ -4257,6 +4260,12 @@ mod tests {
         cfg
     }
 
+    fn push_history_line(app: &mut App, ch: usize, body: &str, time: i64) {
+        let mut line = Line::styled(format!("<alice> {body}"), Style::default());
+        line.time = Some(time);
+        app.push_line(ch, line);
+    }
+
     #[tokio::test]
     async fn history_is_saved_and_prefilled_on_join() {
         let dir = std::env::temp_dir().join(format!("cricr-hist-{}", std::process::id()));
@@ -4295,6 +4304,109 @@ mod tests {
         );
         let hello = text.iter().position(|l| l.contains("hello there")).unwrap();
         assert!(marker > hello, "separator should follow the history");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_keeps_preloaded_lines_across_saves() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = hist_config(&dir);
+
+        // First session writes one line.
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            let mut line = Line::styled("<alice> first", Style::default());
+            line.time = Some(1_700_000_000);
+            app.push_line(ch, line);
+            app.save_all_history();
+        }
+
+        // Second session loads it, adds a line, and saves again. The save must
+        // include the preloaded line, not just the newly added one.
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            let mut line = Line::styled("<bob> second", Style::default());
+            line.time = Some(1_700_000_060);
+            app.push_line(ch, line);
+            app.save_all_history();
+        }
+
+        // Third session still sees both lines.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let text: Vec<String> = (0..app.buffers[ch].buffer.len())
+            .map(|r| app.buffers[ch].buffer.line(r).text())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("first")),
+            "preloaded history dropped after a later save: {text:?}"
+        );
+        assert!(text.iter().any(|l| l.contains("second")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_appends_new_lines_across_saves() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = hist_config(&dir);
+
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            push_history_line(&mut app, ch, "one", 1_700_000_000);
+            app.save_all_history();
+        }
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            push_history_line(&mut app, ch, "two", 1_700_000_001);
+            app.save_all_history();
+            push_history_line(&mut app, ch, "three", 1_700_000_002);
+            app.save_all_history();
+        }
+
+        let entries = history::load(&dir, "127.0.0.1", "#c", 10);
+        assert_eq!(entries.len(), 3, "entries: {entries:?}");
+        for word in ["one", "two", "three"] {
+            let n = entries.iter().filter(|(_, b)| b.contains(word)).count();
+            assert_eq!(n, 1, "{word} should appear once: {entries:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_grows_beyond_scrollback() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-grow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = hist_config(&dir);
+        cfg.ui.scrollback_lines = 2;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        push_history_line(&mut app, ch, "one", 1_700_000_000);
+        push_history_line(&mut app, ch, "two", 1_700_000_001);
+        push_history_line(&mut app, ch, "three", 1_700_000_002);
+        app.save_all_history();
+
+        // The on-screen scrollback is capped...
+        assert!(
+            app.buffers[ch].buffer.len() <= 2,
+            "display should be capped at scrollback_lines"
+        );
+        // ...but the cache keeps every line.
+        let entries = history::load(&dir, "127.0.0.1", "#c", 10);
+        assert_eq!(entries.len(), 3, "cache must not truncate: {entries:?}");
+        assert!(entries.iter().any(|(_, b)| b.contains("one")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
