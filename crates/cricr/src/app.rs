@@ -1913,9 +1913,17 @@ impl App {
                 self.bump_activity(idx, false);
             }
             Event::Mode { target, modes } => {
-                let idx = self.ensure_buffer(server, target.clone(), Kind::Channel);
-                let line = self.server_line(idx, None, "MODE", &format!("{target} {modes}"));
-                self.push_line(idx, line);
+                // Channel modes go to the channel buffer; user modes (e.g. our
+                // own `MODE nick +Ziw`) go to the server buffer.
+                let idx = if is_channel(&target) {
+                    Some(self.ensure_buffer(server, target.clone(), Kind::Channel))
+                } else {
+                    self.servers.get(server).map(|s| s.buffer)
+                };
+                if let Some(idx) = idx {
+                    let line = self.server_line(idx, None, "MODE", &format!("{target} {modes}"));
+                    self.push_line(idx, line);
+                }
             }
             Event::Names { channel, nicks } => {
                 let idx = self.ensure_buffer(server, channel, Kind::Channel);
@@ -2633,6 +2641,53 @@ mod tests {
             .expect("channel buffer created");
         assert_eq!(app.buffers[idx].unread, 1, "own join records activity");
         assert!(!app.activity_entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_mode_goes_to_server_buffer() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.servers.push(crate::config::ServerConfig {
+            name: "127.0.0.1".to_string(),
+            port: Some(addr.port()),
+            tls: Some(false),
+            nick: Some("me".to_string()),
+            user_name: None,
+            full_name: None,
+            password: None,
+            channels: Vec::new(),
+            sasl: None,
+            cert: None,
+            key: None,
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let server_buf = app.servers[0].buffer;
+        let before = app.buffers.len();
+
+        app.handle_event(
+            0,
+            Event::Mode {
+                target: "me".to_string(),
+                modes: "+Ziw".to_string(),
+            },
+        );
+
+        assert_eq!(
+            app.buffers.len(),
+            before,
+            "user mode must not create a buffer"
+        );
+        let text: Vec<String> = (0..app.buffers[server_buf].buffer.len())
+            .map(|r| app.buffers[server_buf].buffer.line(r).text())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("+Ziw")));
     }
 
     #[test]
