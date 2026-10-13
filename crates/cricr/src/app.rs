@@ -1,9 +1,11 @@
 //! Application state and the event loop.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use chrono::{DateTime, Local, TimeZone};
 use crossterm::event::{Event as TermEvent, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
@@ -15,6 +17,7 @@ use cricr_irc::{ClientCommand, ClientConfig, ClientHandle, Event};
 
 use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
 use crate::config::Config;
+use crate::history;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
@@ -122,12 +125,24 @@ pub struct ServerState {
     next_at: Option<Instant>,
 }
 
+/// One entry in a buffer's logical (unwrapped) scrollback log, used by the
+/// on-disk history cache.
+#[derive(Debug, Clone)]
+pub struct HistoryLine {
+    pub time: i64,
+    pub line: Line,
+}
+
 /// One buffer (target).
 pub struct Chan {
     pub server: usize,
     pub target: String,
     pub kind: Kind,
     pub buffer: Buffer,
+    /// Unwrapped logical lines for the history cache (channel/query only).
+    pub history: Vec<HistoryLine>,
+    /// Whether `history` has lines not yet written to disk.
+    pub history_dirty: bool,
     pub nicks: Vec<String>,
     pub unread: usize,
     /// Whether our nick was mentioned since the last visit.
@@ -209,6 +224,8 @@ pub struct App {
     copy_flash: Option<(Pos, Instant)>,
     /// Row of the first line inserted by the most recent `push_line`.
     last_push_row: usize,
+    /// Scrollback cache directory (`None` when history caching is disabled).
+    history_dir: Option<PathBuf>,
     event_tx: mpsc::UnboundedSender<(usize, Event)>,
 }
 
@@ -218,6 +235,7 @@ impl App {
         let fill_column = config.ui.fill_column;
         let clipboard = config.ui.clipboard;
         let theme = Theme::for_background(config.ui.background);
+        let history_dir = history::dir(&config);
         let mut app = App {
             config,
             servers: Vec::new(),
@@ -245,6 +263,7 @@ impl App {
             last_yank: None,
             copy_flash: None,
             last_push_row: 0,
+            history_dir,
             event_tx,
         };
         app.connect_all();
@@ -381,6 +400,8 @@ impl App {
             target,
             kind,
             buffer,
+            history: Vec::new(),
+            history_dirty: false,
             nicks: Vec::new(),
             unread: 0,
             mentioned: false,
@@ -392,7 +413,73 @@ impl App {
             last_timestamp: String::new(),
             topic: None,
         });
-        self.buffers.len() - 1
+        let idx = self.buffers.len() - 1;
+        self.load_cached_history(idx);
+        idx
+    }
+
+    /// Preload a channel/query buffer from the history cache, if enabled.
+    fn load_cached_history(&mut self, idx: usize) {
+        let Some(dir) = self.history_dir.clone() else {
+            return;
+        };
+        if !matches!(self.buffers[idx].kind, Kind::Channel | Kind::Query) {
+            return;
+        }
+        let Some(server) = self.servers.get(self.buffers[idx].server) else {
+            return;
+        };
+        let server = server.name.clone();
+        let target = self.buffers[idx].target.clone();
+        let entries = history::load(&dir, &server, &target);
+        if entries.is_empty() {
+            return;
+        }
+        // Render/re-wrap in order so the timestamp column dedups as it did live.
+        self.buffers[idx].last_timestamp.clear();
+        let mut wrapped: Vec<Line> = Vec::new();
+        for (time, body) in entries {
+            let line = self.render_log_line(idx, time, &body);
+            wrapped.extend(line.wrap(self.fill_column));
+        }
+        self.buffers[idx].buffer.load_scrollback(wrapped);
+    }
+
+    /// Write every dirty channel/query buffer's scrollback to disk.
+    fn save_all_history(&mut self) {
+        let Some(dir) = self.history_dir.clone() else {
+            return;
+        };
+        let indices: Vec<usize> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.history_dirty && matches!(b.kind, Kind::Channel | Kind::Query))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in indices {
+            self.save_history_buffer(&dir, idx);
+        }
+    }
+
+    fn save_history_buffer(&mut self, dir: &Path, idx: usize) {
+        let Some(server) = self
+            .servers
+            .get(self.buffers[idx].server)
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        let target = self.buffers[idx].target.clone();
+        let entries: Vec<history::Entry> = self.buffers[idx]
+            .history
+            .iter()
+            .map(|h| (h.time, line_body(&h.line)))
+            .collect();
+        if let Err(err) = history::save(dir, &server, &target, &entries) {
+            self.message = Some(format!("Could not write history for {target}: {err}"));
+        }
+        self.buffers[idx].history_dirty = false;
     }
 
     // ---- accessors ---------------------------------------------------------
@@ -427,11 +514,33 @@ impl App {
     }
 
     fn push_line(&mut self, buf: usize, line: Line) {
+        // Record the unwrapped logical line for the history cache before it is
+        // split into physical (wrapped) lines.
+        if self.history_dir.is_some()
+            && matches!(self.buffers[buf].kind, Kind::Channel | Kind::Query)
+        {
+            let time = line.time.unwrap_or_else(now_epoch);
+            self.buffers[buf].history.push(HistoryLine {
+                time,
+                line: line.clone(),
+            });
+            self.buffers[buf].history_dirty = true;
+            self.trim_history(buf);
+        }
         self.last_push_row = self.buffers[buf].buffer.len().saturating_sub(1);
         for wrapped in line.wrap(self.fill_column) {
             self.buffers[buf].buffer.push_line(wrapped);
         }
         self.trim_scrollback(buf);
+    }
+
+    fn trim_history(&mut self, buf: usize) {
+        let limit = self.scrollback.max(1);
+        let history = &mut self.buffers[buf].history;
+        if history.len() > limit {
+            let excess = history.len() - limit;
+            history.drain(0..excess);
+        }
     }
 
     fn trim_scrollback(&mut self, buf: usize) {
@@ -768,6 +877,12 @@ impl App {
                 );
             }
             Kind::Query | Kind::Help => {}
+        }
+        // Preserve the latest lines before the buffer (and its log) goes away.
+        if self.buffers[idx].history_dirty {
+            if let Some(dir) = self.history_dir.clone() {
+                self.save_history_buffer(&dir, idx);
+            }
         }
         self.buffers.remove(idx);
         if self.current > idx {
@@ -2171,13 +2286,16 @@ impl App {
         }
     }
 
-    /// The 6-column timestamp field for `buf`. Repeated timestamps are blanked
-    /// so only the first line of a run carries the time.
-    fn time_prefix(&mut self, buf: usize, ts: &str) -> String {
+    /// The timestamp field for `buf`, rendered from the absolute `time` with
+    /// the configured format. Repeated timestamps are blanked so only the first
+    /// line of a run carries the time.
+    fn time_prefix(&mut self, buf: usize, time: i64) -> String {
+        let fmt = self.config.ui.timestamp_format.clone();
+        let ts = format_local(time, &fmt);
         if self.buffers[buf].last_timestamp == ts {
-            "      ".to_string()
+            " ".repeat(ts.chars().count() + 1)
         } else {
-            self.buffers[buf].last_timestamp = ts.to_string();
+            self.buffers[buf].last_timestamp = ts.clone();
             format!("{ts} ")
         }
     }
@@ -2306,8 +2424,8 @@ impl App {
         nick: &str,
         text: &str,
     ) -> Line {
-        let ts = timestamp(tags);
-        let prefix = self.time_prefix(buf, &ts);
+        let time = event_time(tags);
+        let prefix = self.time_prefix(buf, time);
         let nstyle = self.nick_style(server, nick);
         let (mut body, mentioned) = self.message_spans(server, text);
         if mentioned {
@@ -2315,14 +2433,16 @@ impl App {
                 span.style = span.style.bold();
             }
         }
-        let indent = 6 + nick.chars().count() + 3;
+        let indent = prefix.chars().count() + nick.chars().count() + 3;
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(format!("<{nick}>"), nstyle),
             Span::new(" ".to_string(), Style::default()),
         ];
         spans.extend(body);
-        Line::from_spans(spans).indented(indent)
+        let mut line = Line::from_spans(spans).indented(indent);
+        line.time = Some(time);
+        line
     }
 
     fn action_line(
@@ -2333,20 +2453,22 @@ impl App {
         nick: &str,
         body: &str,
     ) -> Line {
-        let ts = timestamp(tags);
-        let prefix = self.time_prefix(buf, &ts);
+        let time = event_time(tags);
+        let prefix = self.time_prefix(buf, time);
         let nstyle = self.nick_style(server, nick);
         let (body, _) = self.message_spans(server, body);
+        let indent = prefix.chars().count() + nick.chars().count() + 2;
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new("[".to_string(), Style::default()),
             Span::new(nick.to_string(), nstyle),
             Span::new(" ".to_string(), Style::default()),
         ];
-        let indent = 6 + nick.chars().count() + 2;
         spans.extend(body);
         spans.push(Span::new("]".to_string(), Style::default()));
-        Line::from_spans(spans).indented(indent)
+        let mut line = Line::from_spans(spans).indented(indent);
+        line.time = Some(time);
+        line
     }
 
     fn notice_line(
@@ -2357,11 +2479,11 @@ impl App {
         nick: &str,
         text: &str,
     ) -> Line {
-        let ts = timestamp(tags);
-        let prefix = self.time_prefix(buf, &ts);
+        let time = event_time(tags);
+        let prefix = self.time_prefix(buf, time);
         let nstyle = self.nick_style(server, nick);
         let (body, _) = self.message_spans(server, text);
-        let indent = 6 + nick.chars().count() + 3;
+        let indent = prefix.chars().count() + nick.chars().count() + 3;
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new("-".to_string(), nstyle),
@@ -2369,7 +2491,9 @@ impl App {
             Span::new("- ".to_string(), nstyle),
         ];
         spans.extend(body);
-        Line::from_spans(spans).indented(indent)
+        let mut line = Line::from_spans(spans).indented(indent);
+        line.time = Some(time);
+        line
     }
 
     /// A server/event line in rcirc's default format: `*** [sender] RESPONSE
@@ -2381,8 +2505,8 @@ impl App {
         response: &str,
         text: &str,
     ) -> Line {
-        let ts = now_hhmm();
-        let prefix = self.time_prefix(buf, &ts);
+        let time = now_epoch();
+        let prefix = self.time_prefix(buf, time);
         let mut head = String::from("***");
         if let Some(sender) = sender {
             head.push(' ');
@@ -2392,7 +2516,7 @@ impl App {
             head.push(' ');
             head.push_str(response);
         }
-        let indent = 6 + head.chars().count() + usize::from(!text.is_empty());
+        let indent = prefix.chars().count() + head.chars().count() + usize::from(!text.is_empty());
         let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(head, self.theme.server),
@@ -2405,7 +2529,9 @@ impl App {
             let (body, _) = self.markup_spans(&our, text, self.theme.server);
             spans.extend(body);
         }
-        Line::from_spans(spans).indented(indent)
+        let mut line = Line::from_spans(spans).indented(indent);
+        line.time = Some(time);
+        line
     }
 
     /// A connection/system message (`*** text`).
@@ -2415,24 +2541,113 @@ impl App {
 
     /// Echo a user-issued command (`>>> /topic ...`) in the current buffer.
     fn command_echo_line(&mut self, buf: usize, text: &str) -> Line {
-        let ts = now_hhmm();
-        let prefix = self.time_prefix(buf, &ts);
-        Line::from_spans(vec![
+        let time = now_epoch();
+        let prefix = self.time_prefix(buf, time);
+        let indent = prefix.chars().count() + 4;
+        let mut line = Line::from_spans(vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(format!(">>> {text}"), Style::fg(Color::Gray)),
         ])
-        .indented(10)
+        .indented(indent);
+        line.time = Some(time);
+        line
     }
 
     /// An error/warning line (`!!! text`) in `font-lock-warning-face`.
     fn error_line(&mut self, buf: usize, text: &str) -> Line {
-        let ts = now_hhmm();
-        let prefix = self.time_prefix(buf, &ts);
-        Line::from_spans(vec![
+        let time = now_epoch();
+        let prefix = self.time_prefix(buf, time);
+        let indent = prefix.chars().count() + 4;
+        let mut line = Line::from_spans(vec![
             Span::new(prefix, self.theme.timestamp),
             Span::new(format!("!!! {text}"), self.theme.warning),
         ])
-        .indented(10)
+        .indented(indent);
+        line.time = Some(time);
+        line
+    }
+
+    /// Rebuild a logical line from the cache: render the timestamp column from
+    /// the absolute `time`, recover the body's face from its rcirc prefix.
+    fn render_log_line(&mut self, buf: usize, time: i64, body: &str) -> Line {
+        let server = self.buffers[buf].server;
+        let prefix = self.time_prefix(buf, time);
+        let prefix_w = prefix.chars().count();
+        let ts_style = self.theme.timestamp;
+        let mut spans = vec![Span::new(prefix, ts_style)];
+        let indent;
+
+        if let Some(rest) = body.strip_prefix('<') {
+            if let Some(close) = rest.find('>') {
+                let nick = rest[..close].to_string();
+                let text = rest[close + 1..]
+                    .strip_prefix(' ')
+                    .unwrap_or(&rest[close + 1..]);
+                let nstyle = self.nick_style(server, &nick);
+                let (mut b, mentioned) = self.message_spans(server, text);
+                if mentioned {
+                    for span in &mut b {
+                        span.style = span.style.bold();
+                    }
+                }
+                indent = prefix_w + nick.chars().count() + 3;
+                spans.push(Span::new(format!("<{nick}>"), nstyle));
+                spans.push(Span::new(" ".to_string(), Style::default()));
+                spans.extend(b);
+                return self.finish_log_line(spans, indent, time);
+            }
+        } else if let Some(inner) = body.strip_prefix('[').and_then(|b| b.strip_suffix(']')) {
+            if let Some((nick, text)) = inner.split_once(' ') {
+                let nstyle = self.nick_style(server, nick);
+                let (b, _) = self.message_spans(server, text);
+                indent = prefix_w + nick.chars().count() + 2;
+                spans.push(Span::new("[".to_string(), Style::default()));
+                spans.push(Span::new(nick.to_string(), nstyle));
+                spans.push(Span::new(" ".to_string(), Style::default()));
+                spans.extend(b);
+                spans.push(Span::new("]".to_string(), Style::default()));
+                return self.finish_log_line(spans, indent, time);
+            }
+        } else if let Some(rest) = body.strip_prefix('-') {
+            if let Some(idx) = rest.find("- ") {
+                let nick = rest[..idx].to_string();
+                let text = &rest[idx + 2..];
+                let nstyle = self.nick_style(server, &nick);
+                let (b, _) = self.message_spans(server, text);
+                indent = prefix_w + nick.chars().count() + 3;
+                spans.push(Span::new("-".to_string(), nstyle));
+                spans.push(Span::new(nick.to_string(), nstyle));
+                spans.push(Span::new("- ".to_string(), nstyle));
+                spans.extend(b);
+                return self.finish_log_line(spans, indent, time);
+            }
+        }
+
+        // Server/system (`*** ...`), command echo (`>>> ...`), error (`!!! ...`),
+        // or anything else: render the remainder with an appropriate base face.
+        if let Some(rest) = body.strip_prefix("*** ") {
+            let our = self.our_nick(server);
+            let (b, _) = self.markup_spans(&our, rest, self.theme.server);
+            indent = prefix_w + 4;
+            spans.push(Span::new("*** ".to_string(), self.theme.server));
+            spans.extend(b);
+        } else if body.starts_with(">>> ") {
+            indent = prefix_w + 4;
+            spans.push(Span::new(body.to_string(), Style::fg(Color::Gray)));
+        } else if body.starts_with("!!! ") {
+            indent = prefix_w + 4;
+            spans.push(Span::new(body.to_string(), self.theme.warning));
+        } else {
+            indent = prefix_w;
+            spans.push(Span::new(body.to_string(), Style::default()));
+        }
+        self.finish_log_line(spans, indent, time)
+    }
+
+    fn finish_log_line(&self, spans: Vec<Span>, indent: usize, time: i64) -> Line {
+        let mut line = Line::from_spans(spans).indented(indent);
+        line.time = Some(time);
+        line
     }
 
     /// Print an error into every buffer of `server` (mirrors rcirc's sentinel
@@ -2794,6 +3009,12 @@ impl App {
         mut net_rx: mpsc::UnboundedReceiver<(usize, Event)>,
         mut term_rx: mpsc::UnboundedReceiver<TermEvent>,
     ) -> Result<()> {
+        // Flush the scrollback cache periodically (interval is configurable).
+        let sync_secs = self.config.history.sync_secs.max(1);
+        let mut history_flush = tokio::time::interval(Duration::from_secs(sync_secs));
+        history_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        history_flush.tick().await; // consume the immediate first tick
+
         loop {
             if let Ok(size) = terminal.size() {
                 // Buffer view height = terminal rows minus mode line + minibuffer.
@@ -2801,6 +3022,7 @@ impl App {
             }
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
             if self.should_quit {
+                self.save_all_history();
                 for state in &self.servers {
                     state.handle.quit("cricr");
                 }
@@ -2846,6 +3068,10 @@ impl App {
                     }
                 } => {
                     self.run_due_reconnects();
+                }
+                // Periodically flush dirty scrollback to the history cache.
+                _ = history_flush.tick() => {
+                    self.save_all_history();
                 }
                 else => break,
             }
@@ -3170,25 +3396,49 @@ fn format_time(unix: i64) -> String {
     }
 }
 
-fn now_hhmm() -> String {
-    let secs = SystemTime::now()
+/// The current time as Unix epoch seconds.
+fn now_epoch() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-fn timestamp(tags: &[Tag]) -> String {
+/// Format `time` (epoch seconds) in local time with `fmt` (e.g. `"%H:%M"`).
+fn format_local(time: i64, fmt: &str) -> String {
+    Local
+        .timestamp_opt(time, 0)
+        .single()
+        .map(|dt| dt.format(fmt).to_string())
+        .unwrap_or_default()
+}
+
+/// A cached logical line's body: its text minus the timestamp column (which is
+/// the line's first span and is re-rendered on load).
+fn line_body(line: &Line) -> String {
+    if line.spans.len() <= 1 {
+        return line.text();
+    }
+    let mut out = String::new();
+    for span in &line.spans[1..] {
+        out.push_str(&span.text);
+    }
+    out
+}
+
+/// The absolute time of an event: the IRCv3 `server-time` tag when present,
+/// else the current local time.
+fn event_time(tags: &[Tag]) -> i64 {
     for tag in tags {
         if tag.key == "time" {
             if let Some(value) = &tag.value {
-                if value.len() >= 16 && value.as_bytes().get(10) == Some(&b'T') {
-                    return value[11..16].to_string();
+                if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+                    return dt.timestamp();
                 }
             }
         }
     }
-    now_hhmm()
+    now_epoch()
 }
 
 /// Advance a point by one cell, for the next search starting position.
@@ -3452,7 +3702,7 @@ mod tests {
             panic!("no TOPIC seen");
         });
 
-        let mut cfg = Config::default();
+        let mut cfg = test_config();
         cfg.servers.push(crate::config::ServerConfig {
             name: "127.0.0.1".to_string(),
             port: Some(addr.port()),
@@ -3637,7 +3887,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let mut cfg = Config::default();
+        let mut cfg = test_config();
         cfg.servers.push(crate::config::ServerConfig {
             name: "127.0.0.1".to_string(),
             port: Some(addr.port()),
@@ -3680,7 +3930,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let mut cfg = Config::default();
+        let mut cfg = test_config();
         cfg.servers.push(crate::config::ServerConfig {
             name: "127.0.0.1".to_string(),
             port: Some(addr.port()),
@@ -3728,7 +3978,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let mut cfg = Config::default();
+        let mut cfg = test_config();
         cfg.servers.push(crate::config::ServerConfig {
             name: "127.0.0.1".to_string(),
             port: Some(addr.port()),
@@ -3817,6 +4067,85 @@ mod tests {
             "should explain config file"
         );
         assert!(text.to_lowercase().contains("configuration"));
+    }
+
+    fn hist_config(dir: &Path) -> Config {
+        let mut cfg: Config = toml::from_str(
+            "[history]\nenabled = true\n[[servers]]\nname = \"127.0.0.1\"\nport = 1\ntls = false\nnick = \"nick\"\n",
+        )
+        .unwrap();
+        cfg.history.dir = Some(dir.to_path_buf());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn history_is_saved_and_prefilled_on_join() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = hist_config(&dir);
+
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            let mut line = Line::styled("<alice> hello there", Style::default());
+            line.time = Some(1_700_000_000);
+            app.push_line(ch, line);
+            app.save_all_history();
+        }
+
+        // A fresh app loads the cache when the channel buffer is created.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let text: Vec<String> = (0..app.buffers[ch].buffer.len())
+            .map(|r| app.buffers[ch].buffer.line(r).text())
+            .collect();
+        assert!(
+            text.iter().any(|l| l.contains("hello there")),
+            "preloaded history missing: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_reload_rewraps_to_current_width() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-wrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = hist_config(&dir);
+        cfg.ui.fill_column = 70;
+
+        let long = format!("<alice> {}", "word ".repeat(40));
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            let mut line = Line::styled(long.clone(), Style::default());
+            line.time = Some(1_700_000_000);
+            app.push_line(ch, line);
+            app.save_all_history();
+        }
+
+        // Reloading at a much narrower width wraps the one logical line.
+        cfg.ui.fill_column = 20;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        assert!(
+            app.buffers[ch].buffer.len() > 3,
+            "expected the long line to wrap into several rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_capture_is_skipped_when_disabled() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let mut line = Line::styled("<alice> hi", Style::default());
+        line.time = Some(1_700_000_000);
+        app.push_line(ch, line);
+        assert!(app.buffers[ch].history.is_empty());
     }
 
     #[test]
@@ -3936,16 +4265,24 @@ mod tests {
         assert_eq!(action_body("hello"), None);
     }
 
+    /// A config with the scrollback cache disabled, so tests stay hermetic
+    /// (never read or write the real user cache directory).
+    fn test_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.history.enabled = false;
+        cfg
+    }
+
     fn app_without_servers() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
-        App::new(Config::default(), tx)
+        App::new(test_config(), tx)
     }
 
     /// An app with one server pointed at an unreachable port, so the client
     /// task spawns (and fails) without needing a real server.
     fn app_with_unreachable_server() -> App {
         let cfg: Config = toml::from_str(
-            "[[servers]]\nname = \"127.0.0.1\"\nport = 1\ntls = false\nnick = \"nick\"\n",
+            "[history]\nenabled = false\n[[servers]]\nname = \"127.0.0.1\"\nport = 1\ntls = false\nnick = \"nick\"\n",
         )
         .unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();

@@ -17,6 +17,29 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     pub ui: UiConfig,
     pub reconnect: ReconnectConfig,
+    pub history: HistoryConfig,
+}
+
+/// Persistent scrollback cache (`[history]`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Cache channel/query scrollback to disk and preload it on (re)join.
+    pub enabled: bool,
+    /// Cache directory; defaults to the platform cache dir.
+    pub dir: Option<PathBuf>,
+    /// How often (seconds) dirty buffers are flushed to disk.
+    pub sync_secs: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        HistoryConfig {
+            enabled: true,
+            dir: None,
+            sync_secs: 60,
+        }
+    }
 }
 
 /// Automatic reconnection behavior for unexpected disconnects.
@@ -167,6 +190,11 @@ background = "dark"   # or "light"
 enabled = true        # reconnect automatically after an unexpected drop
 initial_secs = 1      # delay before the first retry
 max_secs = 120        # cap on the retry delay
+
+[history]
+enabled = true        # cache channel/query scrollback and preload it on join
+# dir = "/path/to/cache"    # defaults to the platform cache directory
+sync_secs = 60        # how often dirty buffers are flushed to disk (seconds)
 
 # No servers are configured by default. Add one like this (uncomment and
 # edit), repeating the [[servers]] table for each network:
@@ -348,6 +376,21 @@ mod tests {
         assert!(!cfg.reconnect.enabled);
         assert_eq!(cfg.reconnect.initial_secs, 5.0);
         assert_eq!(cfg.reconnect.max_secs, 120.0);
+    }
+
+    #[test]
+    fn history_defaults_and_overrides() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.history.enabled);
+        assert!(cfg.history.dir.is_none());
+        assert_eq!(cfg.history.sync_secs, 60);
+
+        let cfg: Config = toml::from_str("[history]\nenabled = false\nsync_secs = 5\n").unwrap();
+        assert!(!cfg.history.enabled);
+        assert_eq!(cfg.history.sync_secs, 5);
+
+        assert!(TEMPLATE.contains("[history]"));
+        assert!(TEMPLATE.contains("sync_secs = 60"));
     }
 
     #[test]

@@ -101,19 +101,31 @@ impl Span {
 }
 
 /// A single display line, made of one or more styled spans.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Line {
     pub spans: Vec<Span>,
     /// When wrapping, continuation lines are indented by this many columns
     /// (the width of the line's prefix, e.g. timestamp + `<nick> `).
     pub indent: usize,
+    /// Absolute time (Unix epoch seconds) this line was produced, if known.
+    /// Used only by the scrollback cache; not part of line equality.
+    pub time: Option<i64>,
 }
+
+impl PartialEq for Line {
+    fn eq(&self, other: &Self) -> bool {
+        self.spans == other.spans && self.indent == other.indent
+    }
+}
+
+impl Eq for Line {}
 
 impl Line {
     pub fn plain(text: impl Into<String>) -> Self {
         Line {
             spans: vec![Span::new(text, Style::default())],
             indent: 0,
+            time: None,
         }
     }
 
@@ -121,11 +133,16 @@ impl Line {
         Line {
             spans: vec![Span::new(text, style)],
             indent: 0,
+            time: None,
         }
     }
 
     pub fn from_spans(spans: Vec<Span>) -> Self {
-        Line { spans, indent: 0 }
+        Line {
+            spans,
+            indent: 0,
+            time: None,
+        }
     }
 
     /// Set the continuation indent used when wrapping.
@@ -283,6 +300,18 @@ impl Buffer {
             lines
         };
         self.point = Pos::new(0, 0);
+        self.scroll = 0;
+        self.mark = None;
+    }
+
+    /// Replace the scrollback with cached `history`, keeping a fresh prompt
+    /// line (used when preloading an rcirc buffer from the history cache).
+    pub fn load_scrollback(&mut self, history: Vec<Line>) {
+        let prompt = self.prompt.clone().unwrap_or_default();
+        self.lines = Vec::with_capacity(history.len() + 1);
+        self.lines.extend(history);
+        self.lines.push(Line::styled(prompt, self.prompt_style));
+        self.point = Pos::new(self.last_row(), self.prompt_len);
         self.scroll = 0;
         self.mark = None;
     }
