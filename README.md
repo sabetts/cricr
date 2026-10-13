@@ -1,6 +1,6 @@
 # Intro
 
-In the spirit of DHH proclamation that Rust is a great language to
+In the spirit of DHH's proclamation that Rust is a great language to
 write code in as long as you don't have to read it, I present a
 vibe-coded clone of rcirc in Rust.
 
