@@ -122,6 +122,14 @@ fn numeric_or_generic(message: &Message) -> Event {
             setter: String::new(),
             time: String::new(),
         },
+        "333" => Event::TopicSet {
+            channel: args.get(1).cloned().unwrap_or_default(),
+            setter: args
+                .get(2)
+                .map(|s| prefix_nick(s).to_string())
+                .unwrap_or_default(),
+            time: args.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+        },
         "353" => Event::Names {
             channel: args.get(2).cloned().unwrap_or_default(),
             nicks: args
@@ -241,6 +249,22 @@ mod tests {
             Event::Names { channel, nicks } => {
                 assert_eq!(channel, "#c");
                 assert_eq!(nicks, vec!["@a", "+b", "c"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn topic_whotime() {
+        match ev(":srv 333 me #c rcy!u@h 1758407992") {
+            Event::TopicSet {
+                channel,
+                setter,
+                time,
+            } => {
+                assert_eq!(channel, "#c");
+                assert_eq!(setter, "rcy");
+                assert_eq!(time, 1_758_407_992);
             }
             other => panic!("{other:?}"),
         }

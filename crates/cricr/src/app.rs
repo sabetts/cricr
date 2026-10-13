@@ -1995,6 +1995,18 @@ impl App {
                 self.push_line(idx, line);
                 self.bump_activity(idx, false);
             }
+            Event::TopicSet {
+                channel,
+                setter,
+                time,
+            } => {
+                let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
+                let when = format_time(time);
+                let text = format!("Topic set by {setter} on {when}");
+                let line = self.server_line(idx, None, "", &text);
+                self.push_line(idx, line);
+                self.bump_activity(idx, false);
+            }
             Event::Mode { target, modes } => {
                 // Channel modes go to the channel buffer; user modes (e.g. our
                 // own `MODE nick +Ziw`) go to the server buffer.
@@ -2421,6 +2433,15 @@ fn platform_open(url: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// Format a unix timestamp in local time, e.g. `Sun Sep 20 20:59:52 2026`.
+fn format_time(unix: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_opt(unix, 0).single() {
+        Some(dt) => dt.format("%a %b %-d %H:%M:%S %Y").to_string(),
+        None => unix.to_string(),
+    }
+}
+
 fn now_hhmm() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2815,6 +2836,24 @@ mod tests {
             .collect();
         assert!(text.iter().any(|l| l.contains("482")));
         assert_eq!(app.buffers[ch].unread, 1, "activity recorded");
+    }
+
+    #[test]
+    fn topic_set_line_is_rendered() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.handle_event(
+            0,
+            Event::TopicSet {
+                channel: "#c".to_string(),
+                setter: "rcy".to_string(),
+                time: 1_758_407_992,
+            },
+        );
+        let text: Vec<String> = (0..app.buffers[ch].buffer.len())
+            .map(|r| app.buffers[ch].buffer.line(r).text())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("Topic set by rcy on")));
     }
 
     #[test]

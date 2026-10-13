@@ -92,6 +92,12 @@ pub enum Event {
         setter: String,
         time: String,
     },
+    /// `RPL_TOPICWHOTIME` (333): who set the channel topic and when.
+    TopicSet {
+        channel: String,
+        setter: String,
+        time: i64,
+    },
     Mode {
         target: String,
         modes: String,
