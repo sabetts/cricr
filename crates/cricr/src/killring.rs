@@ -37,6 +37,11 @@ impl KillRing {
         self.index = 0;
     }
 
+    /// The most recent entry, without changing the cycling index.
+    pub fn current(&self) -> Option<String> {
+        self.ring.front().cloned()
+    }
+
     /// The entry that `yank` would insert, and reset cycling to it.
     pub fn yank(&mut self) -> Option<String> {
         self.index = 0;

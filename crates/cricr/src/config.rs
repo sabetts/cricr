@@ -99,6 +99,8 @@ pub struct UiConfig {
     pub scrollback_lines: usize,
     /// Word-wrap messages at this many columns (0 disables wrapping).
     pub fill_column: usize,
+    /// Mirror kills/copies to the system clipboard via OSC 52.
+    pub clipboard: bool,
     /// Which rcirc face variant to use: `"dark"` (default) or `"light"`.
     pub background: Background,
 }
@@ -109,6 +111,7 @@ impl Default for UiConfig {
             timestamp_format: "%H:%M".to_string(),
             scrollback_lines: 100_000,
             fill_column: 70,
+            clipboard: true,
             background: Background::Dark,
         }
     }
@@ -128,6 +131,7 @@ tls = true
 timestamp_format = "%H:%M"
 scrollback_lines = 100000
 fill_column = 70      # word-wrap messages at this column (0 = off)
+clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
 background = "dark"   # or "light"
 
 [[servers]]
@@ -277,6 +281,7 @@ mod tests {
         assert_eq!(cfg.servers[0].channels, vec!["#emacs", "#rcirc"]);
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
         assert_eq!(cfg.ui.fill_column, 70);
+        assert!(cfg.ui.clipboard);
         assert_eq!(cfg.ui.background, Background::Dark);
     }
 

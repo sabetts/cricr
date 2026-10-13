@@ -150,6 +150,8 @@ pub struct App {
     pub viewport_rows: usize,
     pub scrollback: usize,
     pub fill_column: usize,
+    /// Whether kills/copies are written to the system clipboard (OSC 52).
+    pub clipboard: bool,
     pub theme: Theme,
     pub should_quit: bool,
     pub prompt: Prompt,
@@ -172,6 +174,7 @@ impl App {
     pub fn new(config: Config, event_tx: mpsc::UnboundedSender<(usize, Event)>) -> Self {
         let scrollback = config.ui.scrollback_lines;
         let fill_column = config.ui.fill_column;
+        let clipboard = config.ui.clipboard;
         let theme = Theme::for_background(config.ui.background);
         let mut app = App {
             config,
@@ -185,6 +188,7 @@ impl App {
             viewport_rows: 20,
             scrollback,
             fill_column,
+            clipboard,
             theme,
             should_quit: false,
             prompt: Prompt::None,
@@ -1248,12 +1252,12 @@ impl App {
             DeleteForward => self.current_mut().buffer.delete_forward(),
             BackwardKillWord => {
                 let killed = self.current_mut().buffer.backward_kill_word();
-                self.kill_ring.push(&killed, prev == LastCommand::Kill);
+                self.kill_new(&killed, prev == LastCommand::Kill);
                 self.last_command = LastCommand::Kill;
             }
             KillLine => {
                 let killed = self.current_mut().buffer.kill_line();
-                self.kill_ring.push(&killed, prev == LastCommand::Kill);
+                self.kill_new(&killed, prev == LastCommand::Kill);
                 self.last_command = LastCommand::Kill;
             }
             SetMark => self.current_mut().buffer.set_mark(),
@@ -1298,6 +1302,26 @@ impl App {
         self.current_mut().buffer.page_forward(n);
     }
 
+    /// Add text to the kill ring and mirror the result to the system
+    /// clipboard (OSC 52).
+    fn kill_new(&mut self, text: &str, append: bool) {
+        self.kill_ring.push(text, append);
+        if let Some(top) = self.kill_ring.current() {
+            self.set_clipboard(&top);
+        }
+    }
+
+    fn set_clipboard(&self, text: &str) {
+        if !self.clipboard {
+            return;
+        }
+        if let Some(sequence) = osc52_sequence(text) {
+            let mut out = std::io::stdout();
+            let _ = std::io::Write::write_all(&mut out, sequence.as_bytes());
+            let _ = std::io::Write::flush(&mut out);
+        }
+    }
+
     /// `M-w`: save the region to the kill ring (no deletion).
     fn copy_region(&mut self, prev: LastCommand) {
         let i = self.current;
@@ -1308,7 +1332,7 @@ impl App {
         let Some(text) = self.buffers[i].buffer.region_text() else {
             return;
         };
-        self.kill_ring.push(&text, prev == LastCommand::Kill);
+        self.kill_new(&text, prev == LastCommand::Kill);
         self.last_command = LastCommand::Kill;
 
         if start == end {
@@ -1352,7 +1376,7 @@ impl App {
             return;
         };
         if self.buffers[i].buffer.delete_region(start, end) {
-            self.kill_ring.push(&text, prev == LastCommand::Kill);
+            self.kill_new(&text, prev == LastCommand::Kill);
             self.last_command = LastCommand::Kill;
         } else {
             self.message = Some("Text is read-only".to_string());
@@ -2213,25 +2237,30 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // Prompt input: drop newlines.
         if !matches!(self.prompt, Prompt::None) {
-            for ch in text.chars() {
-                if ch != '\r' && ch != '\n' {
-                    self.prompt_push(ch);
-                }
+            let filtered: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+            if filtered.is_empty() {
+                return;
             }
+            for ch in filtered.chars() {
+                self.prompt_push(ch);
+            }
+            self.kill_ring.push(&filtered, false);
             return;
         }
         let i = self.current;
-        if self.buffers[i].buffer.is_irc() {
-            let cleaned: String = text
-                .chars()
+        let inserted = if self.buffers[i].buffer.is_irc() {
+            text.chars()
                 .filter(|c| *c != '\r')
                 .map(|c| if c == '\n' { ' ' } else { c })
-                .collect();
-            self.buffers[i].buffer.insert_str(&cleaned);
+                .collect::<String>()
         } else {
-            self.buffers[i].buffer.insert_str(&text);
-        }
+            text
+        };
+        self.buffers[i].buffer.insert_str(&inserted);
+        // Make pasted text available to C-y / M-y.
+        self.kill_ring.push(&inserted, false);
     }
 }
 
@@ -2370,10 +2399,27 @@ fn help_lines() -> Vec<String> {
         "Help",
         "  C-h b          describe bindings (this buffer)",
         "  C-g            abort the current command",
+        "",
+        "Notes",
+        "  Pasted text is added to the kill ring (recall with C-y / M-y).",
+        "  C-w / M-w / C-k mirror the kill to the system clipboard (OSC 52).",
+        "  Your terminal may capture Ctrl+V for paste; rebind it (e.g. to",
+        "  Ctrl+Shift+V) if you want C-v to scroll a page.",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// The OSC 52 escape sequence that sets the system clipboard to `text`
+/// (`None` for empty text).
+fn osc52_sequence(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    Some(format!("\u{1b}]52;c;{payload}\u{7}"))
 }
 
 /// A one-line, length-limited rendering of region text for the `M-w` echo.
@@ -3033,6 +3079,25 @@ mod tests {
         app.switch_to(ch);
         app.handle_paste("hello\r\nworld".to_string());
         assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[test]
+    fn paste_adds_to_kill_ring() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.handle_paste("hello\nworld".to_string());
+        assert_eq!(app.current().buffer.input(), "hello world");
+        assert_eq!(app.kill_ring.current().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_text() {
+        assert_eq!(
+            osc52_sequence("hi").as_deref(),
+            Some("\u{1b}]52;c;aGk=\u{7}")
+        );
+        assert_eq!(osc52_sequence(""), None);
     }
 
     #[test]
