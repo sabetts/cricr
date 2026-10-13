@@ -642,6 +642,74 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Upcase the word before point (Emacs `upcase-word` with a negative
+    /// argument), leaving point at the start of that word.
+    pub fn backward_upcase_word(&mut self) {
+        self.backward_case_word(|word| word.iter().flat_map(|c| c.to_uppercase()).collect());
+    }
+
+    /// Downcase the word before point (`downcase-word` with a negative arg).
+    pub fn backward_downcase_word(&mut self) {
+        self.backward_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
+    }
+
+    /// Transform the word before point with `transform`, leaving point at the
+    /// start of that word.
+    fn backward_case_word(&mut self, transform: impl Fn(&[char]) -> String) {
+        if !self.editable() {
+            return;
+        }
+        if self.is_irc() {
+            let base = self.prompt_len;
+            let chars: Vec<char> = self.input().chars().collect();
+            let end = self.point.col.saturating_sub(base).min(chars.len());
+            let mut i = end;
+            while i > 0 && !is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            let start = i;
+            if start == end {
+                self.point.col = base + start;
+                return;
+            }
+            let changed = transform(&chars[start..end]);
+            let mut out: Vec<char> = Vec::with_capacity(chars.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(changed.chars());
+            out.extend_from_slice(&chars[end..]);
+            let text: String = out.into_iter().collect();
+            self.input_set(&text);
+            self.point = Pos::new(self.last_row(), base + start);
+        } else {
+            let row = self.point.row;
+            let chars: Vec<char> = self.lines[row].chars();
+            let end = self.point.col.min(chars.len());
+            let mut i = end;
+            while i > 0 && !is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            let start = i;
+            if start == end {
+                self.point.col = start;
+                return;
+            }
+            let changed = transform(&chars[start..end]);
+            let mut out: Vec<char> = Vec::with_capacity(chars.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(changed.chars());
+            out.extend_from_slice(&chars[end..]);
+            self.lines[row] = Line::plain(out.into_iter().collect::<String>());
+            self.point.col = start;
+        }
+        self.scroll_into_view();
+    }
+
     /// Emacs `scroll-up-command` (C-v): move point forward a screenful and
     /// scroll the view with it.
     pub fn page_forward(&mut self, rows: usize) {
@@ -1069,6 +1137,28 @@ mod tests {
         b.beginning_of_buffer();
         b.upcase_word();
         assert_eq!(b.line(0).text(), "FOO bar");
+    }
+
+    #[test]
+    fn backward_upcase_word() {
+        let mut b = Buffer::new("> ");
+        for c in "hello world".chars() {
+            b.insert_char(c);
+        }
+        b.backward_upcase_word();
+        assert_eq!(b.input(), "hello WORLD");
+        assert_eq!(b.point().col, 2 + 6);
+    }
+
+    #[test]
+    fn backward_downcase_word() {
+        let mut b = Buffer::new("> ");
+        for c in "HELLO WORLD".chars() {
+            b.insert_char(c);
+        }
+        b.backward_downcase_word();
+        assert_eq!(b.input(), "HELLO world");
+        assert_eq!(b.point().col, 2 + 6);
     }
 
     #[test]

@@ -74,6 +74,27 @@ enum Prefix {
     Help,
 }
 
+/// A numeric argument being built with `C-u`, `M-<digit>`, or `M--`
+/// (Emacs's universal argument).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArgState {
+    /// Unsigned magnitude.
+    magnitude: u32,
+    /// `+1` or `-1`.
+    sign: i32,
+    /// Whether a digit has been typed (so further digits append rather than
+    /// replace the initial `C-u`/`M--` value).
+    digits: bool,
+}
+
+impl ArgState {
+    /// The signed value, clamped to `i32`.
+    fn value(self) -> i32 {
+        let mag = self.magnitude.min(i32::MAX as u32) as i32;
+        self.sign * mag
+    }
+}
+
 /// The kind of the previous editing command, for kill/yank chaining.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LastCommand {
@@ -178,6 +199,8 @@ pub struct App {
     activity_seq: u64,
     visit_seq: u64,
     prefix: Prefix,
+    /// A numeric argument being built (Emacs universal argument), if any.
+    numeric_arg: Option<ArgState>,
     quoted: bool,
     last_command: LastCommand,
     /// (start, end) positions of the text inserted by the last `yank`.
@@ -216,6 +239,7 @@ impl App {
             activity_seq: 0,
             visit_seq: 0,
             prefix: Prefix::None,
+            numeric_arg: None,
             quoted: false,
             last_command: LastCommand::Other,
             last_yank: None,
@@ -807,24 +831,33 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // Universal argument entry (`C-u`, `M-<digit>`, `M--`, digits).
+        if self.handle_argument(key, ctrl) {
+            return;
+        }
+
         // A pending prefix always consumes the next key.
         if self.prefix != Prefix::None {
+            self.numeric_arg = None;
             self.handle_prefix(key, ctrl);
             return;
         }
 
         if ctrl && key.code == KeyCode::Char('x') {
+            self.numeric_arg = None;
             self.prefix = Prefix::CtrlX;
             self.message = Some("C-x-".to_string());
             return;
         }
         if ctrl && key.code == KeyCode::Char('c') {
+            self.numeric_arg = None;
             self.prefix = Prefix::CtrlC;
             self.message = Some("C-c-".to_string());
             return;
         }
         // C-h (help) prefix. Some terminals report Ctrl+H as Backspace.
         if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace) {
+            self.numeric_arg = None;
             self.prefix = Prefix::Help;
             self.message = Some("C-h-".to_string());
             return;
@@ -833,12 +866,99 @@ impl App {
         self.message = None;
         let action = keymap::translate(key);
         if action == Action::None {
+            self.numeric_arg = None;
             if let Some(desc) = keymap::describe(key) {
                 self.message = Some(format!("{desc} is undefined"));
             }
         } else {
             self.perform(action);
         }
+    }
+
+    /// Handle keys that build the universal/numeric argument. Returns `true`
+    /// when the key was consumed.
+    fn handle_argument(&mut self, key: crossterm::event::KeyEvent, ctrl: bool) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            // C-u: default 4, and each additional C-u multiplies by 4.
+            KeyCode::Char('u') if ctrl => {
+                let arg = self.numeric_arg.get_or_insert(ArgState {
+                    magnitude: 1,
+                    sign: 1,
+                    digits: false,
+                });
+                arg.magnitude = arg.magnitude.saturating_mul(4);
+                self.show_argument();
+                true
+            }
+            // M--: negative argument (default -1), or flip the sign.
+            KeyCode::Char('-') if alt => {
+                match &mut self.numeric_arg {
+                    Some(arg) => arg.sign = -arg.sign,
+                    None => {
+                        self.numeric_arg = Some(ArgState {
+                            magnitude: 1,
+                            sign: -1,
+                            digits: false,
+                        })
+                    }
+                }
+                self.show_argument();
+                true
+            }
+            // A bare `-` while building an argument flips the sign.
+            KeyCode::Char('-') if !ctrl && self.numeric_arg.is_some() => {
+                if let Some(arg) = &mut self.numeric_arg {
+                    arg.sign = -arg.sign;
+                }
+                self.show_argument();
+                true
+            }
+            // M-<digit> starts a numeric argument; digits extend it.
+            KeyCode::Char(d) if d.is_ascii_digit() && alt => {
+                self.push_argument_digit(d);
+                self.show_argument();
+                true
+            }
+            KeyCode::Char(d) if d.is_ascii_digit() && !ctrl && self.numeric_arg.is_some() => {
+                self.push_argument_digit(d);
+                self.show_argument();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn push_argument_digit(&mut self, d: char) {
+        let n = d.to_digit(10).unwrap_or(0);
+        match &mut self.numeric_arg {
+            Some(arg) if arg.digits => {
+                arg.magnitude = arg.magnitude.saturating_mul(10).saturating_add(n);
+            }
+            Some(arg) => {
+                arg.magnitude = n;
+                arg.digits = true;
+            }
+            None => {
+                self.numeric_arg = Some(ArgState {
+                    magnitude: n,
+                    sign: 1,
+                    digits: true,
+                })
+            }
+        }
+    }
+
+    fn show_argument(&mut self) {
+        if let Some(arg) = self.numeric_arg {
+            self.message = Some(format!("C-u {}-", arg.value()));
+        }
+    }
+
+    /// Consume the pending numeric argument, returning it (default `1`).
+    fn take_arg(&mut self) -> i32 {
+        self.numeric_arg.take().map(ArgState::value).unwrap_or(1)
     }
 
     fn handle_prefix(&mut self, key: crossterm::event::KeyEvent, ctrl: bool) {
@@ -1639,9 +1759,15 @@ impl App {
         use Action::*;
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
+        // A pending numeric argument (Emacs universal argument), default 1.
+        let n = self.take_arg();
         match action {
             None => {}
-            SelfInsert(c) => self.current_mut().buffer.insert_char(c),
+            SelfInsert(c) => {
+                for _ in 0..n.max(0) {
+                    self.current_mut().buffer.insert_char(c);
+                }
+            }
             Send => {
                 if matches!(self.current().kind, Kind::Scratch | Kind::Help) {
                     self.current_mut().buffer.insert_newline();
@@ -1649,22 +1775,22 @@ impl App {
                     self.submit_input();
                 }
             }
-            ForwardChar => self.current_mut().buffer.forward_char(),
-            BackwardChar => self.current_mut().buffer.backward_char(),
-            NextLine => self.current_mut().buffer.next_line(),
-            PrevLine => self.current_mut().buffer.prev_line(),
+            ForwardChar => self.move_chars(n),
+            BackwardChar => self.move_chars(-n),
+            NextLine => self.move_lines(n),
+            PrevLine => self.move_lines(-n),
             BeginningOfLine => self.current_mut().buffer.beginning_of_line(),
             EndOfLine => self.current_mut().buffer.end_of_line(),
-            ForwardWord => self.current_mut().buffer.forward_word(),
-            BackwardWord => self.current_mut().buffer.backward_word(),
-            UpcaseWord => self.current_mut().buffer.upcase_word(),
-            DowncaseWord => self.current_mut().buffer.downcase_word(),
+            ForwardWord => self.move_words(n),
+            BackwardWord => self.move_words(-n),
+            UpcaseWord => self.case_words(n, true),
+            DowncaseWord => self.case_words(n, false),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
             PageUp => self.page_up(),
             PageDown => self.page_down(),
-            DeleteBackward => self.current_mut().buffer.delete_backward(),
-            DeleteForward => self.current_mut().buffer.delete_forward(),
+            DeleteBackward => self.delete_chars(-n),
+            DeleteForward => self.delete_chars(n),
             BackwardKillWord => {
                 let killed = self.current_mut().buffer.backward_kill_word();
                 self.kill_new(&killed, prev == LastCommand::Kill);
@@ -1698,6 +1824,62 @@ impl App {
             Abort => {
                 self.current_mut().buffer.clear_mark();
                 self.message = Option::None;
+            }
+        }
+    }
+
+    /// Move point by `n` characters (negative moves backward).
+    fn move_chars(&mut self, n: i32) {
+        for _ in 0..n.abs() {
+            if n >= 0 {
+                self.current_mut().buffer.forward_char();
+            } else {
+                self.current_mut().buffer.backward_char();
+            }
+        }
+    }
+
+    /// Move point by `n` lines (negative moves up).
+    fn move_lines(&mut self, n: i32) {
+        for _ in 0..n.abs() {
+            if n >= 0 {
+                self.current_mut().buffer.next_line();
+            } else {
+                self.current_mut().buffer.prev_line();
+            }
+        }
+    }
+
+    /// Move point by `n` words (negative moves backward).
+    fn move_words(&mut self, n: i32) {
+        for _ in 0..n.abs() {
+            if n >= 0 {
+                self.current_mut().buffer.forward_word();
+            } else {
+                self.current_mut().buffer.backward_word();
+            }
+        }
+    }
+
+    /// Change the case of `n` words (negative affects words before point).
+    fn case_words(&mut self, n: i32, up: bool) {
+        for _ in 0..n.abs() {
+            match (n >= 0, up) {
+                (true, true) => self.current_mut().buffer.upcase_word(),
+                (true, false) => self.current_mut().buffer.downcase_word(),
+                (false, true) => self.current_mut().buffer.backward_upcase_word(),
+                (false, false) => self.current_mut().buffer.backward_downcase_word(),
+            }
+        }
+    }
+
+    /// Delete `n` characters (negative deletes backward).
+    fn delete_chars(&mut self, n: i32) {
+        for _ in 0..n.abs() {
+            if n >= 0 {
+                self.current_mut().buffer.delete_forward();
+            } else {
+                self.current_mut().buffer.delete_backward();
             }
         }
     }
@@ -2861,6 +3043,7 @@ fn help_lines() -> Vec<String> {
         "  RET            send input",
         "  TAB            complete nick or /command",
         "  M-p / M-n      previous / next input",
+        "  M-u / M-l      upcase / downcase word",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
         "  C-d            delete character forward",
@@ -2889,6 +3072,12 @@ fn help_lines() -> Vec<String> {
         "Help",
         "  C-h b          describe bindings (this buffer)",
         "  C-g            abort the current command",
+        "",
+        "Arguments",
+        "  C-u            numeric argument (4); repeat to multiply (C-u C-u = 16)",
+        "  M-<digit>      start a numeric argument, e.g. M-3",
+        "  M--            negative argument (M-- M-u upcases the previous word)",
+        "  C-u 3 C-f      forward 3 characters; C-u C-n moves down 4 lines",
         "",
         "Notes",
         "  Pasted text is added to the kill ring (recall with C-y / M-y).",
@@ -4099,6 +4288,70 @@ mod tests {
         app.current_mut().buffer.beginning_of_line();
         app.perform(Action::DowncaseWord);
         assert_eq!(app.current().buffer.input(), "hello there");
+    }
+
+    #[test]
+    fn c_u_c_n_moves_down_four_lines() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..10 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.current_mut().buffer.beginning_of_buffer();
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point().row, 4);
+    }
+
+    #[test]
+    fn c_u_3_c_f_moves_forward_three() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("abcdef");
+        app.current_mut().buffer.beginning_of_line();
+        let base = app.current().buffer.prompt_len();
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point().col, base + 3);
+    }
+
+    #[test]
+    fn m_minus_m_u_upcases_previous_word() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello world");
+        let base = app.current().buffer.prompt_len();
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::ALT);
+        assert_eq!(app.current().buffer.input(), "hello WORLD");
+        // Point ends at the start of the affected word.
+        assert_eq!(app.current().buffer.point().col, base + 6);
+    }
+
+    #[test]
+    fn numeric_argument_repeats_self_insert_and_multiplies() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        // C-u 3 x -> "xxx"
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.input(), "xxx");
+        app.current_mut().buffer.set_input("");
+        // C-u C-u z -> 16 z's
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.input(), "z".repeat(16));
     }
 
     #[test]
