@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
 use tokio::io::{
@@ -23,12 +23,54 @@ use crate::sasl::SaslCredentials;
 use crate::{caps, handlers, sasl};
 
 const KEEPALIVE_SECS: u64 = 60;
+/// How long to wait for NickServ to confirm before joining channels anyway.
+const NICKSERV_TIMEOUT_SECS: u64 = 5;
+
+/// Whether a NickServ NOTICE text indicates successful identification.
+fn nickserv_success(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "now identified",
+        "now logged in",
+        "password accepted",
+        "already identified",
+        "already logged in",
+        "successfully logged in",
+        "successfully identified",
+    ];
+    MARKERS.iter().any(|m| t.contains(m))
+}
 
 /// A PEM-encoded client certificate and key, used for SASL EXTERNAL / certfp.
 #[derive(Debug, Clone)]
 pub struct ClientCert {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+}
+
+/// NickServ identification sent after registration.
+#[derive(Debug, Clone)]
+pub struct NickServ {
+    /// Account name for `IDENTIFY <account> <password>`; if `None`, only the
+    /// password is sent.
+    pub account: Option<String>,
+    pub password: String,
+    /// The service nick to message (default `NickServ`).
+    pub service: String,
+}
+
+impl NickServ {
+    fn identify_command(&self) -> String {
+        match &self.account {
+            Some(account) if !account.is_empty() => {
+                format!(
+                    "PRIVMSG {} :IDENTIFY {account} {}",
+                    self.service, self.password
+                )
+            }
+            _ => format!("PRIVMSG {} :IDENTIFY {}", self.service, self.password),
+        }
+    }
 }
 
 /// Everything needed to establish one connection.
@@ -42,6 +84,7 @@ pub struct ClientConfig {
     pub full_name: String,
     pub server_password: Option<String>,
     pub sasl: Option<SaslCredentials>,
+    pub nickserv: Option<NickServ>,
     pub client_cert: Option<ClientCert>,
     pub channels: Vec<String>,
 }
@@ -317,6 +360,9 @@ async fn run(
                     let line = pending.pop_front().expect("checked non-empty");
                     write_line(&mut writer, &line, evt_tx).await?;
                 }
+                for out in state.on_tick() {
+                    apply(out, &mut writer, evt_tx, &mut pending).await?;
+                }
             }
             _ = ping.tick() => {
                 let line = state.keepalive();
@@ -419,11 +465,14 @@ struct State {
     sasl_done: bool,
     sasl_in_progress: bool,
     sasl_payload_sent: bool,
+    nickserv_done: bool,
+    nickserv_deadline: Option<Instant>,
 }
 
 impl State {
     fn new(config: ClientConfig) -> Self {
         let sasl_done = config.sasl.is_none();
+        let nickserv_done = config.nickserv.is_none();
         let nick = config.nick.clone();
         State {
             config,
@@ -434,6 +483,8 @@ impl State {
             sasl_done,
             sasl_in_progress: false,
             sasl_payload_sent: false,
+            nickserv_done,
+            nickserv_deadline: None,
         }
     }
 
@@ -469,7 +520,30 @@ impl State {
                     .unwrap_or_else(|| self.nick.clone());
                 self.nick = nick.clone();
                 outs.push(Out::Emit(Event::Registered { nick }));
+                // Identify to NickServ before joining channels.
+                if let Some(ns) = self.config.nickserv.clone() {
+                    outs.push(Out::Send(ns.identify_command()));
+                    self.nickserv_deadline =
+                        Some(Instant::now() + Duration::from_secs(NICKSERV_TIMEOUT_SECS));
+                }
                 outs.extend(self.maybe_join());
+            }
+            "NOTICE" => {
+                let success = match &self.config.nickserv {
+                    Some(ns) => {
+                        let from = msg.prefix_nick().unwrap_or("");
+                        let text = msg.params.get(1).map(String::as_str).unwrap_or("");
+                        !self.nickserv_done
+                            && from.eq_ignore_ascii_case(&ns.service)
+                            && nickserv_success(text)
+                    }
+                    None => false,
+                };
+                if success {
+                    self.nickserv_done = true;
+                    self.nickserv_deadline = None;
+                    outs.extend(self.maybe_join());
+                }
             }
             "900" | "903" => {
                 self.sasl_done = true;
@@ -550,7 +624,12 @@ impl State {
     }
 
     fn maybe_join(&mut self) -> Vec<Out> {
-        if !self.registered || !self.sasl_done || self.joined || self.config.channels.is_empty() {
+        if !self.registered
+            || !self.sasl_done
+            || !self.nickserv_done
+            || self.joined
+            || self.config.channels.is_empty()
+        {
             return Vec::new();
         }
         self.joined = true;
@@ -559,6 +638,20 @@ impl State {
             .iter()
             .map(|c| Out::Send(format!("JOIN {c}")))
             .collect()
+    }
+
+    /// Periodic check: give up waiting for NickServ and join anyway.
+    fn on_tick(&mut self) -> Vec<Out> {
+        if !self.nickserv_done {
+            if let Some(deadline) = self.nickserv_deadline {
+                if Instant::now() >= deadline {
+                    self.nickserv_done = true;
+                    self.nickserv_deadline = None;
+                    return self.maybe_join();
+                }
+            }
+        }
+        Vec::new()
     }
 
     fn keepalive(&self) -> String {

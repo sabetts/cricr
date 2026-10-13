@@ -62,6 +62,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sasl: Option<SaslConfig>,
     #[serde(default)]
+    pub nickserv: Option<NickServConfig>,
+    #[serde(default)]
     pub cert: Option<PathBuf>,
     #[serde(default)]
     pub key: Option<PathBuf>,
@@ -76,6 +78,18 @@ pub struct SaslConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub authzid: Option<String>,
+}
+
+/// NickServ identification (for networks without SASL, or as a fallback).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NickServConfig {
+    pub password: String,
+    /// Account/nickserv name; defaults to the connection nickname.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Service nick to message; defaults to "NickServ".
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +144,10 @@ channels = ["#emacs", "#rcirc"]
 # cert = "cert.pem"
 # key  = "key.pem"
 # sasl = { mechanism = "EXTERNAL" }
+#
+# NickServ identification (for networks without SASL):
+# nickserv = { password = "secret" }
+# nickserv = { password = "secret", account = "yournick", service = "NickServ" }
 "##;
 
 impl Config {
@@ -191,11 +209,21 @@ impl Config {
             _ => None,
         };
 
+        let nick = server.nick_or(&self.defaults);
+        let nickserv = server
+            .nickserv
+            .as_ref()
+            .map(|ns| cricr_irc::client::NickServ {
+                account: ns.account.clone().or_else(|| Some(nick.clone())),
+                password: ns.password.clone(),
+                service: ns.service.clone().unwrap_or_else(|| "NickServ".to_string()),
+            });
+
         Ok(ClientConfig {
             server: server.name.clone(),
             port: server.port.unwrap_or(self.defaults.port),
             tls: server.tls.unwrap_or(self.defaults.tls),
-            nick: server.nick_or(&self.defaults),
+            nick,
             user_name: server
                 .user_name
                 .clone()
@@ -209,6 +237,7 @@ impl Config {
                 .clone()
                 .or_else(|| self.defaults.password.clone()),
             sasl,
+            nickserv,
             client_cert,
             channels: server.channels.clone(),
         })
@@ -258,6 +287,23 @@ mod tests {
         assert_eq!(cc.port, 6697);
         assert!(cc.tls);
         assert_eq!(cc.nick, cfg.defaults.nick);
+    }
+
+    #[test]
+    fn nickserv_configures_identify() {
+        let toml = r##"
+[[servers]]
+name = "irc.example.org"
+nick = "me"
+channels = ["#x"]
+nickserv = { password = "secret" }
+"##;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let cc = cfg.client_config(&cfg.servers[0]).unwrap();
+        let ns = cc.nickserv.unwrap();
+        assert_eq!(ns.service, "NickServ");
+        assert_eq!(ns.account.as_deref(), Some("me"));
+        assert_eq!(ns.password, "secret");
     }
 
     #[test]

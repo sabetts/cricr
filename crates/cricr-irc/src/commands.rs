@@ -155,6 +155,11 @@ pub fn parse(input: &str, current_target: Option<&str>) -> ParsedInput {
         "away" => ParsedInput::Send(ClientCommand::Away {
             message: (!args.is_empty()).then(|| args.to_string()),
         }),
+        // NickServ / services: send the rest as a message to NickServ.
+        "nickserv" | "ns" if !args.is_empty() => ParsedInput::Send(ClientCommand::Privmsg {
+            target: "NickServ".to_string(),
+            text: args.to_string(),
+        }),
         "quote" | "raw" if !args.is_empty() => {
             ParsedInput::Send(ClientCommand::Raw(args.to_string()))
         }
@@ -253,6 +258,24 @@ mod tests {
             ParsedInput::Send(ClientCommand::Topic {
                 channel: "#other".into(),
                 topic: Some("hi there".into())
+            })
+        );
+    }
+
+    #[test]
+    fn nickserv_command() {
+        assert_eq!(
+            parse("/ns identify secret", None),
+            ParsedInput::Send(ClientCommand::Privmsg {
+                target: "NickServ".into(),
+                text: "identify secret".into()
+            })
+        );
+        assert_eq!(
+            parse("/nickserv ghost me", None),
+            ParsedInput::Send(ClientCommand::Privmsg {
+                target: "NickServ".into(),
+                text: "ghost me".into()
             })
         );
     }

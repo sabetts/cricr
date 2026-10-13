@@ -120,6 +120,8 @@ const COMMANDS: &[&str] = &[
     "/mode",
     "/kick",
     "/invite",
+    "/nickserv",
+    "/ns",
     "/whois",
     "/who",
     "/names",
@@ -2631,6 +2633,7 @@ mod tests {
             password: None,
             channels: Vec::new(),
             sasl: None,
+            nickserv: None,
             cert: None,
             key: None,
         });
@@ -2746,6 +2749,7 @@ mod tests {
             password: None,
             channels: Vec::new(),
             sasl: None,
+            nickserv: None,
             cert: None,
             key: None,
         });
@@ -2788,6 +2792,7 @@ mod tests {
             password: None,
             channels: Vec::new(),
             sasl: None,
+            nickserv: None,
             cert: None,
             key: None,
         });
@@ -2835,6 +2840,7 @@ mod tests {
             password: None,
             channels: Vec::new(),
             sasl: None,
+            nickserv: None,
             cert: None,
             key: None,
         });
