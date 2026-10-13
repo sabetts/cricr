@@ -278,7 +278,10 @@ impl App {
     }
 
     fn our_nick(&self, server: usize) -> String {
-        self.servers[server].our_nick.clone()
+        self.servers
+            .get(server)
+            .map(|s| s.our_nick.clone())
+            .unwrap_or_default()
     }
 
     fn find_buffer(&self, server: usize, target: &str, kind: Kind) -> Option<usize> {
@@ -1529,6 +1532,13 @@ impl App {
     /// was mentioned.
     fn message_spans(&self, server: usize, text: &str) -> (Vec<Span>, bool) {
         let our = self.our_nick(server);
+        self.markup_spans(&our, text, Style::default())
+    }
+
+    /// Tokenize `text`, applying `rcirc-url` (bold) to URLs and
+    /// `rcirc-nick-in-message` to whole-word occurrences of `our`. Non-marked
+    /// text uses `base` (default for chat, server color for server lines).
+    fn markup_spans(&self, our: &str, text: &str, base: Style) -> (Vec<Span>, bool) {
         let mut mentioned = false;
         let mut spans = Vec::new();
         let mut run = String::new();
@@ -1538,7 +1548,7 @@ impl App {
             match run_space {
                 Some(s) if s == space => run.push(ch),
                 Some(s) => {
-                    self.emit_run(&mut run, s, &our, &mut mentioned, &mut spans);
+                    self.emit_run(&mut run, s, our, base, &mut mentioned, &mut spans);
                     run.push(ch);
                     run_space = Some(space);
                 }
@@ -1549,7 +1559,7 @@ impl App {
             }
         }
         if let Some(s) = run_space {
-            self.emit_run(&mut run, s, &our, &mut mentioned, &mut spans);
+            self.emit_run(&mut run, s, our, base, &mut mentioned, &mut spans);
         }
         (spans, mentioned)
     }
@@ -1559,6 +1569,7 @@ impl App {
         run: &mut String,
         space: bool,
         our: &str,
+        base: Style,
         mentioned: &mut bool,
         spans: &mut Vec<Span>,
     ) {
@@ -1567,37 +1578,37 @@ impl App {
         }
         let text = std::mem::take(run);
         if space {
-            spans.push(Span::new(text, Style::default()));
+            spans.push(Span::new(text, base));
         } else {
-            spans.extend(self.token_spans(&text, our, mentioned));
+            spans.extend(self.token_spans(&text, our, base, mentioned));
         }
     }
 
-    fn token_spans(&self, token: &str, our: &str, mentioned: &mut bool) -> Vec<Span> {
+    fn token_spans(&self, token: &str, our: &str, base: Style, mentioned: &mut bool) -> Vec<Span> {
         if let Some(url) = extract_url(token) {
             if let Some(start) = token.find(&url) {
                 let mut spans = Vec::new();
                 let before = &token[..start];
                 let after = &token[start + url.len()..];
                 if !before.is_empty() {
-                    spans.extend(self.nick_spans(before, our, mentioned));
+                    spans.extend(self.nick_spans(before, our, base, mentioned));
                 }
                 spans.push(Span::new(url, self.theme.url));
                 if !after.is_empty() {
-                    spans.extend(self.nick_spans(after, our, mentioned));
+                    spans.extend(self.nick_spans(after, our, base, mentioned));
                 }
                 return spans;
             }
         }
-        self.nick_spans(token, our, mentioned)
+        self.nick_spans(token, our, base, mentioned)
     }
 
     /// Highlight whole-word occurrences of `our` within `text`.
-    fn nick_spans(&self, text: &str, our: &str, mentioned: &mut bool) -> Vec<Span> {
+    fn nick_spans(&self, text: &str, our: &str, base: Style, mentioned: &mut bool) -> Vec<Span> {
         let chars: Vec<char> = text.chars().collect();
         let needle: Vec<char> = our.to_lowercase().chars().collect();
         if our.is_empty() || needle.len() > chars.len() {
-            return vec![Span::new(text.to_string(), Style::default())];
+            return vec![Span::new(text.to_string(), base)];
         }
         let lowered: Vec<char> = text.to_lowercase().chars().collect();
         let mut spans = Vec::new();
@@ -1610,10 +1621,7 @@ impl App {
                 i + needle.len() >= chars.len() || !is_word_char(chars[i + needle.len()]);
             if hit && before_ok && after_ok {
                 if i > last {
-                    spans.push(Span::new(
-                        chars[last..i].iter().collect::<String>(),
-                        Style::default(),
-                    ));
+                    spans.push(Span::new(chars[last..i].iter().collect::<String>(), base));
                 }
                 spans.push(Span::new(
                     chars[i..i + needle.len()].iter().collect::<String>(),
@@ -1627,13 +1635,10 @@ impl App {
             }
         }
         if last < chars.len() {
-            spans.push(Span::new(
-                chars[last..].iter().collect::<String>(),
-                Style::default(),
-            ));
+            spans.push(Span::new(chars[last..].iter().collect::<String>(), base));
         }
         if spans.is_empty() {
-            spans.push(Span::new(text.to_string(), Style::default()));
+            spans.push(Span::new(text.to_string(), base));
         }
         spans
     }
@@ -1733,16 +1738,19 @@ impl App {
             head.push_str(response);
         }
         let indent = 6 + head.chars().count() + usize::from(!text.is_empty());
-        let body = if text.is_empty() {
-            head
-        } else {
-            format!("{head} {text}")
-        };
-        Line::from_spans(vec![
+        let mut spans = vec![
             Span::new(prefix, self.theme.timestamp),
-            Span::new(body, self.theme.server),
-        ])
-        .indented(indent)
+            Span::new(head, self.theme.server),
+        ];
+        if !text.is_empty() {
+            spans.push(Span::new(" ".to_string(), self.theme.server));
+            // URLs/nick markup applies here too (rcirc-markup-urls runs on all
+            // responses), with the server face as the base color.
+            let our = self.our_nick(self.buffers[buf].server);
+            let (body, _) = self.markup_spans(&our, text, self.theme.server);
+            spans.extend(body);
+        }
+        Line::from_spans(spans).indented(indent)
     }
 
     /// A connection/system message (`*** text`).
@@ -3061,17 +3069,34 @@ mod tests {
     fn nick_and_url_spans_are_marked() {
         let app = app_without_servers();
         let mut mentioned = false;
-        let spans = app.nick_spans("hey crictest!", "crictest", &mut mentioned);
+        let base = Style::default();
+        let spans = app.nick_spans("hey crictest!", "crictest", base, &mut mentioned);
         assert!(mentioned);
         assert!(spans
             .iter()
             .any(|s| s.text == "crictest" && s.style == app.theme.nick_in_message));
 
         let mut mentioned = false;
-        let url_spans = app.token_spans("see https://example.com/x.", "crictest", &mut mentioned);
+        let url_spans = app.token_spans(
+            "see https://example.com/x.",
+            "crictest",
+            base,
+            &mut mentioned,
+        );
         assert!(url_spans
             .iter()
             .any(|s| s.style.bold && s.text == "https://example.com/x"));
+    }
+
+    #[test]
+    fn server_line_marks_urls() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let line = app.server_line(ch, None, "TOPIC", "see https://example.com/x now");
+        assert!(line
+            .spans
+            .iter()
+            .any(|s| s.text == "https://example.com/x" && s.style.bold));
     }
 
     #[test]
