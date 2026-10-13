@@ -2255,7 +2255,7 @@ impl App {
             Event::TopicReply { channel, topic, .. } => {
                 let idx = self.ensure_buffer(server, channel.clone(), Kind::Channel);
                 self.buffers[idx].topic = Some(topic.clone());
-                let line = self.server_line(idx, None, "TOPIC", &format!("{channel} :{topic}"));
+                let line = self.server_line(idx, None, "TOPIC", &topic);
                 self.push_line(idx, line);
                 self.bump_activity(idx, false);
             }
