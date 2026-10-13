@@ -157,16 +157,25 @@ fill_column = 70      # word-wrap messages at this column (0 = off)
 clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
 background = "dark"   # or "light"
 
+# After an unexpected drop cricr reconnects with exponential backoff: it waits
+# initial_secs, then doubles the delay on each failed attempt until max_secs.
+# So a flaky connection is retried gently, not once per second, e.g.:
+#   1s, 2s, 4s, 8s, 16s, 32s, 64s, 120s, 120s, ...
+# The backoff resets after a successful connection. Set enabled = false to
+# disable automatic reconnection entirely.
 [reconnect]
 enabled = true        # reconnect automatically after an unexpected drop
 initial_secs = 1      # delay before the first retry
 max_secs = 120        # cap on the retry delay
 
-[[servers]]
-name = "irc.libera.chat"
-port = 6697
-tls = true
-channels = ["#emacs", "#rcirc"]
+# No servers are configured by default. Add one like this (uncomment and
+# edit), repeating the [[servers]] table for each network:
+#
+# [[servers]]
+# name = "irc.libera.chat"
+# port = 6697
+# tls = true
+# channels = ["#emacs", "#rcirc"]   # channels to auto-join on connect
 # password = "server-password"
 #
 # SASL (recommended for registered nicks):
@@ -304,9 +313,14 @@ mod tests {
     #[test]
     fn parses_template() {
         let cfg: Config = toml::from_str(TEMPLATE).unwrap();
-        assert_eq!(cfg.servers.len(), 1);
-        assert_eq!(cfg.servers[0].name, "irc.libera.chat");
-        assert_eq!(cfg.servers[0].channels, vec!["#emacs", "#rcirc"]);
+        // No servers connect out of the box; the example is commented out.
+        assert!(cfg.servers.is_empty());
+        assert!(TEMPLATE.contains("# [[servers]]"));
+        assert!(TEMPLATE.contains("# channels = [\"#emacs\", \"#rcirc\"]"));
+        // The reconnect section documents the backoff so users know retries
+        // slow down rather than hammering the server.
+        assert!(TEMPLATE.contains("exponential backoff"));
+        assert!(TEMPLATE.contains("1s, 2s, 4s, 8s"));
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
         assert_eq!(cfg.ui.fill_column, 70);
         assert!(cfg.ui.clipboard);
