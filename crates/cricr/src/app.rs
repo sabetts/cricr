@@ -2012,14 +2012,30 @@ impl App {
     }
 
     fn add_nick(&mut self, buf: usize, nick: &str) {
-        if !self.buffers[buf].nicks.iter().any(|n| n == nick) {
-            self.buffers[buf].nicks.push(nick.to_string());
-            self.buffers[buf].nicks.sort();
+        let bare = strip_prefixes(nick).to_string();
+        let existing = self.buffers[buf]
+            .nicks
+            .iter()
+            .position(|n| strip_prefixes(n) == bare);
+        match existing {
+            // Keep the more informative (prefixed) spelling, e.g. `@nick`.
+            Some(pos) => {
+                if nick.chars().count() > self.buffers[buf].nicks[pos].chars().count() {
+                    self.buffers[buf].nicks[pos] = nick.to_string();
+                }
+            }
+            None => {
+                self.buffers[buf].nicks.push(nick.to_string());
+                self.buffers[buf].nicks.sort();
+            }
         }
     }
 
     fn remove_nick(&mut self, buf: usize, nick: &str) {
-        self.buffers[buf].nicks.retain(|n| n != nick);
+        let bare = strip_prefixes(nick).to_string();
+        self.buffers[buf]
+            .nicks
+            .retain(|n| strip_prefixes(n) != bare);
     }
 
     // ---- loop --------------------------------------------------------------
@@ -2668,6 +2684,17 @@ mod tests {
         let still = (0..app.buffers[a].buffer.len())
             .any(|r| app.buffers[a].buffer.line(r).text().starts_with("---"));
         assert!(!still, "separator removed on leaving");
+    }
+
+    #[test]
+    fn nick_prefixes_dedupe() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.add_nick(ch, "crictest");
+        app.add_nick(ch, "@crictest");
+        assert_eq!(app.buffers[ch].nicks, vec!["@crictest"]);
+        app.remove_nick(ch, "crictest");
+        assert!(app.buffers[ch].nicks.is_empty());
     }
 
     #[test]
