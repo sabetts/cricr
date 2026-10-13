@@ -275,6 +275,18 @@ impl Buffer {
         }
     }
 
+    /// Replace all content (used for read-only-ish help buffers).
+    pub fn set_content(&mut self, lines: Vec<Line>) {
+        self.lines = if lines.is_empty() {
+            vec![Line::plain("")]
+        } else {
+            lines
+        };
+        self.point = Pos::new(0, 0);
+        self.scroll = 0;
+        self.mark = None;
+    }
+
     /// Set the style used to render the prompt (e.g. `rcirc-prompt`).
     pub fn set_prompt_style(&mut self, style: Style) {
         self.prompt_style = style;

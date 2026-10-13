@@ -63,6 +63,7 @@ enum Prefix {
     CtrlX,
     CtrlC,
     CtrlCF,
+    Help,
 }
 
 /// The kind of the previous editing command, for kill/yank chaining.
@@ -694,6 +695,12 @@ impl App {
             self.message = Some("C-c-".to_string());
             return;
         }
+        // C-h (help) prefix. Some terminals report Ctrl+H as Backspace.
+        if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace) {
+            self.prefix = Prefix::Help;
+            self.message = Some("C-h-".to_string());
+            return;
+        }
 
         self.message = None;
         let action = keymap::translate(key);
@@ -753,7 +760,29 @@ impl App {
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-c C-f", key),
             },
+            Prefix::Help => match key.code {
+                KeyCode::Char('b') => self.show_help(),
+                KeyCode::Char('g') if ctrl => {}
+                _ => self.undefined("C-h", key),
+            },
         }
+    }
+
+    /// `C-h b`: show the key bindings in a `*Help*` buffer.
+    fn show_help(&mut self) {
+        let lines: Vec<Line> = help_lines().into_iter().map(Line::plain).collect();
+        let idx = match self.buffers.iter().position(|b| b.target == "*Help*") {
+            Some(idx) => {
+                self.buffers[idx].buffer.set_content(lines);
+                idx
+            }
+            None => {
+                let idx = self.new_buffer(0, "*Help*".to_string(), Kind::Scratch);
+                self.buffers[idx].buffer.set_content(lines);
+                idx
+            }
+        };
+        self.switch_to(idx);
     }
 
     fn undefined(&mut self, prefix: &str, key: crossterm::event::KeyEvent) {
@@ -2280,6 +2309,58 @@ fn extract_url(token: &str) -> Option<String> {
     (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
 }
 
+/// The text of the `*Help*` buffer (`C-h b`).
+fn help_lines() -> Vec<String> {
+    [
+        "cricr key bindings",
+        "",
+        "Movement",
+        "  C-f / C-b      forward / backward character",
+        "  C-n / C-p      next / previous line",
+        "  M-f / M-b      forward / backward word",
+        "  C-a / C-e      beginning / end of line",
+        "  M-< / M->      beginning / end of buffer",
+        "  C-v / M-v      scroll up / down a screen",
+        "  C-s / C-r      incremental search forward / backward",
+        "",
+        "Editing",
+        "  RET            send input",
+        "  TAB            complete nick or /command",
+        "  M-p / M-n      previous / next input",
+        "  C-k            kill to end of line",
+        "  M-Backspace    kill word backward",
+        "  C-d            delete character forward",
+        "  C-SPC          set mark",
+        "  C-w / M-w      kill / copy region",
+        "  C-y / M-y      yank / yank-pop",
+        "  C-q            quoted insert",
+        "",
+        "Buffers",
+        "  C-x b          switch buffer",
+        "  C-x k          kill buffer (parts a channel)",
+        "  C-x C-c        quit",
+        "  C-c C-SPC      jump to the next buffer with activity",
+        "  C-c C-a        jump to the first unread line",
+        "  C-c C-s        switch to the server buffer",
+        "",
+        "IRC commands",
+        "  C-c C-n        /names",
+        "  C-c C-t        set the channel topic",
+        "  C-c C-b        browse a URL found in the buffer",
+        "  C-c C-i        toggle ignoring activity",
+        "  C-c C-j/p/q/w/m/k/d/r/x  /join /part /query /whois /msg /kick /mode /nick /quit",
+        "  C-c C-f C-b/i/u/s/f/t    bold / italic / underline / strike / fixed",
+        "  C-c C-f C-d    remove formatting",
+        "",
+        "Help",
+        "  C-h b          describe bindings (this buffer)",
+        "  C-g            abort the current command",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// A one-line, length-limited rendering of region text for the `M-w` echo.
 fn snippet(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2647,6 +2728,26 @@ mod tests {
         app.submit_input();
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+    }
+
+    #[test]
+    fn c_h_b_shows_help_buffer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        let help = app
+            .buffers
+            .iter()
+            .position(|b| b.target == "*Help*")
+            .expect("help buffer created");
+        let text: String = (0..app.buffers[help].buffer.len())
+            .map(|r| app.buffers[help].buffer.line(r).text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cricr key bindings"));
+        assert!(text.contains("C-x b"));
+        assert_eq!(app.current, help);
     }
 
     #[test]
