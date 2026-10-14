@@ -158,7 +158,7 @@ impl Default for UiConfig {
         UiConfig {
             timestamp_format: "%H:%M".to_string(),
             scrollback_lines: 100_000,
-            fill_column: 70,
+            fill_column: 80,
             clipboard: true,
             title_badge: true,
             background: Background::Dark,
@@ -179,7 +179,7 @@ tls = true
 [ui]
 timestamp_format = "%H:%M"
 scrollback_lines = 100000
-fill_column = 70      # word-wrap messages at this column (0 = off)
+fill_column = 80      # word-wrap messages at this column (0 = off)
 clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
 title_badge = true    # show buffers with activity in the terminal title (OSC 2)
 background = "dark"   # or "light"
@@ -354,7 +354,7 @@ mod tests {
         assert!(TEMPLATE.contains("exponential backoff"));
         assert!(TEMPLATE.contains("1s, 2s, 4s, 8s"));
         assert_eq!(cfg.ui.scrollback_lines, 100_000);
-        assert_eq!(cfg.ui.fill_column, 70);
+        assert_eq!(cfg.ui.fill_column, 80);
         assert!(cfg.ui.clipboard);
         assert!(cfg.ui.title_badge);
         assert!(TEMPLATE.contains("title_badge"));

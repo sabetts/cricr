@@ -169,6 +169,10 @@ impl Line {
 
     /// Word-wrap this line to `width` columns. Continuation lines are indented
     /// by `self.indent`. Returns the original line unchanged if it fits.
+    ///
+    /// Words are kept whole where possible, and URLs are never split (a URL
+    /// that is itself wider than the line overflows it) so they stay copyable
+    /// and openable.
     pub fn wrap(&self, width: usize) -> Vec<Line> {
         if width == 0 {
             return vec![self.clone()];
@@ -198,9 +202,33 @@ impl Line {
             let brk = (start + 1..=window_end)
                 .rev()
                 .find(|&i| cells[i - 1].0 == ' ' && i > min_break);
-            let end = brk.map_or(window_end, |i| i - 1);
-            chunks.push(&cells[start..end]);
-            start = brk.unwrap_or(window_end);
+            if let Some(i) = brk {
+                chunks.push(&cells[start..i - 1]);
+                start = i;
+            } else {
+                // No space to break on inside the window. Identify the token
+                // that runs past the edge.
+                let word_start = (start..window_end)
+                    .rev()
+                    .find(|&i| cells[i].0 == ' ')
+                    .map(|i| (i + 1).max(min_break))
+                    .unwrap_or(start);
+                let word_end = (word_start..cells.len())
+                    .find(|&i| cells[i].0 == ' ')
+                    .unwrap_or(cells.len());
+                if is_url(&cells[word_start..word_end]) {
+                    // Never split a URL or give it its own line; keep it on the
+                    // current line and let it overflow.
+                    chunks.push(&cells[start..word_end]);
+                    start = (word_end + 1).min(cells.len());
+                } else if word_start > start {
+                    chunks.push(&cells[start..word_start]);
+                    start = word_start;
+                } else {
+                    chunks.push(&cells[start..window_end]);
+                    start = window_end;
+                }
+            }
             limit = width.saturating_sub(indent);
             min_break = 0;
         }
@@ -219,6 +247,13 @@ impl Line {
             })
             .collect()
     }
+}
+
+/// Whether a wrapped word is an http(s) URL, which is never broken across
+/// lines (so it stays copyable and openable).
+fn is_url(cells: &[(char, Style)]) -> bool {
+    let text: String = cells.iter().map(|(c, _)| *c).collect();
+    text.contains("http://") || text.contains("https://")
 }
 
 fn cells_to_line(cells: &[(char, Style)]) -> Line {
@@ -1417,6 +1452,31 @@ mod tests {
         assert!(wrapped[0].text().starts_with("nick: "));
         assert_eq!(wrapped[0].spans[0].style, Style::rgb(1, 2, 3));
         assert!(wrapped[1].text().starts_with("      "));
+    }
+
+    #[test]
+    fn urls_are_never_split() {
+        let prefix = "<nick> ";
+        // A URL that does not fit after the text moves whole to the next line.
+        let url = format!("https://example.com/{}", "a".repeat(60));
+        let line = Line::plain(format!("{prefix}see {url}")).indented(prefix.chars().count());
+        let wrapped = line.wrap(40);
+        assert!(
+            wrapped.iter().any(|l| l.text().contains(&url)),
+            "URL split across lines: {wrapped:?}"
+        );
+
+        // A URL wider than the line stays on the line it started on (no extra
+        // break) and overflows intact rather than being cut.
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
+        let wrapped = line.wrap(40);
+        assert_eq!(
+            wrapped.len(),
+            1,
+            "overflowing URL should not get its own line: {wrapped:?}"
+        );
+        assert!(wrapped[0].text().contains(&long));
     }
 
     #[test]
