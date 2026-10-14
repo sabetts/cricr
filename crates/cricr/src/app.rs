@@ -594,25 +594,41 @@ impl App {
         // returning to the terminal shows where output resumed (no mode-line
         // flag for the current buffer).
         if !ignored && (!current || idle) {
-            if !current {
+            if current {
+                // Idle activity in the buffer we are viewing: move the
+                // separator to the new message rather than growing the unread
+                // region. (Pressing keys never moves it.)
+                let mut row = self.last_push_row;
+                if let Some(old) = self.buffers[buf].marker_row {
+                    // Removing a separator above the new line shifts it up one.
+                    if old < row {
+                        row -= 1;
+                    }
+                    self.remove_marker(buf);
+                }
+                self.insert_marker(buf, row);
+            } else {
                 self.activity_seq += 1;
                 self.buffers[buf].unread += 1;
                 self.buffers[buf].last_activity = self.activity_seq;
                 if mentioned {
                     self.buffers[buf].mentioned = true;
                 }
-            }
-            if self.buffers[buf].first_unread.is_none() {
-                // Insert a "read up to here" separator before the first unread
-                // message, so it's visible when the buffer is visited.
-                let row = self.last_push_row;
-                let marker = self.marker_line();
-                self.buffers[buf].buffer.insert_line(row, marker);
-                self.buffers[buf].marker_row = Some(row);
-                self.buffers[buf].first_unread = Some(row + 1);
+                if self.buffers[buf].first_unread.is_none() {
+                    let row = self.last_push_row;
+                    self.insert_marker(buf, row);
+                }
             }
         }
         self.buffers[buf].last_activity_at = Instant::now();
+    }
+
+    /// Insert a "read up to here" separator at `row` and record it.
+    fn insert_marker(&mut self, buf: usize, row: usize) {
+        let marker = self.marker_line();
+        self.buffers[buf].buffer.insert_line(row, marker);
+        self.buffers[buf].marker_row = Some(row);
+        self.buffers[buf].first_unread = Some(row + 1);
     }
 
     fn marker_line(&self) -> Line {
@@ -4603,6 +4619,40 @@ mod tests {
         );
         // The current buffer stays out of the mode-line activity list.
         assert_eq!(app.buffers[ch].unread, 0);
+    }
+
+    #[test]
+    fn idle_post_moves_the_current_buffer_marker() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.idle_mark = Duration::ZERO; // always idle
+
+        // A first idle post drops the separator.
+        app.push_line(ch, Line::plain("first"));
+        app.bump_activity(ch, false);
+        let first = app.buffers[ch].marker_row.expect("separator inserted");
+
+        // Pressing a key does not move it.
+        app.perform(Action::PrevLine);
+        assert_eq!(
+            app.buffers[ch].marker_row,
+            Some(first),
+            "keys must not move the separator"
+        );
+
+        // A later idle post moves the separator down to just before it.
+        app.push_line(ch, Line::plain("second"));
+        app.bump_activity(ch, false);
+        let moved = app.buffers[ch].marker_row.expect("separator kept");
+        assert!(moved > first, "separator should move to the new post");
+        assert_eq!(app.buffers[ch].first_unread, Some(moved + 1));
+        assert!(app.buffers[ch].buffer.line(moved).text().starts_with("---"));
+        assert!(app.buffers[ch]
+            .buffer
+            .line(moved + 1)
+            .text()
+            .contains("second"));
     }
 
     #[test]
