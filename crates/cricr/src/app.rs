@@ -181,10 +181,11 @@ pub struct Chan {
 /// output resumed.
 const IDLE_MARK: Duration = Duration::from_secs(5 * 60);
 
-/// Key events closer together than this are treated as one paste burst. On
-/// Windows bracketed paste is unavailable, so a pasted newline arrives as a
-/// plain Enter key press; timing distinguishes it from a typed one.
-const PASTE_GAP: Duration = Duration::from_millis(20);
+/// How long a detected paste keeps folding newlines. On Windows bracketed
+/// paste is unavailable, so a pasted newline arrives as a plain Enter key
+/// press; a burst that carries a newline *followed by more input* is a paste,
+/// and this latch keeps a paste split across drains folding.
+const PASTE_LATCH: Duration = Duration::from_millis(30);
 
 const COMMANDS: &[&str] = &[
     "/msg",
@@ -228,8 +229,8 @@ pub struct App {
     idle_mark: Duration,
     /// In-progress `M-/` (dabbrev) expansion, for cycling.
     dabbrev: Option<Dabbrev>,
-    /// Arrival time of the previous key event, to detect paste bursts.
-    last_key_at: Option<Instant>,
+    /// While set, key events are treated as part of an in-progress paste.
+    pasting_until: Option<Instant>,
     /// Whether the key currently being handled arrived in a paste burst.
     rapid_key: bool,
     pub scrollback: usize,
@@ -282,7 +283,7 @@ impl App {
             viewport_rows: 20,
             idle_mark: IDLE_MARK,
             dabbrev: None,
-            last_key_at: None,
+            pasting_until: None,
             rapid_key: false,
             scrollback,
             fill_column,
@@ -3372,11 +3373,13 @@ impl App {
                     }
                 }
                 Some(term_event) = term_rx.recv() => {
-                    self.handle_term(term_event);
-                    // Batch a burst of input (e.g. a paste) into one redraw.
+                    // Batch a burst of input (e.g. a paste) into one redraw,
+                    // so the whole burst can be classified at once.
+                    let mut batch = vec![term_event];
                     while let Ok(event) = term_rx.try_recv() {
-                        self.handle_term(event);
+                        batch.push(event);
                     }
+                    self.handle_term_batch(batch);
                 }
                 // Restore the point after the `M-w` indication flashes.
                 _ = async {
@@ -3412,22 +3415,27 @@ impl App {
         Ok(())
     }
 
-    fn handle_term(&mut self, event: TermEvent) {
-        match event {
-            TermEvent::Key(key) => {
-                // A tight burst of key events is a paste (e.g. on Windows,
-                // where bracketed paste is not available).
-                let now = Instant::now();
-                self.rapid_key = self
-                    .last_key_at
-                    .is_some_and(|prev| now.duration_since(prev) < PASTE_GAP);
-                self.last_key_at = Some(now);
-                self.handle_key(key);
-                self.rapid_key = false;
-            }
-            TermEvent::Paste(text) => self.handle_paste(text),
-            _ => {}
+    fn handle_term_batch(&mut self, batch: Vec<TermEvent>) {
+        let now = Instant::now();
+        // A burst carrying a newline followed by more input is a paste (e.g. on
+        // Windows, where bracketed paste is not available); the latch keeps a
+        // paste that is split across drains folding.
+        let multiline = is_multiline_paste(&batch);
+        let pasting = multiline || self.pasting_until.is_some_and(|t| now < t);
+        if pasting {
+            self.pasting_until = Some(now + PASTE_LATCH);
         }
+        for event in batch {
+            match event {
+                TermEvent::Key(key) => {
+                    self.rapid_key = pasting;
+                    self.handle_key(key);
+                }
+                TermEvent::Paste(text) => self.handle_paste(text),
+                _ => {}
+            }
+        }
+        self.rapid_key = false;
     }
 
     /// A newline that arrived inside a paste burst: fold it into the input
@@ -3704,6 +3712,22 @@ fn snippet(text: &str) -> String {
     } else {
         joined
     }
+}
+
+/// Whether a drained burst of terminal events is a multiline paste: it carries
+/// an Enter that is not the last key press, i.e. a newline with more input after
+/// it. A typed Enter is always the last key in its burst.
+fn is_multiline_paste(batch: &[TermEvent]) -> bool {
+    let keys: Vec<&crossterm::event::KeyEvent> = batch
+        .iter()
+        .filter_map(|event| match event {
+            TermEvent::Key(key) if key.kind != KeyEventKind::Release => Some(key),
+            _ => None,
+        })
+        .collect();
+    keys.iter()
+        .enumerate()
+        .any(|(i, key)| key.code == crossterm::event::KeyCode::Enter && i + 1 < keys.len())
 }
 
 /// Give a bare host (`example.com`) a scheme so the OS opener treats it as a
@@ -4486,6 +4510,38 @@ mod tests {
         app.rapid_key = false;
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.current().buffer.input(), "");
+    }
+
+    #[test]
+    fn multiline_paste_burst_is_recognized() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ch = |c: char| TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let enter = || TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // A typed letter then Enter: Enter is last, so it's not a paste.
+        assert!(!is_multiline_paste(&[ch('a'), enter()]));
+        // A multiline paste: the newline is followed by more text.
+        assert!(is_multiline_paste(&[ch('a'), enter(), ch('b')]));
+    }
+
+    #[test]
+    fn burst_letter_enter_sends_but_multiline_paste_folds() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char| TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let enter = || TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+
+        // Typing "!" then Enter quickly: Enter is the last key, so it sends.
+        app.current_mut().buffer.set_input("hi");
+        app.handle_term_batch(vec![key('!'), enter()]);
+        assert_eq!(app.current().buffer.input(), "");
+
+        // A multiline paste: the newline folds instead of sending.
+        app.current_mut().buffer.set_input("a");
+        app.handle_term_batch(vec![enter(), key('b')]);
+        assert_eq!(app.current().buffer.input(), "a b");
     }
 
     #[test]
