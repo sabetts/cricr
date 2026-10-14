@@ -181,6 +181,11 @@ pub struct Chan {
 /// output resumed.
 const IDLE_MARK: Duration = Duration::from_secs(5 * 60);
 
+/// Key events closer together than this are treated as one paste burst. On
+/// Windows bracketed paste is unavailable, so a pasted newline arrives as a
+/// plain Enter key press; timing distinguishes it from a typed one.
+const PASTE_GAP: Duration = Duration::from_millis(20);
+
 const COMMANDS: &[&str] = &[
     "/msg",
     "/query",
@@ -223,6 +228,10 @@ pub struct App {
     idle_mark: Duration,
     /// In-progress `M-/` (dabbrev) expansion, for cycling.
     dabbrev: Option<Dabbrev>,
+    /// Arrival time of the previous key event, to detect paste bursts.
+    last_key_at: Option<Instant>,
+    /// Whether the key currently being handled arrived in a paste burst.
+    rapid_key: bool,
     pub scrollback: usize,
     pub fill_column: usize,
     /// Whether kills/copies are written to the system clipboard (OSC 52).
@@ -273,6 +282,8 @@ impl App {
             viewport_rows: 20,
             idle_mark: IDLE_MARK,
             dabbrev: None,
+            last_key_at: None,
+            rapid_key: false,
             scrollback,
             fill_column,
             clipboard,
@@ -1128,6 +1139,11 @@ impl App {
 
         self.message = None;
         let action = keymap::translate(key);
+        // A newline that arrived inside a paste burst must not send.
+        if action == Action::Send && self.rapid_key {
+            self.paste_newline();
+            return;
+        }
         if action == Action::None {
             self.numeric_arg = None;
             if let Some(desc) = keymap::describe(key) {
@@ -1788,7 +1804,10 @@ impl App {
                 return;
             }
             KeyCode::Enter => {
-                self.commit_prompt();
+                // Ignore a newline that arrived inside a paste burst.
+                if !self.rapid_key {
+                    self.commit_prompt();
+                }
                 return;
             }
             KeyCode::Tab => {
@@ -3395,9 +3414,31 @@ impl App {
 
     fn handle_term(&mut self, event: TermEvent) {
         match event {
-            TermEvent::Key(key) => self.handle_key(key),
+            TermEvent::Key(key) => {
+                // A tight burst of key events is a paste (e.g. on Windows,
+                // where bracketed paste is not available).
+                let now = Instant::now();
+                self.rapid_key = self
+                    .last_key_at
+                    .is_some_and(|prev| now.duration_since(prev) < PASTE_GAP);
+                self.last_key_at = Some(now);
+                self.handle_key(key);
+                self.rapid_key = false;
+            }
             TermEvent::Paste(text) => self.handle_paste(text),
             _ => {}
+        }
+    }
+
+    /// A newline that arrived inside a paste burst: fold it into the input
+    /// rather than sending (a space for rcirc buffers, a real newline for free
+    /// text buffers).
+    fn paste_newline(&mut self) {
+        let i = self.current;
+        if self.buffers[i].buffer.is_irc() {
+            self.buffers[i].buffer.insert_char(' ');
+        } else {
+            self.buffers[i].buffer.insert_newline();
         }
     }
 
@@ -4428,6 +4469,23 @@ mod tests {
         app.switch_to(ch);
         app.handle_paste("hello\r\nworld".to_string());
         assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[test]
+    fn pasted_newline_does_not_send() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello");
+        // A newline arriving in a paste burst folds into the input.
+        app.rapid_key = true;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.input(), "hello ");
+        // A typed Enter still sends.
+        app.rapid_key = false;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.input(), "");
     }
 
     #[test]
