@@ -107,6 +107,13 @@ enum LastCommand {
     Yank,
 }
 
+/// State for cycling through `M-/` (dabbrev) expansions.
+#[derive(Debug, Clone, Default)]
+struct Dabbrev {
+    expansions: Vec<String>,
+    index: usize,
+}
+
 /// One connection's shared state.
 pub struct ServerState {
     pub name: String,
@@ -214,6 +221,8 @@ pub struct App {
     pub viewport_rows: usize,
     /// Quiet spell after which activity in the current buffer is marked unread.
     idle_mark: Duration,
+    /// In-progress `M-/` (dabbrev) expansion, for cycling.
+    dabbrev: Option<Dabbrev>,
     pub scrollback: usize,
     pub fill_column: usize,
     /// Whether kills/copies are written to the system clipboard (OSC 52).
@@ -263,6 +272,7 @@ impl App {
             kill_ring: KillRing::new(),
             viewport_rows: 20,
             idle_mark: IDLE_MARK,
+            dabbrev: None,
             scrollback,
             fill_column,
             clipboard,
@@ -1794,7 +1804,11 @@ impl App {
             Prompt::None | Prompt::Topic { .. } => 0,
         };
         use Action::*;
-        match keymap::translate(key) {
+        let action = keymap::translate(key);
+        if action != DabbrevExpand {
+            self.dabbrev = Option::None;
+        }
+        match action {
             Abort => self.prompt = Prompt::None,
             SelfInsert(c) => self.prompt_insert(c),
             DeleteBackward => self.prompt_delete_backward(),
@@ -1807,6 +1821,7 @@ impl App {
             ForwardWord => self.prompt_forward_word(),
             UpcaseWord => self.prompt_upcase_word(),
             DowncaseWord => self.prompt_downcase_word(),
+            DabbrevExpand => self.prompt_dabbrev_expand(),
             BackwardKillWord => self.prompt_backward_kill_word(),
             KillWord => self.prompt_kill_word(),
             KillLine => self.prompt_kill_line(),
@@ -2036,6 +2051,9 @@ impl App {
 
     fn perform(&mut self, action: Action) {
         use Action::*;
+        if action != DabbrevExpand {
+            self.dabbrev = Option::None;
+        }
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
         // A pending numeric argument (Emacs universal argument), default 1.
@@ -2064,6 +2082,7 @@ impl App {
             BackwardWord => self.move_words(-n),
             UpcaseWord => self.case_words(n, true),
             DowncaseWord => self.case_words(n, false),
+            DabbrevExpand => self.dabbrev_expand(),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
             PageUp => self.page_up(),
@@ -2155,6 +2174,121 @@ impl App {
                 (false, false) => self.current_mut().buffer.backward_downcase_word(),
             }
         }
+    }
+
+    /// `M-/`: expand the word before point from another word in the buffer,
+    /// cycling through candidates on repeated invocations.
+    fn dabbrev_expand(&mut self) {
+        let i = self.current;
+        if !self.buffers[i].buffer.editable() {
+            return;
+        }
+        // Continue cycling when the word before point is the last expansion.
+        if let Some(prev) = self.dabbrev_current() {
+            if self.buffers[i].buffer.word_before_point() == prev {
+                self.dabbrev_advance_buffer(i);
+                return;
+            }
+        }
+        let prefix = self.buffers[i].buffer.word_before_point();
+        if prefix.is_empty() {
+            self.dabbrev = None;
+            return;
+        }
+        let candidates = self.buffers[i].buffer.dabbrev_candidates(&prefix);
+        let Some(first) = candidates.first().cloned() else {
+            self.dabbrev = None;
+            self.message = Some(format!("No dabbrev expansion for \"{prefix}\""));
+            return;
+        };
+        self.buffers[i].buffer.replace_word_before_point(&first);
+        self.dabbrev = Some(Dabbrev {
+            expansions: candidates,
+            index: 0,
+        });
+    }
+
+    /// The word the current `M-/` cycle last inserted, if any.
+    fn dabbrev_current(&self) -> Option<String> {
+        self.dabbrev
+            .as_ref()
+            .and_then(|d| d.expansions.get(d.index).cloned())
+    }
+
+    /// Replace the word before point with the next `M-/` candidate.
+    fn dabbrev_advance_buffer(&mut self, i: usize) {
+        let (next, word) = {
+            let d = self.dabbrev.as_ref().unwrap();
+            let next = (d.index + 1) % d.expansions.len();
+            (next, d.expansions[next].clone())
+        };
+        self.buffers[i].buffer.replace_word_before_point(&word);
+        if let Some(d) = self.dabbrev.as_mut() {
+            d.index = next;
+        }
+    }
+
+    /// `M-/` in the minibuffer: expand the word before the cursor, drawing
+    /// candidates from the buffer being edited (like Emacs searching buffers).
+    fn prompt_dabbrev_expand(&mut self) {
+        let cur = self.current;
+        if let Some(prev) = self.dabbrev_current() {
+            if self.prompt_word_before_cursor() == prev {
+                let (next, word) = {
+                    let d = self.dabbrev.as_ref().unwrap();
+                    let next = (d.index + 1) % d.expansions.len();
+                    (next, d.expansions[next].clone())
+                };
+                self.prompt_replace_word_before_cursor(&word);
+                if let Some(d) = self.dabbrev.as_mut() {
+                    d.index = next;
+                }
+                return;
+            }
+        }
+        let prefix = self.prompt_word_before_cursor();
+        if prefix.is_empty() {
+            self.dabbrev = None;
+            return;
+        }
+        let candidates = self.buffers[cur].buffer.dabbrev_candidates(&prefix);
+        let Some(first) = candidates.first().cloned() else {
+            self.dabbrev = None;
+            return;
+        };
+        self.prompt_replace_word_before_cursor(&first);
+        self.dabbrev = Some(Dabbrev {
+            expansions: candidates,
+            index: 0,
+        });
+    }
+
+    fn prompt_word_before_cursor(&mut self) -> String {
+        self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let end = (*cursor).min(chars.len());
+            let mut start = end;
+            while start > 0 && is_word_char(chars[start - 1]) {
+                start -= 1;
+            }
+            chars[start..end].iter().collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn prompt_replace_word_before_cursor(&mut self, word: &str) {
+        self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let end = (*cursor).min(chars.len());
+            let mut start = end;
+            while start > 0 && is_word_char(chars[start - 1]) {
+                start -= 1;
+            }
+            let s = char_to_byte(input, start);
+            let e = char_to_byte(input, end);
+            input.replace_range(s..e, word);
+            *cursor = start + word.chars().count();
+        });
     }
 
     /// Delete `n` characters (negative deletes backward).
@@ -3450,6 +3584,7 @@ fn help_lines() -> Vec<String> {
         "  TAB            complete nick or /command",
         "  M-p / M-n      previous / next input",
         "  M-u / M-l      upcase / downcase word",
+        "  M-/            dabbrev-expand (complete from a word in the buffer)",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
         "  M-d            kill word forward",
@@ -5156,6 +5291,23 @@ mod tests {
         app.current_mut().buffer.beginning_of_line();
         app.perform(Action::DowncaseWord);
         assert_eq!(app.current().buffer.input(), "hello there");
+    }
+
+    #[test]
+    fn dabbrev_expand_cycles_candidates() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("regina reginald regi");
+        // Point is at the end; M-/ expands the word "regi".
+        app.perform(Action::DabbrevExpand);
+        assert_eq!(app.current().buffer.input(), "regina reginald reginald");
+        // A second M-/ cycles to the next candidate.
+        app.perform(Action::DabbrevExpand);
+        assert_eq!(app.current().buffer.input(), "regina reginald regina");
+        // A third cycles back to the first.
+        app.perform(Action::DabbrevExpand);
+        assert_eq!(app.current().buffer.input(), "regina reginald reginald");
     }
 
     #[test]

@@ -1092,6 +1092,82 @@ impl Buffer {
         text
     }
 
+    // ---- dabbrev -----------------------------------------------------------
+
+    /// The word immediately before point (the dabbrev abbreviation).
+    pub fn word_before_point(&self) -> String {
+        let row = self.point.row;
+        let min = self.min_col(row);
+        let chars = self.lines[row].chars();
+        let end = self.point.col.min(chars.len());
+        let mut start = end;
+        while start > min && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        chars[start..end].iter().collect()
+    }
+
+    /// Replace the word immediately before point with `word`, leaving point
+    /// just after it.
+    pub fn replace_word_before_point(&mut self, word: &str) {
+        if !self.editable() {
+            return;
+        }
+        if self.is_irc() {
+            let base = self.prompt_len;
+            let chars: Vec<char> = self.input().chars().collect();
+            let end = self.point.col.saturating_sub(base).min(chars.len());
+            let mut start = end;
+            while start > 0 && is_word(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut out: Vec<char> = Vec::with_capacity(chars.len() + word.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(word.chars());
+            out.extend_from_slice(&chars[end..]);
+            let text: String = out.into_iter().collect();
+            self.input_set(&text);
+            self.point = Pos::new(self.last_row(), base + start + word.chars().count());
+        } else {
+            let row = self.point.row;
+            let chars: Vec<char> = self.lines[row].chars();
+            let end = self.point.col.min(chars.len());
+            let mut start = end;
+            while start > 0 && is_word(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut out: Vec<char> = Vec::with_capacity(chars.len() + word.len());
+            out.extend_from_slice(&chars[..start]);
+            out.extend(word.chars());
+            out.extend_from_slice(&chars[end..]);
+            self.lines[row] = Line::plain(out.into_iter().collect::<String>());
+            self.point.col = start + word.chars().count();
+        }
+        self.scroll_into_view();
+    }
+
+    /// Words in the buffer that begin with `prefix` (case-insensitively) and
+    /// are longer than it, most recent first and de-duplicated.
+    pub fn dabbrev_candidates(&self, prefix: &str) -> Vec<String> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let lower = prefix.to_lowercase();
+        let min_len = prefix.chars().count();
+        let mut out: Vec<String> = Vec::new();
+        for row in (0..self.lines.len()).rev() {
+            for word in words_in(&self.lines[row].text()).into_iter().rev() {
+                if word.chars().count() > min_len
+                    && word.to_lowercase().starts_with(&lower)
+                    && !out.contains(&word)
+                {
+                    out.push(word);
+                }
+            }
+        }
+        out
+    }
+
     // ---- search ------------------------------------------------------------
 
     /// Find the next occurrence of `query` from `from` in the given direction.
@@ -1162,6 +1238,23 @@ impl Buffer {
 
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Split `text` into runs of word characters.
+fn words_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if is_word(c) {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Find `needle` inside `hay`, starting at char index `start`. When `forward`
@@ -1403,6 +1496,26 @@ mod tests {
         assert_eq!(b.kill_word(), " world");
         assert_eq!(b.input(), "");
         assert_eq!(b.kill_word(), "");
+    }
+
+    #[test]
+    fn dabbrev_candidates_and_replace() {
+        let mut b = Buffer::new("> ");
+        b.set_input("config configuration");
+        let cands = b.dabbrev_candidates("conf");
+        // Most recent word first; the prefix itself is not a candidate.
+        assert_eq!(cands.first().map(String::as_str), Some("configuration"));
+        assert!(cands.contains(&"config".to_string()));
+        assert!(!b
+            .dabbrev_candidates("config")
+            .contains(&"config".to_string()));
+
+        // Replace the word before point.
+        b.set_input("conf");
+        assert_eq!(b.word_before_point(), "conf");
+        b.replace_word_before_point("configuration");
+        assert_eq!(b.input(), "configuration");
+        assert_eq!(b.word_before_point(), "configuration");
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub enum Action {
     BackwardWord,
     UpcaseWord,
     DowncaseWord,
+    DabbrevExpand,
     BeginningOfBuffer,
     EndOfBuffer,
     PageUp,
@@ -73,6 +74,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'u' | 'U' => UpcaseWord,
             'l' | 'L' => DowncaseWord,
             'd' | 'D' => KillWord,
+            '/' => DabbrevExpand,
             'v' | 'V' => PageUp,
             '<' => BeginningOfBuffer,
             '>' => EndOfBuffer,
@@ -211,6 +213,14 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Send
+        );
+    }
+
+    #[test]
+    fn alt_slash_dabbrev_expands() {
+        assert_eq!(
+            translate(key(KeyCode::Char('/'), KeyModifiers::ALT)),
+            Action::DabbrevExpand
         );
     }
 
