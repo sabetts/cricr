@@ -1060,6 +1060,38 @@ impl Buffer {
         text
     }
 
+    /// Kill from point to the end of the next word (`M-d`), returning the
+    /// killed text.
+    pub fn kill_word(&mut self) -> String {
+        if !self.editable() {
+            return String::new();
+        }
+        let row = self.point.row;
+        let min = self.min_col(row);
+        let chars = self.lines[row].chars();
+        let mut col = self.point.col.min(chars.len());
+        while col < chars.len() && !is_word(chars[col]) {
+            col += 1;
+        }
+        while col < chars.len() && is_word(chars[col]) {
+            col += 1;
+        }
+        col = col.max(min);
+        if col == self.point.col {
+            // At the line end: join with the next line (kills the newline).
+            if self.is_irc() || row == self.last_row() {
+                return String::new();
+            }
+            self.delete_forward();
+            return "\n".to_string();
+        }
+        let start = self.point;
+        let end = Pos::new(row, col);
+        let text = self.text_between(start, end);
+        self.delete_region(start, end);
+        text
+    }
+
     // ---- search ------------------------------------------------------------
 
     /// Find the next occurrence of `query` from `from` in the given direction.
@@ -1358,6 +1390,19 @@ mod tests {
         assert_eq!(b.backward_kill_word(), "hello ");
         assert_eq!(b.input(), "");
         assert_eq!(b.backward_kill_word(), "");
+    }
+
+    #[test]
+    fn kill_word_deletes_forward() {
+        let mut b = Buffer::new("> ");
+        b.set_input("hello world");
+        b.beginning_of_line();
+        // Like Emacs, point moves to the end of the word (before the space).
+        assert_eq!(b.kill_word(), "hello");
+        assert_eq!(b.input(), " world");
+        assert_eq!(b.kill_word(), " world");
+        assert_eq!(b.input(), "");
+        assert_eq!(b.kill_word(), "");
     }
 
     #[test]

@@ -1643,6 +1643,31 @@ impl App {
         }
     }
 
+    /// Kill from the cursor to the end of the next word (`M-d`).
+    fn prompt_kill_word(&mut self) {
+        let killed = self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let mut i = *cursor;
+            while i < chars.len() && !is_word_char(chars[i]) {
+                i += 1;
+            }
+            while i < chars.len() && is_word_char(chars[i]) {
+                i += 1;
+            }
+            let start = char_to_byte(input, *cursor);
+            let end = char_to_byte(input, i);
+            let killed = input[start..end].to_string();
+            input.replace_range(start..end, "");
+            killed
+        });
+        if let Some(killed) = killed {
+            let append = self.last_command == LastCommand::Kill;
+            self.kill_ring.push(&killed, append);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
     /// Insert the most recent kill at the cursor (`C-y`).
     fn prompt_yank(&mut self) {
         let text = match self.kill_ring.current() {
@@ -1749,6 +1774,7 @@ impl App {
             UpcaseWord => self.prompt_upcase_word(),
             DowncaseWord => self.prompt_downcase_word(),
             BackwardKillWord => self.prompt_backward_kill_word(),
+            KillWord => self.prompt_kill_word(),
             KillLine => self.prompt_kill_line(),
             Yank => self.prompt_yank(),
             PrevLine => self.prompt_move(count, -1),
@@ -2012,6 +2038,11 @@ impl App {
             DeleteForward => self.delete_chars(n),
             BackwardKillWord => {
                 let killed = self.current_mut().buffer.backward_kill_word();
+                self.kill_new(&killed, prev == LastCommand::Kill);
+                self.last_command = LastCommand::Kill;
+            }
+            KillWord => {
+                let killed = self.current_mut().buffer.kill_word();
                 self.kill_new(&killed, prev == LastCommand::Kill);
                 self.last_command = LastCommand::Kill;
             }
@@ -3387,6 +3418,7 @@ fn help_lines() -> Vec<String> {
         "  M-u / M-l      upcase / downcase word",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
+        "  M-d            kill word forward",
         "  C-d            delete character forward",
         "  C-SPC          set mark",
         "  C-w / M-w      kill / copy region",
@@ -4985,6 +5017,21 @@ mod tests {
         // M-b moves back to the start of "two".
         press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
         assert_eq!(prompt_cursor(&app), 4);
+    }
+
+    #[test]
+    fn prompt_kill_word_forward() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "one two".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        // M-d kills the word at point.
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::ALT);
+        assert_eq!(prompt_input(&app), " two");
+        assert_eq!(app.kill_ring.current().as_deref(), Some("one"));
     }
 
     #[test]

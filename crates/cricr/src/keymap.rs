@@ -25,6 +25,7 @@ pub enum Action {
     DeleteBackward,
     DeleteForward,
     BackwardKillWord,
+    KillWord,
     KillLine,
     SetMark,
     KillRegion,
@@ -71,6 +72,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'b' | 'B' => BackwardWord,
             'u' | 'U' => UpcaseWord,
             'l' | 'L' => DowncaseWord,
+            'd' | 'D' => KillWord,
             'v' | 'V' => PageUp,
             '<' => BeginningOfBuffer,
             '>' => EndOfBuffer,
@@ -209,6 +211,14 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Enter, KeyModifiers::NONE)),
             Action::Send
+        );
+    }
+
+    #[test]
+    fn alt_d_kills_word_forward() {
+        assert_eq!(
+            translate(key(KeyCode::Char('d'), KeyModifiers::ALT)),
+            Action::KillWord
         );
     }
 
