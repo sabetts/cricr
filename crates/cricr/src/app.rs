@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use crossterm::event::{Event as TermEvent, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
@@ -173,6 +173,8 @@ pub struct Chan {
     pub last_visited: u64,
     /// Last timestamp printed, so repeats can be blanked.
     pub last_timestamp: String,
+    /// Year*12 + month of the last line seen, for month date separators.
+    last_month: Option<i32>,
     pub topic: Option<String>,
 }
 
@@ -453,6 +455,7 @@ impl App {
             last_activity_at: Instant::now(),
             last_visited: 0,
             last_timestamp: String::new(),
+            last_month: None,
             topic: None,
         });
         let idx = self.buffers.len() - 1;
@@ -480,8 +483,12 @@ impl App {
         }
         // Render/re-wrap in order so the timestamp column dedups as it did live.
         self.buffers[idx].last_timestamp.clear();
+        self.buffers[idx].last_month = None;
         let mut wrapped: Vec<Line> = Vec::new();
         for (time, body) in entries {
+            if let Some(marker) = self.take_date_marker(idx, time) {
+                wrapped.push(marker);
+            }
             let line = self.render_log_line(idx, time, &body);
             wrapped.extend(line.wrap(self.fill_column));
         }
@@ -589,11 +596,46 @@ impl App {
             });
             self.buffers[buf].history_dirty = true;
         }
+        // A date separator when the month changes (channel/query scrollback).
+        if let Some(time) = line.time {
+            if matches!(self.buffers[buf].kind, Kind::Channel | Kind::Query) {
+                if let Some(marker) = self.take_date_marker(buf, time) {
+                    self.buffers[buf].buffer.push_line(marker);
+                }
+            }
+        }
         self.last_push_row = self.buffers[buf].buffer.len().saturating_sub(1);
         for wrapped in line.wrap(self.fill_column) {
             self.buffers[buf].buffer.push_line(wrapped);
         }
         self.trim_scrollback(buf);
+    }
+
+    /// Record `time` as the buffer's latest month and return a date separator
+    /// line when it differs from the previous one. The first line of a buffer
+    /// gets no separator (only month *changes* are marked).
+    fn take_date_marker(&mut self, buf: usize, time: i64) -> Option<Line> {
+        let month = month_index(time);
+        let marker = match self.buffers[buf].last_month {
+            None => None,
+            Some(prev) if prev == month => None,
+            Some(_) => Some(self.date_marker_line(time)),
+        };
+        self.buffers[buf].last_month = Some(month);
+        marker
+    }
+
+    /// A `Apr 2026 ------` separator for the month containing `time`.
+    fn date_marker_line(&self, time: i64) -> Line {
+        let label = format_local(time, "%b %Y");
+        let dashes = self
+            .fill_column
+            .saturating_sub(label.chars().count() + 1)
+            .max(1);
+        Line::styled(
+            format!("{label} {}", "-".repeat(dashes)),
+            Style::fg(Color::DarkGray),
+        )
     }
 
     fn trim_scrollback(&mut self, buf: usize) {
@@ -978,6 +1020,7 @@ impl App {
                 let i = self.current;
                 self.buffers[i].buffer.clear();
                 self.buffers[i].last_timestamp.clear();
+                self.buffers[i].last_month = None;
             }
             LocalCommand::Disconnect => {
                 // An explicit disconnect should not queue a retry.
@@ -3806,6 +3849,16 @@ fn format_local(time: i64, fmt: &str) -> String {
         .unwrap_or_default()
 }
 
+/// A monotonic month index (year * 12 + month) for `time` in local time, so
+/// consecutive months compare unequal. `i32::MIN` when the time is invalid.
+fn month_index(time: i64) -> i32 {
+    Local
+        .timestamp_opt(time, 0)
+        .single()
+        .map(|dt| dt.year() * 12 + dt.month0() as i32)
+        .unwrap_or(i32::MIN)
+}
+
 /// A cached logical line's body: its text minus the timestamp column (which is
 /// the line's first span and is re-rendered on load).
 fn line_body(line: &Line) -> String {
@@ -4664,6 +4717,61 @@ mod tests {
         let mut line = Line::styled(format!("<alice> {body}"), Style::default());
         line.time = Some(time);
         app.push_line(ch, line);
+    }
+
+    /// An epoch timestamp for noon local time on the given date.
+    fn ts(year: i32, month: u32, day: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(year, month, day, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp()
+    }
+
+    fn buffer_text(app: &App, idx: usize) -> Vec<String> {
+        (0..app.buffers[idx].buffer.len())
+            .map(|r| app.buffers[idx].buffer.line(r).text())
+            .collect()
+    }
+
+    #[test]
+    fn month_change_inserts_date_separator() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        push_history_line(&mut app, ch, "one", ts(2026, 4, 10));
+        push_history_line(&mut app, ch, "two", ts(2026, 4, 20));
+        push_history_line(&mut app, ch, "three", ts(2026, 5, 2));
+        let text = buffer_text(&app, ch);
+        // Only the month *change* is marked; the first line is not.
+        assert!(!text.iter().any(|l| l.starts_with("Apr 2026")), "{text:?}");
+        let separators: Vec<&String> = text.iter().filter(|l| l.starts_with("May 2026")).collect();
+        assert_eq!(separators.len(), 1, "{text:?}");
+        assert!(separators[0].contains("---"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn history_load_inserts_date_separators() {
+        let dir = std::env::temp_dir().join(format!("cricr-hist-months-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = hist_config(&dir);
+        {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(cfg.clone(), tx);
+            let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+            push_history_line(&mut app, ch, "apr", ts(2026, 4, 1));
+            push_history_line(&mut app, ch, "may", ts(2026, 5, 1));
+            app.save_all_history();
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(cfg, tx);
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let text = buffer_text(&app, ch);
+        assert!(
+            text.iter().any(|l| l.starts_with("May 2026")),
+            "date separator missing on reload: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
