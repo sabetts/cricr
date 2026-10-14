@@ -2119,6 +2119,9 @@ impl App {
         }
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
+        // Being active in the buffer clears its terminal-title activity badge
+        // (the unread separator line itself is left in place).
+        self.buffers[self.current].idle_marked = false;
         // A pending numeric argument (Emacs universal argument), default 1.
         let n = self.take_arg();
         match action {
@@ -4665,6 +4668,29 @@ mod tests {
             .unwrap();
         app.switch_to(scratch);
         assert_eq!(app.terminal_title(), "cricr");
+    }
+
+    #[test]
+    fn activity_clears_the_current_buffer_badge() {
+        let mut app = app_without_servers();
+        app.config.ui.title_badge = true;
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        // An idle post badges the buffer being viewed.
+        app.idle_mark = Duration::ZERO;
+        app.push_line(ch, Line::plain("hi"));
+        app.bump_activity(ch, false);
+        assert!(app.buffers[ch].idle_marked);
+        assert!(app.terminal_title().starts_with("cricr ["));
+
+        // Being active in the buffer clears the badge (the separator stays).
+        app.perform(Action::PrevLine);
+        assert!(!app.buffers[ch].idle_marked);
+        assert_eq!(app.terminal_title(), "cricr");
+        assert!(
+            app.buffers[ch].marker_row.is_some(),
+            "separator should remain"
+        );
     }
 
     #[test]
