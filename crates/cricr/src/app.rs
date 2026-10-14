@@ -153,6 +153,9 @@ pub struct Chan {
     pub first_unread: Option<usize>,
     /// Row of the inserted "read up to here" separator line, if present.
     pub marker_row: Option<usize>,
+    /// Set when the unread separator was created/moved by the idle rule while
+    /// this buffer was the one being viewed (so the terminal title badges it).
+    idle_marked: bool,
     /// When set, activity in this buffer is not tracked (`C-c C-i`).
     pub ignore_activity: bool,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
@@ -422,6 +425,7 @@ impl App {
             mentioned: false,
             first_unread: None,
             marker_row: None,
+            idle_marked: false,
             ignore_activity: false,
             last_activity: 0,
             last_activity_at: Instant::now(),
@@ -607,6 +611,7 @@ impl App {
                     self.remove_marker(buf);
                 }
                 self.insert_marker(buf, row);
+                self.buffers[buf].idle_marked = true;
             } else {
                 self.activity_seq += 1;
                 self.buffers[buf].unread += 1;
@@ -648,6 +653,7 @@ impl App {
                 *first = first.saturating_sub(1);
             }
         }
+        self.buffers[buf].idle_marked = false;
     }
 
     fn switch_to(&mut self, idx: usize) {
@@ -703,15 +709,7 @@ impl App {
     pub fn activity_entries(&self) -> Vec<(String, Style)> {
         let targets: Vec<String> = self.buffers.iter().map(|b| b.target.clone()).collect();
         let short = abbreviate(&targets);
-        let mut active: Vec<usize> = self
-            .buffers
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.unread > 0)
-            .map(|(i, _)| i)
-            .collect();
-        active.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_activity));
-        active
+        self.active_indices(false)
             .into_iter()
             .map(|i| {
                 let style = if self.buffers[i].mentioned {
@@ -722,6 +720,22 @@ impl App {
                 (short[i].clone(), style)
             })
             .collect()
+    }
+
+    /// Indices of buffers with pending activity, most recent first. When
+    /// `idle` is set, a buffer whose unread separator was created/moved by the
+    /// idle rule while being viewed also counts (for the terminal title, not
+    /// the mode line).
+    fn active_indices(&self, idle: bool) -> Vec<usize> {
+        let mut active: Vec<usize> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.unread > 0 || (idle && b.idle_marked))
+            .map(|(i, _)| i)
+            .collect();
+        active.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_activity));
+        active
     }
 
     /// Targets with pending activity, most recent first.
@@ -745,16 +759,20 @@ impl App {
     }
 
     /// The terminal title: the app name, with the buffers that have pending
-    /// activity appended (e.g. `cricr [bob,#emacs]`).
+    /// activity appended (e.g. `cricr [bob,#emacs]`). Unlike the mode line this
+    /// also lists the buffer being viewed when it has an unread separator, so
+    /// the terminal tab shows activity you may not be looking at.
     fn terminal_title(&self) -> String {
-        let entries = self.activity_entries();
-        if entries.is_empty() {
+        let targets: Vec<String> = self.buffers.iter().map(|b| b.target.clone()).collect();
+        let short = abbreviate(&targets);
+        let active = self.active_indices(true);
+        if active.is_empty() {
             return "cricr".to_string();
         }
-        let shown: Vec<&str> = entries.iter().take(4).map(|(n, _)| n.as_str()).collect();
+        let shown: Vec<&str> = active.iter().take(4).map(|&i| short[i].as_str()).collect();
         let mut title = format!("cricr [{}", shown.join(","));
-        if entries.len() > shown.len() {
-            title.push_str(&format!(" +{}", entries.len() - shown.len()));
+        if active.len() > shown.len() {
+            title.push_str(&format!(" +{}", active.len() - shown.len()));
         }
         title.push(']');
         title
@@ -4319,6 +4337,31 @@ mod tests {
 
         // Visiting the buffer clears its activity, dropping it from the title.
         app.switch_to(b);
+        assert_eq!(app.terminal_title(), "cricr");
+    }
+
+    #[test]
+    fn idle_marker_badges_the_current_buffer_title() {
+        let mut app = app_without_servers();
+        app.config.ui.title_badge = true;
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        assert_eq!(app.terminal_title(), "cricr");
+
+        // An idle post in the visible buffer drops the separator and badges it.
+        app.idle_mark = Duration::ZERO;
+        app.push_line(ch, Line::plain("hi"));
+        app.bump_activity(ch, false);
+        let title = app.terminal_title();
+        assert!(title.starts_with("cricr ["), "expected a badge: {title}");
+
+        // Leaving the buffer clears the badge (and the separator).
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
         assert_eq!(app.terminal_title(), "cricr");
     }
 
