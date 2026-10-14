@@ -157,12 +157,19 @@ pub struct Chan {
     pub ignore_activity: bool,
     /// Monotonic stamp of the most recent activity, for mode-line ordering.
     pub last_activity: u64,
+    /// When this buffer last saw activity, for the idle-based unread marker.
+    last_activity_at: Instant,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
     pub last_visited: u64,
     /// Last timestamp printed, so repeats can be blanked.
     pub last_timestamp: String,
     pub topic: Option<String>,
 }
+
+/// A quiet spell after which activity in the buffer you are already viewing
+/// still gets an unread separator, so returning to the terminal shows where
+/// output resumed.
+const IDLE_MARK: Duration = Duration::from_secs(5 * 60);
 
 const COMMANDS: &[&str] = &[
     "/msg",
@@ -202,6 +209,8 @@ pub struct App {
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
+    /// Quiet spell after which activity in the current buffer is marked unread.
+    idle_mark: Duration,
     pub scrollback: usize,
     pub fill_column: usize,
     /// Whether kills/copies are written to the system clipboard (OSC 52).
@@ -250,6 +259,7 @@ impl App {
             message: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
+            idle_mark: IDLE_MARK,
             scrollback,
             fill_column,
             clipboard,
@@ -414,6 +424,7 @@ impl App {
             marker_row: None,
             ignore_activity: false,
             last_activity: 0,
+            last_activity_at: Instant::now(),
             last_visited: 0,
             last_timestamp: String::new(),
             topic: None,
@@ -574,13 +585,23 @@ impl App {
     }
 
     fn bump_activity(&mut self, buf: usize, mentioned: bool) {
-        if buf != self.current
-            && !matches!(self.buffers[buf].kind, Kind::Scratch | Kind::Help)
-            && !self.buffers[buf].ignore_activity
-        {
-            self.activity_seq += 1;
-            self.buffers[buf].unread += 1;
-            self.buffers[buf].last_activity = self.activity_seq;
+        let current = buf == self.current;
+        let idle = self.buffers[buf].last_activity_at.elapsed() >= self.idle_mark;
+        let ignored = matches!(self.buffers[buf].kind, Kind::Scratch | Kind::Help)
+            || self.buffers[buf].ignore_activity;
+        // Activity in another buffer always counts as unread. Activity in the
+        // buffer we are already viewing only counts after a quiet spell, so
+        // returning to the terminal shows where output resumed (no mode-line
+        // flag for the current buffer).
+        if !ignored && (!current || idle) {
+            if !current {
+                self.activity_seq += 1;
+                self.buffers[buf].unread += 1;
+                self.buffers[buf].last_activity = self.activity_seq;
+                if mentioned {
+                    self.buffers[buf].mentioned = true;
+                }
+            }
             if self.buffers[buf].first_unread.is_none() {
                 // Insert a "read up to here" separator before the first unread
                 // message, so it's visible when the buffer is visited.
@@ -590,10 +611,8 @@ impl App {
                 self.buffers[buf].marker_row = Some(row);
                 self.buffers[buf].first_unread = Some(row + 1);
             }
-            if mentioned {
-                self.buffers[buf].mentioned = true;
-            }
         }
+        self.buffers[buf].last_activity_at = Instant::now();
     }
 
     fn marker_line(&self) -> Line {
@@ -4523,6 +4542,35 @@ mod tests {
         let still = (0..app.buffers[a].buffer.len())
             .any(|r| app.buffers[a].buffer.line(r).text().starts_with("---"));
         assert!(!still, "separator removed on leaving");
+    }
+
+    #[test]
+    fn current_buffer_marks_unread_only_after_idle() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.idle_mark = Duration::from_secs(3600); // not idle
+
+        // Fresh activity in the buffer we are viewing is not marked.
+        app.push_line(ch, Line::plain("now"));
+        app.bump_activity(ch, false);
+        assert!(
+            app.buffers[ch].marker_row.is_none(),
+            "no marker while active"
+        );
+        assert_eq!(app.buffers[ch].unread, 0);
+
+        // After a quiet spell, activity in the current buffer is marked.
+        app.idle_mark = Duration::ZERO; // always idle
+        app.push_line(ch, Line::plain("later"));
+        app.bump_activity(ch, false);
+        assert!(app.buffers[ch].marker_row.is_some(), "marker after idle");
+        assert_eq!(
+            app.buffers[ch].first_unread,
+            app.buffers[ch].marker_row.map(|r| r + 1)
+        );
+        // The current buffer stays out of the mode-line activity list.
+        assert_eq!(app.buffers[ch].unread, 0);
     }
 
     #[test]
