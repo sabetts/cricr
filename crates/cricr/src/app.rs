@@ -657,6 +657,9 @@ impl App {
             if let Some(row) = &mut self.buffers[buf].marker_row {
                 *row = row.saturating_sub(excess);
             }
+            // The line just pushed (recorded in `last_push_row` before the
+            // trim) shifted up with everything else.
+            self.last_push_row = self.last_push_row.saturating_sub(excess);
         }
     }
 
@@ -1189,7 +1192,13 @@ impl App {
             } else if key.code == KeyCode::Tab {
                 self.current_mut().buffer.insert_char('\t');
             } else if key.code == KeyCode::Enter {
-                self.current_mut().buffer.insert_char('\n');
+                // An IRC input line is single-line, so a quoted newline becomes
+                // a space; free text buffers get a real line break.
+                if self.current().buffer.is_irc() {
+                    self.current_mut().buffer.insert_char(' ');
+                } else {
+                    self.current_mut().buffer.insert_newline();
+                }
             }
             return;
         }
@@ -3444,9 +3453,11 @@ impl App {
         history_flush.tick().await; // consume the immediate first tick
 
         loop {
+            let minibuffer = self.minibuffer_height();
             if let Ok(size) = terminal.size() {
-                // Buffer view height = terminal rows minus mode line + minibuffer.
-                self.viewport_rows = size.height.saturating_sub(2) as usize;
+                // Buffer view height = terminal rows minus the mode line and
+                // the (possibly multi-row) minibuffer.
+                self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
             }
             self.ensure_scroll_visible();
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
@@ -3973,6 +3984,33 @@ mod tests {
 
     fn press(app: &mut App, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) {
         app.handle_key(crossterm::event::KeyEvent::new(code, mods));
+    }
+
+    #[test]
+    fn quoted_newline_is_a_space_in_irc_but_a_break_in_scratch() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("ab");
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.buffers[ch].buffer.input(), "ab ");
+        assert!(!app.buffers[ch].buffer.input().contains('\n'));
+
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        let before = app.buffers[scratch].buffer.len();
+        app.current_mut().buffer.beginning_of_buffer();
+        app.current_mut().buffer.insert_str("xy");
+        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.buffers[scratch].buffer.len(), before + 1);
+        assert_eq!(app.buffers[scratch].buffer.line(0).text(), "xy");
     }
 
     #[test]
@@ -5200,6 +5238,27 @@ mod tests {
             app.buffers[ch].marker_row.unwrap() > first,
             "separator moves once the buffer has been acknowledged"
         );
+    }
+
+    #[test]
+    fn separator_lands_above_the_new_line_when_scrollback_is_trimmed() {
+        let mut app = app_without_servers();
+        app.scrollback = 4;
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        for i in 0..6 {
+            app.push_line(a, Line::plain(format!("line {i}")));
+        }
+        // The buffer is now at the scrollback limit; new unread arrives.
+        app.push_line(a, Line::plain("LAST"));
+        app.bump_activity(a, false);
+        let row = app.buffers[a].marker_row.expect("separator inserted");
+        assert!(app.buffers[a].buffer.line(row + 1).text().contains("LAST"));
     }
 
     #[test]

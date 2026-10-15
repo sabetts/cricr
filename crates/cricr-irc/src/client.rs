@@ -177,31 +177,33 @@ impl FloodLimiter {
 /// Maximum length of an IRC protocol line (including CRLF).
 const MAX_LINE: usize = 510;
 
-/// Split `text` into chunks of at most `max` characters, preferring to break
-/// on whitespace. Very long words are hard-split.
+/// Split `text` into chunks of at most `max` bytes, preferring to break on
+/// whitespace. Very long words are hard-split on char boundaries. The limit is
+/// in bytes because that is what the protocol (and the server) counts.
 fn split_message(text: &str, max: usize) -> Vec<String> {
-    if max == 0 || text.chars().count() <= max {
+    if max == 0 || text.len() <= max {
         return vec![text.to_string()];
     }
     let mut out = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {
-        let wlen = word.chars().count();
+        let wlen = word.len();
         if wlen > max {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
-            let mut chars: Vec<char> = word.chars().collect();
-            while chars.len() > max {
-                out.push(chars.drain(..max).collect());
+            let mut rest = word;
+            while rest.len() > max {
+                let cut = floor_char_boundary(rest, max);
+                out.push(rest[..cut].to_string());
+                rest = &rest[cut..];
             }
-            cur.extend(chars);
+            cur.push_str(rest);
             continue;
         }
-        let cur_len = cur.chars().count();
         if cur.is_empty() {
             cur.push_str(word);
-        } else if cur_len + 1 + wlen <= max {
+        } else if cur.len() + 1 + wlen <= max {
             cur.push(' ');
             cur.push_str(word);
         } else {
@@ -213,6 +215,20 @@ fn split_message(text: &str, max: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// The largest char boundary `<= idx`, always advancing past at least one
+/// character so a hard split can never loop forever.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    if i == 0 && !s.is_empty() {
+        s.chars().next().map(char::len_utf8).unwrap_or(1)
+    } else {
+        i
+    }
 }
 
 /// Build the queued `PRIVMSG`/`NOTICE` lines for a user message, splitting it
@@ -757,6 +773,22 @@ mod tests {
         for out in outs {
             match out {
                 Out::Queue(line) => assert!(line.len() <= MAX_LINE),
+                _ => panic!("expected queued line"),
+            }
+        }
+    }
+
+    #[test]
+    fn message_lines_respects_the_byte_limit_for_multibyte() {
+        let outs = message_lines("PRIVMSG", "#c", &"é".repeat(2000));
+        assert!(outs.len() > 1);
+        for out in outs {
+            match out {
+                Out::Queue(line) => {
+                    assert!(line.len() <= MAX_LINE, "line is {} bytes", line.len());
+                    // No chunk may split a UTF-8 character.
+                    assert!(line.is_char_boundary(line.len()));
+                }
                 _ => panic!("expected queued line"),
             }
         }

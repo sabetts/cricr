@@ -109,8 +109,8 @@ pub fn parse(input: &str, current_target: Option<&str>) -> ParsedInput {
             reason: (!args.is_empty()).then(|| args.to_string()),
         }),
         "topic" => {
-            // `/topic #chan text` targets CHAN; otherwise the current channel.
-            let (channel, text) = if is_channel(first) && !remainder.is_empty() {
+            // `/topic #chan [text]` targets CHAN; otherwise the current channel.
+            let (channel, text) = if is_channel(first) {
                 (first.to_string(), remainder.to_string())
             } else {
                 (target.to_string(), args.to_string())
@@ -261,6 +261,14 @@ mod tests {
             ParsedInput::Send(ClientCommand::Topic {
                 channel: "#other".into(),
                 topic: Some("hi there".into())
+            })
+        );
+        // A channel with no text queries that channel, not the current one.
+        assert_eq!(
+            parse("/topic #other", Some("#c")),
+            ParsedInput::Send(ClientCommand::Topic {
+                channel: "#other".into(),
+                topic: None
             })
         );
     }

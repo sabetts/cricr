@@ -450,6 +450,10 @@ impl Buffer {
             return None;
         }
         let removed = self.lines.remove(row);
+        if self.lines.is_empty() {
+            // A buffer always keeps at least one (possibly empty) line.
+            self.lines.push(Line::plain(""));
+        }
         let last = self.lines.len() - 1;
         if self.point.row > row {
             self.point.row -= 1;
@@ -1553,6 +1557,16 @@ mod tests {
         assert!(b.delete_region(start, end));
         assert_eq!(b.line(0).text(), "af");
         assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_line_keeps_a_blank_line() {
+        let mut b = Buffer::text();
+        assert_eq!(b.len(), 1);
+        b.remove_line(0).expect("line removed");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.line(0).text(), "");
+        assert_eq!(b.point(), Pos::new(0, 0));
     }
 
     #[test]
