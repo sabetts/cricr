@@ -2120,8 +2120,11 @@ impl App {
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
         // Being active in the buffer clears its terminal-title activity badge
-        // (the unread separator line itself is left in place).
-        self.buffers[self.current].idle_marked = false;
+        // (the unread separator line itself is left in place) and restarts the
+        // quiet timer, so a reply moments later isn't treated as idle activity.
+        let cur = self.current;
+        self.buffers[cur].idle_marked = false;
+        self.buffers[cur].last_activity_at = Instant::now();
         // A pending numeric argument (Emacs universal argument), default 1.
         let n = self.take_arg();
         match action {
@@ -4691,6 +4694,27 @@ mod tests {
             app.buffers[ch].marker_row.is_some(),
             "separator should remain"
         );
+    }
+
+    #[test]
+    fn user_activity_resets_the_idle_timer() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        // The buffer has been quiet for a long time...
+        app.buffers[ch].last_activity_at = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        // ...then the user posts.
+        app.perform(Action::Send);
+        // A reply moments later is not idle activity: no separator, no badge.
+        app.push_line(ch, Line::plain("reply"));
+        app.bump_activity(ch, false);
+        assert!(
+            app.buffers[ch].marker_row.is_none(),
+            "a reply right after posting must not be marked unread"
+        );
+        assert!(!app.buffers[ch].idle_marked);
     }
 
     #[test]
