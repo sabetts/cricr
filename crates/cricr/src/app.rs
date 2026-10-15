@@ -697,7 +697,11 @@ impl App {
                 if mentioned {
                     self.buffers[buf].mentioned = true;
                 }
-                if self.buffers[buf].first_unread.is_none() {
+                // Insert a separator only when one isn't already showing. Gate
+                // on `marker_row` (the separator actually inserted), not
+                // `first_unread`, which persists after the separator is removed
+                // so `C-c C-a` can still find where unread began.
+                if self.buffers[buf].marker_row.is_none() {
                     let row = self.last_push_row;
                     self.insert_marker(buf, row);
                 }
@@ -5196,6 +5200,35 @@ mod tests {
             app.buffers[ch].marker_row.unwrap() > first,
             "separator moves once the buffer has been acknowledged"
         );
+    }
+
+    #[test]
+    fn second_unread_activity_inserts_a_new_separator() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+
+        app.push_line(a, Line::plain("one"));
+        app.bump_activity(a, false);
+        assert!(app.buffers[a].marker_row.is_some(), "first separator");
+
+        // Visiting and leaving the buffer removes its separator...
+        app.switch_to(a);
+        app.switch_to(scratch);
+        assert!(app.buffers[a].marker_row.is_none());
+
+        // ...but a later message must drop a fresh one.
+        app.push_line(a, Line::plain("two"));
+        app.bump_activity(a, false);
+        let row = app.buffers[a]
+            .marker_row
+            .expect("separator after new activity");
+        assert!(app.buffers[a].buffer.line(row + 1).text().contains("two"));
     }
 
     #[test]
