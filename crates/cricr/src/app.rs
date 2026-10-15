@@ -248,6 +248,12 @@ pub struct App {
     previous: usize,
     activity_seq: u64,
     visit_seq: u64,
+    /// Buffer the current `C-c C-SPC` run started from, so the run can return
+    /// there once every activity buffer has been visited.
+    next_active_origin: Option<usize>,
+    /// Set while `next_active` is switching, so `switch_to` knows not to end
+    /// the run.
+    in_next_active: bool,
     prefix: Prefix,
     /// A numeric argument being built (Emacs universal argument), if any.
     numeric_arg: Option<ArgState>,
@@ -297,6 +303,8 @@ impl App {
             previous: 0,
             activity_seq: 0,
             visit_seq: 0,
+            next_active_origin: None,
+            in_next_active: false,
             prefix: Prefix::None,
             numeric_arg: None,
             quoted: false,
@@ -724,6 +732,10 @@ impl App {
         if idx >= self.buffers.len() {
             return;
         }
+        if !self.in_next_active {
+            // Switching any other way ends a `C-c C-SPC` run.
+            self.next_active_origin = None;
+        }
         if idx != self.current {
             // Leaving a buffer: its unread separator has been seen.
             let old = self.current;
@@ -747,8 +759,11 @@ impl App {
         self.buffers.iter().position(|b| b.kind == Kind::Scratch)
     }
 
-    /// Switch to the buffer with the most recent activity, or to `*scratch*`
-    /// when nothing has activity (mirrors `rcirc-next-active-buffer`).
+    /// Switch to the buffer with the most recent activity (mirrors
+    /// `rcirc-next-active-buffer`). A run of consecutive `C-c C-SPC` presses
+    /// remembers where it began and, once every activity buffer has been
+    /// visited, returns there instead of falling through to `*scratch*`. A
+    /// lone press with nothing to visit still goes to `*scratch*`.
     fn next_active(&mut self) {
         let target = self
             .buffers
@@ -757,14 +772,35 @@ impl App {
             .filter(|(i, b)| *i != self.current && b.unread > 0)
             .max_by_key(|(_, b)| b.last_activity)
             .map(|(i, _)| i);
-        match target {
-            Some(i) => self.switch_to(i),
-            None => {
+        match (self.next_active_origin, target) {
+            // Mid-run: hop to the next buffer with activity.
+            (Some(_), Some(i)) => self.switch_active(i),
+            // Run exhausted: go back to where it started.
+            (Some(origin), None) => {
+                self.next_active_origin = None;
+                if origin != self.current && origin < self.buffers.len() {
+                    self.switch_active(origin);
+                }
+            }
+            // Starting a run: remember the origin and jump.
+            (None, Some(i)) => {
+                self.next_active_origin = Some(self.current);
+                self.switch_active(i);
+            }
+            // Nothing to visit and no run: fall back to `*scratch*`.
+            (None, None) => {
                 if let Some(s) = self.scratch_index() {
-                    self.switch_to(s);
+                    self.switch_active(s);
                 }
             }
         }
+    }
+
+    /// Switch buffers as part of a `next_active` run (see `in_next_active`).
+    fn switch_active(&mut self, idx: usize) {
+        self.in_next_active = true;
+        self.switch_to(idx);
+        self.in_next_active = false;
     }
 
     /// Targets with pending activity, most recent first, with the mode-line
@@ -2125,6 +2161,8 @@ impl App {
         let cur = self.current;
         self.buffers[cur].idle_marked = false;
         self.buffers[cur].last_activity_at = Instant::now();
+        // Any real command ends a `C-c C-SPC` run.
+        self.next_active_origin = Option::None;
         // A pending numeric argument (Emacs universal argument), default 1.
         let n = self.take_arg();
         match action {
@@ -5373,6 +5411,51 @@ mod tests {
         assert_eq!(app.current, a, "then the next-most-recent");
         app.next_active();
         assert_eq!(app.current, scratch, "no activity left -> *scratch*");
+    }
+
+    #[test]
+    fn next_active_run_returns_to_where_it_started() {
+        let mut app = app_without_servers();
+        let scratch = app.current;
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        let c = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(a);
+        app.bump_activity(b, false);
+        app.bump_activity(c, false);
+
+        app.next_active();
+        assert_eq!(app.current, c, "most recent activity");
+        app.next_active();
+        assert_eq!(app.current, b, "next-most-recent");
+        app.next_active();
+        assert_eq!(
+            app.current, a,
+            "run exhausted -> back to the start, not *scratch*"
+        );
+        // A fresh run with nothing to visit still falls back to *scratch*.
+        app.next_active();
+        assert_eq!(app.current, scratch);
+    }
+
+    #[test]
+    fn next_active_run_ends_on_another_command() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        let c = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(a);
+        app.bump_activity(b, false);
+        app.bump_activity(c, false);
+
+        app.next_active();
+        assert_eq!(app.current, c, "most recent activity");
+        // Typing in the buffer ends the run...
+        app.perform(Action::SelfInsert('x'));
+        app.next_active();
+        assert_eq!(app.current, b, "a new run starts from #c");
+        app.next_active();
+        assert_eq!(app.current, c, "returns to where this run started");
     }
 
     #[test]
