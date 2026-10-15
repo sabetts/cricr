@@ -671,19 +671,25 @@ impl App {
         // flag for the current buffer).
         if !ignored && (!current || idle) {
             if current {
-                // Idle activity in the buffer we are viewing: move the
-                // separator to the new message rather than growing the unread
-                // region. (Pressing keys never moves it.)
-                let mut row = self.last_push_row;
-                if let Some(old) = self.buffers[buf].marker_row {
-                    // Removing a separator above the new line shifts it up one.
-                    if old < row {
-                        row -= 1;
+                // Idle activity in the buffer we are viewing: drop the
+                // separator before the first message of the quiet spell rather
+                // than growing the unread region. Once it is showing, later
+                // output in the same spell grows the unread region below it
+                // instead of dragging the separator forward; the user
+                // acknowledging the buffer (or leaving it) clears `idle_marked`,
+                // which lets a fresh spell move the separator again.
+                if !self.buffers[buf].idle_marked {
+                    let mut row = self.last_push_row;
+                    if let Some(old) = self.buffers[buf].marker_row {
+                        // Removing a separator above the new line shifts it up.
+                        if old < row {
+                            row -= 1;
+                        }
+                        self.remove_marker(buf);
                     }
-                    self.remove_marker(buf);
+                    self.insert_marker(buf, row);
+                    self.buffers[buf].idle_marked = true;
                 }
-                self.insert_marker(buf, row);
-                self.buffers[buf].idle_marked = true;
             } else {
                 self.activity_seq += 1;
                 self.buffers[buf].unread += 1;
@@ -5141,6 +5147,55 @@ mod tests {
             .line(moved + 1)
             .text()
             .contains("second"));
+    }
+
+    #[test]
+    fn idle_separator_stays_put_while_the_buffer_stays_idle() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.idle_mark = Duration::from_secs(300);
+        let quiet = || {
+            Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .unwrap_or_else(Instant::now)
+        };
+
+        // The first post after a quiet spell drops the separator.
+        app.buffers[ch].last_activity_at = quiet();
+        app.push_line(ch, Line::plain("post 0"));
+        app.bump_activity(ch, false);
+        let first = app.buffers[ch].marker_row.expect("separator inserted");
+        assert!(app.buffers[ch].idle_marked);
+
+        // Later output while the user stays away grows the unread region below
+        // the separator instead of dragging it forward, even across further
+        // quiet spells.
+        for i in 1..4 {
+            app.buffers[ch].last_activity_at = quiet();
+            app.push_line(ch, Line::plain(format!("post {i}")));
+            app.bump_activity(ch, false);
+            assert_eq!(
+                app.buffers[ch].marker_row,
+                Some(first),
+                "separator must not drift while the user is idle"
+            );
+        }
+        assert!(app.buffers[ch]
+            .buffer
+            .line(first + 1)
+            .text()
+            .contains("post 0"));
+
+        // Acknowledging the buffer lets a fresh quiet spell move it.
+        app.perform(Action::PrevLine);
+        app.buffers[ch].last_activity_at = quiet();
+        app.push_line(ch, Line::plain("post 4"));
+        app.bump_activity(ch, false);
+        assert!(
+            app.buffers[ch].marker_row.unwrap() > first,
+            "separator moves once the buffer has been acknowledged"
+        );
     }
 
     #[test]
