@@ -394,7 +394,7 @@ impl App {
     }
 
     /// Schedule the next reconnect attempt for `server`, with exponential
-    /// backoff, and report it in the server buffer.
+    /// backoff, and report it in every buffer of the server.
     fn schedule_reconnect(&mut self, server: usize) {
         if !self.config.reconnect.enabled {
             return;
@@ -407,14 +407,10 @@ impl App {
             self.config.reconnect.max_secs,
         );
         self.servers[server].next_at = Some(Instant::now() + Duration::from_secs_f64(delay));
-        let idx = self.servers[server].buffer;
         let name = self.servers[server].name.clone();
         let secs = (delay.round() as u64).max(1);
-        let line = self.error_line(
-            idx,
-            &format!("Reconnecting to {name} in {secs}s (attempt {attempt})"),
-        );
-        self.push_line(idx, line);
+        let text = format!("Attempting to reconnect to {name} (try {attempt}) in {secs}s ...");
+        self.broadcast_message(server, &text);
     }
 
     /// Earliest scheduled reconnect deadline across all servers, if any.
@@ -3091,6 +3087,11 @@ impl App {
     /// printing an `ERROR` response in all buffers on disconnect).
     fn broadcast_error(&mut self, server: usize, message: &str) {
         let text = format!("{}: {message}", self.server_name(server));
+        self.broadcast_message(server, &text);
+    }
+
+    /// Print `text` verbatim as an `!!!` line into every buffer of `server`.
+    fn broadcast_message(&mut self, server: usize, text: &str) {
         let targets: Vec<usize> = self
             .buffers
             .iter()
@@ -3099,7 +3100,7 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         for idx in targets {
-            let line = self.error_line(idx, &text);
+            let line = self.error_line(idx, text);
             self.push_line(idx, line);
         }
     }
@@ -3148,7 +3149,13 @@ impl App {
             }
             Event::ConnectionError { error } => {
                 self.servers[server].connected = false;
-                self.broadcast_error(server, &error);
+                // Report the underlying failure only for the first error of an
+                // outage; each retry is summarized by `schedule_reconnect`
+                // ("Attempting to reconnect ... (try N)") rather than repeating
+                // the same connect error every few seconds.
+                if self.servers[server].attempt == 0 {
+                    self.broadcast_error(server, &error);
+                }
                 self.schedule_reconnect(server);
             }
             Event::Privmsg {
@@ -5426,6 +5433,49 @@ mod tests {
             },
         );
         assert_eq!(app.servers[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn reconnect_failures_report_the_attempt_number() {
+        let mut app = app_with_unreachable_server();
+        let server_buf = app.servers[0].buffer;
+
+        // The first failure of an outage shows the underlying error once, and
+        // each retry reports its attempt number instead of repeating it.
+        app.handle_event(
+            0,
+            Event::ConnectionError {
+                error: "boom".into(),
+            },
+        );
+        app.handle_event(
+            0,
+            Event::ConnectionError {
+                error: "boom".into(),
+            },
+        );
+        app.handle_event(
+            0,
+            Event::ConnectionError {
+                error: "boom".into(),
+            },
+        );
+
+        let text = buffer_text(&app, server_buf).join("\n");
+        assert_eq!(
+            text.matches("boom").count(),
+            1,
+            "raw error shown once: {text}"
+        );
+        for attempt in 1..=3 {
+            assert!(
+                text.contains(&format!(
+                    "Attempting to reconnect to 127.0.0.1 (try {attempt})"
+                )),
+                "missing try {attempt}: {text}"
+            );
+        }
+        assert_eq!(app.servers[0].attempt, 3);
     }
 
     #[tokio::test]
