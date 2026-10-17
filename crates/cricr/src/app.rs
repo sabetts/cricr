@@ -409,7 +409,7 @@ impl App {
         self.servers[server].next_at = Some(Instant::now() + Duration::from_secs_f64(delay));
         let name = self.servers[server].name.clone();
         let secs = (delay.round() as u64).max(1);
-        let text = format!("Attempting to reconnect to {name} (try {attempt}) in {secs}s ...");
+        let text = format!("Reconnecting to {name} in {secs}s (attempt {attempt})");
         self.broadcast_message(server, &text);
     }
 
@@ -3151,8 +3151,8 @@ impl App {
                 self.servers[server].connected = false;
                 // Report the underlying failure only for the first error of an
                 // outage; each retry is summarized by `schedule_reconnect`
-                // ("Attempting to reconnect ... (try N)") rather than repeating
-                // the same connect error every few seconds.
+                // ("Reconnecting ... (attempt N)") rather than repeating the
+                // same connect error every few seconds.
                 if self.servers[server].attempt == 0 {
                     self.broadcast_error(server, &error);
                 }
@@ -5467,12 +5467,11 @@ mod tests {
             1,
             "raw error shown once: {text}"
         );
+        assert!(text.contains("Reconnecting to 127.0.0.1 in"), "{text}");
         for attempt in 1..=3 {
             assert!(
-                text.contains(&format!(
-                    "Attempting to reconnect to 127.0.0.1 (try {attempt})"
-                )),
-                "missing try {attempt}: {text}"
+                text.contains(&format!("(attempt {attempt})")),
+                "missing attempt {attempt}: {text}"
             );
         }
         assert_eq!(app.servers[0].attempt, 3);
