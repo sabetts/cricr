@@ -3665,8 +3665,13 @@ impl App {
         Ok(())
     }
 
-    fn handle_term_batch(&mut self, batch: Vec<TermEvent>) {
+    fn handle_term_batch(&mut self, mut batch: Vec<TermEvent>) {
         let now = Instant::now();
+        // Alacritty on Windows reports Ctrl+Space as a plain Space. Only
+        // promote a lone space; a paste burst holds typed text that must keep
+        // its spaces even while Ctrl is still held after Ctrl+V.
+        #[cfg(windows)]
+        promote_alacritty_ctrl_space(&mut batch, keymap::ctrl_is_down());
         // A burst carrying a newline followed by more input is a paste (e.g. on
         // Windows, where bracketed paste is not available); the latch keeps a
         // paste that is split across drains folding.
@@ -3998,6 +4003,42 @@ fn is_multiline_paste(batch: &[TermEvent]) -> bool {
     keys.iter()
         .enumerate()
         .any(|(i, key)| key.code == crossterm::event::KeyCode::Enter && i + 1 < keys.len())
+}
+
+/// Promote a lone plain Space to `C-SPC` when Alacritty on Windows has lost the
+/// control modifier. Multi-key bursts (pastes) are left alone so their spaces
+/// are inserted normally.
+#[cfg(windows)]
+fn promote_alacritty_ctrl_space(batch: &mut [TermEvent], ctrl_down: bool) {
+    if !ctrl_down {
+        return;
+    }
+    let mut found = None;
+    for (i, event) in batch.iter().enumerate() {
+        match event {
+            TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                if found.is_some() {
+                    return;
+                }
+                found = Some(i);
+            }
+            TermEvent::Paste(_) => return,
+            _ => {}
+        }
+    }
+    let Some(i) = found else {
+        return;
+    };
+    if let TermEvent::Key(key) = &mut batch[i] {
+        if key.code == crossterm::event::KeyCode::Char(' ')
+            && !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+        {
+            key.modifiers |= crossterm::event::KeyModifiers::CONTROL;
+        }
+    }
 }
 
 /// Give a bare host (`example.com`) a scheme so the OS opener treats it as a
@@ -4948,6 +4989,15 @@ mod tests {
     }
 
     #[test]
+    fn paste_preserves_spaces() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.handle_paste("two  spaces and one".to_string());
+        assert_eq!(app.current().buffer.input(), "two  spaces and one");
+    }
+
+    #[test]
     fn pasted_newline_does_not_send() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = app_without_servers();
@@ -4973,6 +5023,37 @@ mod tests {
         assert!(!is_multiline_paste(&[ch('a'), enter()]));
         // A multiline paste: the newline is followed by more text.
         assert!(is_multiline_paste(&[ch('a'), enter(), ch('b')]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alacritty_space_promotion_skips_paste_bursts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let space = || TermEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let ch = |c: char| TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+
+        let mut lone = vec![space()];
+        promote_alacritty_ctrl_space(&mut lone, true);
+        let TermEvent::Key(key) = &lone[0] else {
+            panic!("expected key");
+        };
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+
+        // A pasted burst must keep its spaces as typed text.
+        let mut burst = vec![ch('r'), ch('e'), space(), ch('d')];
+        promote_alacritty_ctrl_space(&mut burst, true);
+        let TermEvent::Key(key) = &burst[2] else {
+            panic!("expected key");
+        };
+        assert!(!key.modifiers.contains(KeyModifiers::CONTROL));
+
+        // Without Ctrl held, a lone space stays a space.
+        let mut plain = vec![space()];
+        promote_alacritty_ctrl_space(&mut plain, false);
+        let TermEvent::Key(key) = &plain[0] else {
+            panic!("expected key");
+        };
+        assert!(!key.modifiers.contains(KeyModifiers::CONTROL));
     }
 
     #[test]

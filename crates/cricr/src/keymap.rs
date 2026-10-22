@@ -50,13 +50,6 @@ pub fn translate(key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Alacritty on Windows reports Ctrl+Space exactly like a plain Space (the
-    // control flag is lost in ConPTY). Recover it from the live key state.
-    #[cfg(windows)]
-    if !ctrl && !alt && key.code == KeyCode::Char(' ') && ctrl_is_down() {
-        return SetMark;
-    }
-
     match key.code {
         // Terminals report `C-SPC` in several ways: a space with CONTROL,
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
@@ -159,7 +152,7 @@ pub fn describe(key: KeyEvent) -> Option<String> {
 /// Whether a Ctrl key is currently held. Used to recover `C-SPC` from
 /// terminals (notably Alacritty on Windows) that report it as a plain space.
 #[cfg(windows)]
-fn ctrl_is_down() -> bool {
+pub(crate) fn ctrl_is_down() -> bool {
     const VK_CONTROL: i32 = 0x11;
     #[link(name = "user32")]
     extern "system" {
