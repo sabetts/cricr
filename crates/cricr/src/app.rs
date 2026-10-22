@@ -1396,6 +1396,7 @@ impl App {
                 KeyCode::Char('c') if ctrl => self.should_quit = true,
                 KeyCode::Char('b') => self.start_switch_buffer(),
                 KeyCode::Char('k') => self.start_kill_buffer(),
+                KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
             },
@@ -2595,6 +2596,13 @@ impl App {
             let mut out = std::io::stdout();
             let _ = std::io::Write::write_all(&mut out, sequence.as_bytes());
             let _ = std::io::Write::flush(&mut out);
+        }
+    }
+
+    /// `C-x C-x`: swap point and mark.
+    fn exchange_point_and_mark(&mut self) {
+        if !self.current_mut().buffer.exchange_point_and_mark() {
+            self.message = Some("No mark set in this buffer".to_string());
         }
     }
 
@@ -3940,6 +3948,7 @@ fn help_lines() -> Vec<String> {
         "Buffers",
         "  C-x b          switch buffer",
         "  C-x k          kill buffer (parts a channel)",
+        "  C-x C-x        exchange point and mark",
         "  C-x C-c        quit",
         "  C-c C-SPC      jump to the next buffer with activity",
         "  C-c C-a        jump to the first unread line",
@@ -4592,6 +4601,33 @@ mod tests {
         assert_eq!(snippet("a\nb   c"), "a b c");
         let long = "x".repeat(100);
         assert!(snippet(&long).chars().count() <= 41);
+    }
+
+    #[test]
+    fn c_x_c_x_exchanges_point_and_mark() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello world");
+        app.current_mut().buffer.set_point(Pos::new(0, 8));
+        app.current_mut().buffer.set_mark();
+        app.current_mut().buffer.set_point(Pos::new(0, 13));
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 8));
+        assert_eq!(app.current().buffer.region_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn c_x_c_x_without_mark_reports_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(app.message.as_deref(), Some("No mark set in this buffer"));
     }
 
     #[test]

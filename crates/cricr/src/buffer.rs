@@ -917,6 +917,16 @@ impl Buffer {
         self.mark = None;
     }
 
+    /// Swap point and mark. Returns `false` when no mark is set.
+    pub fn exchange_point_and_mark(&mut self) -> bool {
+        let Some(mark) = self.mark else {
+            return false;
+        };
+        self.mark = Some(self.point);
+        self.set_point(mark);
+        true
+    }
+
     pub fn region(&self) -> Option<(Pos, Pos)> {
         self.mark.map(|m| {
             if m <= self.point {
@@ -1751,6 +1761,26 @@ mod tests {
         b.replace_word_before_point("configuration");
         assert_eq!(b.input(), "configuration");
         assert_eq!(b.word_before_point(), "configuration");
+    }
+
+    #[test]
+    fn exchange_point_and_mark_swaps_ends() {
+        let mut b = Buffer::new("> ");
+        b.set_input("hello world");
+        b.set_point(Pos::new(0, 8));
+        b.set_mark();
+        b.set_point(Pos::new(0, 13));
+        assert!(b.exchange_point_and_mark());
+        assert_eq!(b.point(), Pos::new(0, 8));
+        assert_eq!(b.region_text().unwrap(), "world");
+        assert!(b.exchange_point_and_mark());
+        assert_eq!(b.point(), Pos::new(0, 13));
+    }
+
+    #[test]
+    fn exchange_without_mark_fails() {
+        let mut b = Buffer::new("> ");
+        assert!(!b.exchange_point_and_mark());
     }
 
     #[test]
