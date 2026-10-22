@@ -50,6 +50,13 @@ pub fn translate(key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Alacritty on Windows reports Ctrl+Space exactly like a plain Space (the
+    // control flag is lost in ConPTY). Recover it from the live key state.
+    #[cfg(windows)]
+    if !ctrl && !alt && key.code == KeyCode::Char(' ') && ctrl_is_down() {
+        return SetMark;
+    }
+
     match key.code {
         // Terminals report `C-SPC` in several ways: a space with CONTROL,
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
@@ -72,6 +79,10 @@ pub fn translate(key: KeyEvent) -> Action {
             'g' => Abort,
             'q' => QuotedInsert,
             't' => TransposeChars,
+            // The Alacritty NUL workaround for C-SPC arrives via ConPTY as
+            // Ctrl+Shift+2 on a US layout.
+            #[cfg(windows)]
+            '2' if key.modifiers.contains(KeyModifiers::SHIFT) => SetMark,
             _ => None,
         },
         KeyCode::Char(c) if alt => match c {
@@ -140,6 +151,18 @@ pub fn describe(key: KeyEvent) -> Option<String> {
     }
     out.push_str(&base);
     Some(out)
+}
+
+/// Whether a Ctrl key is currently held. Used to recover `C-SPC` from
+/// terminals (notably Alacritty on Windows) that report it as a plain space.
+#[cfg(windows)]
+fn ctrl_is_down() -> bool {
+    const VK_CONTROL: i32 = 0x11;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+    }
+    unsafe { GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000 != 0 }
 }
 
 #[cfg(test)]
@@ -245,6 +268,18 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('@'), KeyModifiers::NONE)),
             Action::SelfInsert('@')
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alacritty_nul_workaround_sets_mark() {
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('2'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::SetMark
         );
     }
 
