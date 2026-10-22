@@ -80,7 +80,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
                     && matches!(app.prompt, Prompt::None)
                     && chunk == cursor_chunk
                 {
-                    place_cursor(&mut cells, cursor_col);
+                    place_point_cursor(&mut cells, cursor_col, app.search.active);
                 }
                 lines.push(to_rline(&cells));
             }
@@ -90,7 +90,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
         if row == point.row && matches!(app.prompt, Prompt::None) {
-            place_cursor(&mut cells, point.col);
+            place_point_cursor(&mut cells, point.col, app.search.active);
         }
         lines.push(to_rline(&cells));
     }
@@ -244,6 +244,21 @@ fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize) {
     }
 }
 
+/// Place the point's cursor. During isearch the match highlight is also
+/// reverse-video, so use a distinctive color to keep point visible.
+fn place_point_cursor(cells: &mut Vec<(char, Style)>, col: usize, searching: bool) {
+    if !searching {
+        place_cursor(cells, col);
+        return;
+    }
+    let style = Style::fg(Color::Red).reverse().bold();
+    if col < cells.len() {
+        cells[col].1 = style;
+    } else {
+        cells.push((' ', style));
+    }
+}
+
 fn to_rline(cells: &[(char, Style)]) -> RLine<'static> {
     let mut spans: Vec<RSpan> = Vec::new();
     let mut current = String::new();
@@ -343,5 +358,14 @@ mod tests {
         assert_eq!(display_top(5, 25, 10, 5, false), 5);
         assert_eq!(display_top(5, 25, 10, 14, false), 5);
         assert_eq!(display_top(5, 25, 10, 16, false), 7);
+    }
+
+    #[test]
+    fn search_cursor_stands_out_from_reverse_highlights() {
+        let mut cells = vec![('a', Style::default().reverse())];
+        place_point_cursor(&mut cells, 0, true);
+        assert_eq!(cells[0].1.color, Color::Red);
+        assert!(cells[0].1.reverse);
+        assert!(cells[0].1.bold);
     }
 }
