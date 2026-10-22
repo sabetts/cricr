@@ -230,6 +230,8 @@ pub struct App {
     pub history: History,
     pub search: Search,
     pub message: Option<String>,
+    /// Candidates from `dabbrev-completion`, shown until the next keystroke.
+    pub completions: Option<Vec<String>>,
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
@@ -300,6 +302,7 @@ impl App {
             history: History::default(),
             search: Search::default(),
             message: None,
+            completions: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
             idle_mark: IDLE_MARK,
@@ -1187,6 +1190,8 @@ impl App {
         }
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
+        // ...and the completion list from `dabbrev-completion`.
+        self.completions = None;
         // ...and cancels an overdue-but-unshown prefix hint.
         self.prefix_echo = None;
         if !matches!(self.prompt, Prompt::None) {
@@ -2052,6 +2057,7 @@ impl App {
             TransposeChars => self.prompt_transpose_chars(),
             TransposeWords => self.prompt_transpose_words(),
             DabbrevExpand => self.prompt_dabbrev_expand(),
+            DabbrevComplete => self.prompt_dabbrev_complete(),
             BackwardKillWord => self.prompt_backward_kill_word(),
             KillWord => self.prompt_kill_word(),
             KillLine => self.prompt_kill_line(),
@@ -2267,10 +2273,13 @@ impl App {
     /// lines) rather than shrinking the echo area. The height resets once the
     /// prompt closes.
     pub fn minibuffer_height(&mut self) -> u16 {
-        let desired = self
-            .prompt_view()
-            .map(|(_, _, candidates, _)| (1 + candidates.len().min(5)) as u16)
-            .unwrap_or(1);
+        let desired = if let Some((_, _, candidates, _)) = self.prompt_view() {
+            (1 + candidates.len().min(5)) as u16
+        } else if let Some(candidates) = &self.completions {
+            (1 + candidates.len().min(5)) as u16
+        } else {
+            1
+        };
         self.minibuffer_rows = if matches!(self.prompt, Prompt::None) {
             desired
         } else {
@@ -2330,6 +2339,7 @@ impl App {
             TransposeChars => self.current_mut().buffer.transpose_chars(),
             TransposeWords => self.current_mut().buffer.transpose_words(),
             DabbrevExpand => self.dabbrev_expand(),
+            DabbrevComplete => self.dabbrev_complete(),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
             PageUp => self.page_up(),
@@ -2462,6 +2472,64 @@ impl App {
             expansions: candidates,
             index: 0,
         });
+    }
+
+    /// `C-M-/`: complete the word before point from every match in the
+    /// buffer, inserting the common prefix and listing the candidates.
+    fn dabbrev_complete(&mut self) {
+        let i = self.current;
+        if !self.buffers[i].buffer.editable() {
+            return;
+        }
+        let prefix = self.buffers[i].buffer.word_before_point();
+        if prefix.is_empty() {
+            self.message = Some("No possible abbreviation preceding point".to_string());
+            return;
+        }
+        let candidates = self.buffers[i].buffer.dabbrev_candidates(&prefix);
+        if candidates.is_empty() {
+            self.message = Some(format!("No dynamic expansion for \"{prefix}\" found"));
+            return;
+        }
+        let completion = if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            common_prefix(&candidates)
+        };
+        if completion.chars().count() > prefix.chars().count() {
+            self.buffers[i]
+                .buffer
+                .replace_word_before_point(&completion);
+        }
+        if candidates.len() > 1 {
+            self.completions = Some(candidates);
+        }
+    }
+
+    /// `C-M-/` in the minibuffer: complete from the buffer being edited.
+    fn prompt_dabbrev_complete(&mut self) {
+        let cur = self.current;
+        let prefix = self.prompt_word_before_cursor();
+        if prefix.is_empty() {
+            self.message = Some("No possible abbreviation preceding point".to_string());
+            return;
+        }
+        let candidates = self.buffers[cur].buffer.dabbrev_candidates(&prefix);
+        if candidates.is_empty() {
+            self.message = Some(format!("No dynamic expansion for \"{prefix}\" found"));
+            return;
+        }
+        let completion = if candidates.len() == 1 {
+            candidates[0].clone()
+        } else {
+            common_prefix(&candidates)
+        };
+        if completion.chars().count() > prefix.chars().count() {
+            self.prompt_replace_word_before_cursor(&completion);
+        }
+        if candidates.len() > 1 {
+            self.message = Some(format!("Completions: {}", candidates.join("  ")));
+        }
     }
 
     /// The word the current `M-/` cycle last inserted, if any.
@@ -3957,6 +4025,7 @@ fn help_lines() -> Vec<String> {
         "  M-p / M-n      previous / next input",
         "  M-u / M-l      upcase / downcase word",
         "  M-/            dabbrev-expand (complete from a word in the buffer)",
+        "  C-M-/          dabbrev-completion (complete prefix and list matches)",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
         "  M-d            kill word forward",
@@ -6436,6 +6505,78 @@ mod tests {
         // A third cycles back to the first.
         app.perform(Action::DabbrevExpand);
         assert_eq!(app.current().buffer.input(), "regina reginald reginald");
+    }
+
+    #[test]
+    fn dabbrev_completion_inserts_common_prefix_and_lists_matches() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut()
+            .buffer
+            .set_input("configuration configure conf");
+        app.perform(Action::DabbrevComplete);
+        assert_eq!(
+            app.current().buffer.input(),
+            "configuration configure configur"
+        );
+        let completions = app.completions.as_ref().unwrap();
+        assert_eq!(completions.len(), 2);
+        assert!(completions.contains(&"configuration".to_string()));
+        assert!(completions.contains(&"configure".to_string()));
+        assert_eq!(app.minibuffer_height(), 3);
+    }
+
+    #[test]
+    fn dabbrev_completion_inserts_a_unique_match() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello hel");
+        app.perform(Action::DabbrevComplete);
+        assert_eq!(app.current().buffer.input(), "hello hello");
+        assert!(app.completions.is_none());
+    }
+
+    #[test]
+    fn dabbrev_completion_without_matches_reports_it() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("zzz");
+        app.perform(Action::DabbrevComplete);
+        assert_eq!(app.current().buffer.input(), "zzz");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("No dynamic expansion for \"zzz\" found")
+        );
+    }
+
+    #[test]
+    fn c_m_slash_runs_dabbrev_completion_and_next_key_hides_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut()
+            .buffer
+            .set_input("configuration configure conf");
+        press(
+            &mut app,
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(
+            app.current().buffer.input(),
+            "configuration configure configur"
+        );
+        assert!(app.completions.is_some());
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.completions.is_none());
+        assert_eq!(
+            app.current().buffer.input(),
+            "configuration configure configurx"
+        );
     }
 
     #[test]

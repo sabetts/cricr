@@ -234,6 +234,16 @@ fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    if let Some(candidates) = &app.completions {
+        let lines: Vec<RLine> = candidates
+            .iter()
+            .take(5)
+            .map(|candidate| RLine::from(RSpan::raw(format!("  {candidate}"))))
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
+
     let text = if app.search.active {
         let prefix = match app.search.direction {
             SearchDirection::Forward => "I-search",

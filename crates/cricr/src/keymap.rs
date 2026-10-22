@@ -21,6 +21,7 @@ pub enum Action {
     TransposeChars,
     TransposeWords,
     DabbrevExpand,
+    DabbrevComplete,
     BeginningOfBuffer,
     EndOfBuffer,
     PageUp,
@@ -58,11 +59,12 @@ pub fn translate(key: KeyEvent) -> Action {
         KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
         KeyCode::Char('\0') | KeyCode::Null => SetMark,
         // C-M-< / C-M-> are aliases for beginning/end of buffer; C-M-_ (like
-        // C-?) redoes, matching Emacs.
+        // C-?) redoes; C-M-/ completes the abbreviation (dabbrev-completion).
         KeyCode::Char(c) if ctrl && alt => match c.to_ascii_lowercase() {
             '<' => BeginningOfBuffer,
             '>' => EndOfBuffer,
-            '_' | '-' | '/' | '?' => Redo,
+            '_' | '-' | '?' => Redo,
+            '/' => DabbrevComplete,
             _ => None,
         },
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
@@ -286,7 +288,7 @@ mod tests {
 
     #[test]
     fn redo_bindings() {
-        for c in ['_', '-', '/', '?'] {
+        for c in ['_', '-', '?'] {
             assert_eq!(
                 translate(key(
                     KeyCode::Char(c),
@@ -298,6 +300,17 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('?'), KeyModifiers::CONTROL)),
             Action::Redo
+        );
+    }
+
+    #[test]
+    fn dabbrev_completion_binding() {
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('/'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::DabbrevComplete
         );
     }
 
