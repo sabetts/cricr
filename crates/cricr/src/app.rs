@@ -2774,7 +2774,17 @@ impl App {
                 self.search.query.pop();
                 self.search_run(false);
             }
-            KeyCode::Enter => self.search.accept(),
+            KeyCode::Enter => {
+                let end = if self.search.direction == SearchDirection::Forward {
+                    self.search.match_end
+                } else {
+                    None
+                };
+                self.search.accept();
+                if let Some(end) = end {
+                    self.current_mut().buffer.set_point(end);
+                }
+            }
             KeyCode::Esc => self.cancel_search(),
             _ => {}
         }
@@ -4273,6 +4283,29 @@ mod tests {
         assert!(matches!(app.prompt, Prompt::BrowseUrl { .. }));
         assert!(app.prefix_echo.is_none());
         assert_ne!(app.message.as_deref(), Some("C-c-"));
+    }
+
+    #[test]
+    fn enter_accepts_forward_search_at_match_end() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("beta");
+            b.push_plain("gamma");
+            b.beginning_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for c in "beta".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 0));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 4));
     }
 
     #[test]

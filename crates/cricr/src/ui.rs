@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Prompt};
 use crate::buffer::{Color, Line, Pos, Style};
-use crate::search::SearchDirection;
+use crate::search::{Search, SearchDirection};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let minibuffer = app.minibuffer_height().max(1);
@@ -33,6 +33,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let point = buf.point();
+    let cursor_point = display_point(&app.search, point);
     let highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
     } else {
@@ -59,12 +60,12 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
             app.theme.lazy_highlight,
             app.theme.isearch,
         );
-        let (chunk, col) = wrap_position(point.col, width);
+        let (chunk, col) = wrap_position(cursor_point.col, width);
         (wrap_cells(&cells, width), chunk, col)
     } else {
         (Vec::new(), 0, 0)
     };
-    if buf.is_irc() && point.row == prompt_row && cursor_chunk >= prompt_chunks.len() {
+    if buf.is_irc() && cursor_point.row == prompt_row && cursor_chunk >= prompt_chunks.len() {
         // Point at the start of a fresh visual row (e.g. exactly at the wrap
         // boundary), so make room for the cursor.
         prompt_chunks.resize(cursor_chunk + 1, Vec::new());
@@ -75,10 +76,10 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         buf.len()
     };
-    let cursor_display = if buf.is_irc() && point.row == prompt_row {
+    let cursor_display = if buf.is_irc() && cursor_point.row == prompt_row {
         prompt_row + cursor_chunk
     } else {
-        point.row
+        cursor_point.row
     };
 
     let bottom_anchored = buf.is_irc() && buf.scroll() + height >= buf.len();
@@ -90,7 +91,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
             let chunk = display - prompt_row;
             if let Some(cells) = prompt_chunks.get(chunk) {
                 let mut cells = cells.clone();
-                if point.row == prompt_row
+                if cursor_point.row == prompt_row
                     && matches!(app.prompt, Prompt::None)
                     && chunk == cursor_chunk
                 {
@@ -110,13 +111,23 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
             app.theme.lazy_highlight,
             app.theme.isearch,
         );
-        if row == point.row && matches!(app.prompt, Prompt::None) {
-            place_cursor(&mut cells, point.col, app.cursor_style);
+        if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
+            place_cursor(&mut cells, cursor_point.col, app.cursor_style);
         }
         lines.push(to_rline(&cells));
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Where to draw the point. During a forward isearch Emacs leaves point at the
+/// end of the match; backward searches leave it at the beginning.
+fn display_point(search: &Search, point: Pos) -> Pos {
+    if search.active && search.direction == SearchDirection::Forward {
+        search.match_end.unwrap_or(point)
+    } else {
+        point
+    }
 }
 
 /// Split `cells` into hard-wrapped display rows, preserving every character.
@@ -389,6 +400,19 @@ mod tests {
         let cursor = Style::fg(Color::Black).bg(Color::Yellow);
         place_cursor(&mut cells, 0, cursor);
         assert_eq!(cells[0].1, cursor);
+    }
+
+    #[test]
+    fn isearch_cursor_sits_at_the_match_edge() {
+        let mut search = Search {
+            active: true,
+            direction: SearchDirection::Forward,
+            match_end: Some(Pos::new(0, 4)),
+            ..Search::default()
+        };
+        assert_eq!(display_point(&search, Pos::new(0, 0)), Pos::new(0, 4));
+        search.direction = SearchDirection::Backward;
+        assert_eq!(display_point(&search, Pos::new(0, 0)), Pos::new(0, 0));
     }
 
     #[test]
