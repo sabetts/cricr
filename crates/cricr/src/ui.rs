@@ -67,13 +67,8 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         point.row
     };
 
-    let mut top = buf.scroll().min(total.saturating_sub(1));
-    if cursor_display < top {
-        top = cursor_display;
-    }
-    if cursor_display >= top + height {
-        top = cursor_display + 1 - height;
-    }
+    let bottom_anchored = buf.is_irc() && buf.scroll() + height >= buf.len();
+    let top = display_top(buf.scroll(), total, height, cursor_display, bottom_anchored);
 
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
     for display in top..(top + height).min(total) {
@@ -120,6 +115,29 @@ fn wrap_position(col: usize, width: usize) -> (usize, usize) {
         Some(row) => (row, col % width),
         None => (0, col),
     }
+}
+
+/// The first display row to draw. When the logical window reaches the end of
+/// the buffer, anchor the display to the bottom so a wrapping prompt stays
+/// fully visible while point moves within it.
+fn display_top(
+    scroll: usize,
+    total: usize,
+    height: usize,
+    cursor: usize,
+    bottom_anchored: bool,
+) -> usize {
+    let mut top = scroll.min(total.saturating_sub(1));
+    if bottom_anchored {
+        top = total.saturating_sub(height);
+    }
+    if cursor < top {
+        top = cursor;
+    }
+    if cursor >= top + height {
+        top = cursor + 1 - height;
+    }
+    top
 }
 
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -308,5 +326,22 @@ mod tests {
         assert_eq!(wrap_position(3, 4), (0, 3));
         assert_eq!(wrap_position(4, 4), (1, 0));
         assert_eq!(wrap_position(7, 4), (1, 3));
+    }
+
+    #[test]
+    fn bottom_anchored_window_stays_put_within_wrapped_prompt() {
+        // A three-row prompt ending at display row 24 stays fully visible as
+        // the cursor moves from its start to its end.
+        assert_eq!(display_top(13, 25, 10, 22, true), 15);
+        assert_eq!(display_top(13, 25, 10, 24, true), 15);
+        // Moving above the window's top edge does scroll it.
+        assert_eq!(display_top(13, 25, 10, 14, true), 14);
+    }
+
+    #[test]
+    fn window_scrolls_only_at_the_edges() {
+        assert_eq!(display_top(5, 25, 10, 5, false), 5);
+        assert_eq!(display_top(5, 25, 10, 14, false), 5);
+        assert_eq!(display_top(5, 25, 10, 16, false), 7);
     }
 }
