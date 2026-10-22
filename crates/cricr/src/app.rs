@@ -1617,6 +1617,35 @@ impl App {
         urls
     }
 
+    /// The URL under point on the current line, if any.
+    fn url_at_point(&self) -> Option<String> {
+        let buf = &self.current().buffer;
+        let point = buf.point();
+        let text = buf.line(point.row).text();
+        let chars: Vec<char> = text.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() {
+            if chars[idx].is_whitespace() {
+                idx += 1;
+                continue;
+            }
+            let start = idx;
+            while idx < chars.len() && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+            let token: String = chars[start..idx].iter().collect();
+            let Some(url) = extract_url(&token) else {
+                continue;
+            };
+            let byte = token.find(&url).unwrap_or(0);
+            let col = start + token[..byte].chars().count();
+            if point.col >= col && point.col < col + url.chars().count() {
+                return Some(url);
+            }
+        }
+        None
+    }
+
     fn prompt_move(&mut self, count: usize, delta: isize) {
         let selected = match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. }
@@ -2269,6 +2298,13 @@ impl App {
                 }
             }
             Send => {
+                if self.current().buffer.is_irc() && !self.current().buffer.editable() {
+                    // RET on a URL in the scrollback opens it.
+                    if let Some(url) = self.url_at_point() {
+                        self.open_url(&url);
+                        return;
+                    }
+                }
                 if matches!(self.current().kind, Kind::Scratch | Kind::Help) {
                     self.current_mut().buffer.insert_newline();
                 } else {
@@ -6262,6 +6298,24 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.text == "https://example.com/x" && s.style.bold));
+    }
+
+    #[test]
+    fn url_at_point_finds_the_url_under_cursor() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("see https://example.com/x now");
+            b.set_point(Pos::new(0, 8));
+        }
+        assert_eq!(app.url_at_point().as_deref(), Some("https://example.com/x"));
+        // Whitespace outside the URL does not count.
+        app.current_mut().buffer.set_point(Pos::new(0, 3));
+        assert_eq!(app.url_at_point(), None);
+        app.current_mut().buffer.set_point(Pos::new(0, 27));
+        assert_eq!(app.url_at_point(), None);
     }
 
     #[test]

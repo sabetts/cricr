@@ -6,7 +6,7 @@
 * input line needs to wrap long lines.
 * does C-c C-b reset the unread line?
 * DONE movement keys like C-f/C-n/C-p/C-M-< should exit isearch
-* pressing RET on an url should open it
+* DONE pressing RET on an url should open it
 
 
 * first connecting to entry needs a tiple * marker
