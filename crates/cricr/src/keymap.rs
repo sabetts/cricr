@@ -58,15 +58,22 @@ pub fn translate(key: KeyEvent) -> Action {
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
         KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
         KeyCode::Char('\0') | KeyCode::Null => SetMark,
-        // C-M-< / C-M-> are aliases for beginning/end of buffer; C-M-_ (like
-        // C-?) redoes; C-M-/ completes the abbreviation (dabbrev-completion).
-        KeyCode::Char(c) if ctrl && alt => match c.to_ascii_lowercase() {
-            '<' => BeginningOfBuffer,
-            '>' => EndOfBuffer,
-            '_' | '-' | '?' => Redo,
-            '/' => DabbrevComplete,
-            _ => None,
-        },
+        // C-M-< / C-M-> are aliases for beginning/end of buffer. On Windows
+        // terminals (notably Alacritty) C-M-/ is often reported as C-M-- or
+        // as the raw 0x1f control code, so treat the unshifted forms as
+        // dabbrev-completion; C-M-_ stays redo.
+        KeyCode::Char(c) if ctrl && alt => {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            match c.to_ascii_lowercase() {
+                '<' => BeginningOfBuffer,
+                '>' => EndOfBuffer,
+                '/' | '\u{1f}' => DabbrevComplete,
+                '-' if shift => Redo,
+                '-' => DabbrevComplete,
+                '_' | '?' => Redo,
+                _ => None,
+            }
+        }
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
             'f' => ForwardChar,
             'b' => BackwardChar,
@@ -103,6 +110,7 @@ pub fn translate(key: KeyEvent) -> Action {
             't' | 'T' => TransposeWords,
             'd' | 'D' => KillWord,
             '/' => DabbrevExpand,
+            '\u{1f}' => DabbrevComplete,
             'v' | 'V' => PageUp,
             '<' => BeginningOfBuffer,
             '>' => EndOfBuffer,
@@ -288,7 +296,7 @@ mod tests {
 
     #[test]
     fn redo_bindings() {
-        for c in ['_', '-', '?'] {
+        for c in ['_', '?'] {
             assert_eq!(
                 translate(key(
                     KeyCode::Char(c),
@@ -297,6 +305,13 @@ mod tests {
                 Action::Redo
             );
         }
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('-'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Action::Redo
+        );
         assert_eq!(
             translate(key(KeyCode::Char('?'), KeyModifiers::CONTROL)),
             Action::Redo
@@ -308,6 +323,21 @@ mod tests {
         assert_eq!(
             translate(key(
                 KeyCode::Char('/'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::DabbrevComplete
+        );
+        // Alacritty on Windows encodes C-M-/ as C-M-- (or raw 0x1f).
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('-'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::DabbrevComplete
+        );
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('\u{1f}'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT
             )),
             Action::DabbrevComplete

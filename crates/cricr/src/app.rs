@@ -1402,6 +1402,7 @@ impl App {
                 KeyCode::Char('b') => self.start_switch_buffer(),
                 KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
+                KeyCode::Char('/') => self.dabbrev_complete(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
             },
@@ -4026,6 +4027,7 @@ fn help_lines() -> Vec<String> {
         "  M-u / M-l      upcase / downcase word",
         "  M-/            dabbrev-expand (complete from a word in the buffer)",
         "  C-M-/          dabbrev-completion (complete prefix and list matches)",
+        "  C-x /          dabbrev-completion fallback for terminals that drop C-M-/",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
         "  M-d            kill word forward",
@@ -6577,6 +6579,24 @@ mod tests {
             app.current().buffer.input(),
             "configuration configure configurx"
         );
+    }
+
+    #[test]
+    fn c_x_slash_also_runs_dabbrev_completion() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut()
+            .buffer
+            .set_input("configuration configure conf");
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(
+            app.current().buffer.input(),
+            "configuration configure configur"
+        );
+        assert!(app.completions.is_some());
     }
 
     #[test]
