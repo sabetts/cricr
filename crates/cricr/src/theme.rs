@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use crate::buffer::Style;
+use crate::buffer::{Color, Style};
 
 /// Which background the terminal uses, selecting the rcirc face variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -39,6 +39,10 @@ pub struct Theme {
     pub warning: Style,
     pub track_nick: Style,
     pub track_keyword: Style,
+    /// `lazy-highlight`: other matches during isearch.
+    pub lazy_highlight: Style,
+    /// `isearch`: the current match.
+    pub isearch: Style,
 }
 
 impl Theme {
@@ -60,6 +64,10 @@ impl Theme {
                 warning: Style::rgb(0xff, 0x00, 0x00).bold(),
                 track_nick: Style::default().reverse(),
                 track_keyword: Style::default().bold(),
+                // isearch.el: (:background "paleturquoise4" :distant-foreground "white")
+                lazy_highlight: Style::fg(Color::White).bg(Color::Rgb(0x66, 0x8b, 0x8b)),
+                // isearch.el: (:background "palevioletred2" :foreground "brown4")
+                isearch: Style::fg(Color::Rgb(0x8b, 0x23, 0x23)).bg(Color::Rgb(0xee, 0x79, 0x9f)),
             },
             Background::Light => Theme {
                 my_nick: Style::rgb(0x00, 0x00, 0xff),     // Blue1
@@ -76,6 +84,10 @@ impl Theme {
                 warning: Style::rgb(0x8b, 0x00, 0x00).bold(), // dark red
                 track_nick: Style::default().reverse(),
                 track_keyword: Style::default().bold(),
+                // isearch.el: (:background "paleturquoise" :distant-foreground "black")
+                lazy_highlight: Style::fg(Color::Black).bg(Color::Rgb(0xaf, 0xee, 0xee)),
+                // isearch.el: (:background "magenta3" :foreground "lightskyblue1")
+                isearch: Style::fg(Color::Rgb(0xb0, 0xe2, 0xff)).bg(Color::Rgb(0xcd, 0x00, 0xcd)),
             },
         }
     }
@@ -92,6 +104,9 @@ mod tests {
         assert_eq!(theme.other_nick, Style::rgb(0xee, 0xdd, 0x82));
         assert!(theme.url.bold);
         assert!(theme.track_nick.reverse);
+        assert_eq!(theme.lazy_highlight.bg, Color::Rgb(0x66, 0x8b, 0x8b));
+        assert_eq!(theme.isearch.bg, Color::Rgb(0xee, 0x79, 0x9f));
+        assert_eq!(theme.isearch.color, Color::Rgb(0x8b, 0x23, 0x23));
     }
 
     #[test]
@@ -99,5 +114,7 @@ mod tests {
         let theme = Theme::for_background(Background::Light);
         assert_eq!(theme.my_nick, Style::rgb(0x00, 0x00, 0xff));
         assert_eq!(theme.server, Style::rgb(0xb2, 0x22, 0x22));
+        assert_eq!(theme.lazy_highlight.bg, Color::Rgb(0xaf, 0xee, 0xee));
+        assert_eq!(theme.isearch.bg, Color::Rgb(0xcd, 0x00, 0xcd));
     }
 }
