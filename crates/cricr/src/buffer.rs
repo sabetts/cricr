@@ -571,6 +571,8 @@ impl Buffer {
         if self.point.row < self.last_row() {
             self.point.row += 1;
             self.point.col = self.clamp_col(self.point.row, self.point.col);
+        } else {
+            self.point.col = self.lines[self.point.row].char_len();
         }
         self.scroll_into_view();
     }
@@ -1739,6 +1741,15 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b.line(0).text(), "");
         assert_eq!(b.point(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn next_line_at_end_moves_to_line_end() {
+        let mut b = Buffer::text();
+        b.insert_str("abc");
+        b.beginning_of_buffer();
+        b.next_line();
+        assert_eq!(b.point(), Pos::new(0, 3));
     }
 
     #[test]

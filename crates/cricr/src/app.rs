@@ -2390,7 +2390,11 @@ impl App {
     fn move_lines(&mut self, n: i32) {
         for _ in 0..n.abs() {
             if n >= 0 {
+                let at_last = self.current().buffer.point().row == self.current().buffer.last_row();
                 self.current_mut().buffer.next_line();
+                if at_last {
+                    self.message = Some("End of buffer".to_string());
+                }
             } else {
                 self.current_mut().buffer.prev_line();
             }
@@ -6275,6 +6279,20 @@ mod tests {
         // A third cycles back to the first.
         app.perform(Action::DabbrevExpand);
         assert_eq!(app.current().buffer.input(), "regina reginald reginald");
+    }
+
+    #[test]
+    fn c_n_on_last_line_reports_end_of_buffer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello");
+        app.current_mut().buffer.beginning_of_line();
+        let base = app.current().buffer.prompt_len();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point().col, base + 5);
+        assert_eq!(app.message.as_deref(), Some("End of buffer"));
     }
 
     #[test]
