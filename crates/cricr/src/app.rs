@@ -15,7 +15,9 @@ use cricr_irc::commands::{self, LocalCommand, ParsedInput};
 use cricr_irc::message::Tag;
 use cricr_irc::{ClientCommand, ClientConfig, ClientHandle, Event};
 
-use crate::buffer::{Buffer, Color, Line, Pos, Span, Style};
+use crate::buffer::{
+    transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Span, Style,
+};
 use crate::config::Config;
 use crate::history;
 use crate::input::History;
@@ -1722,6 +1724,40 @@ impl App {
         self.prompt_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
     }
 
+    /// Transpose the characters around the cursor (`C-t`).
+    fn prompt_transpose_chars(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                let mut chars: Vec<char> = input.chars().collect();
+                if let Some(new_cursor) = transpose_chars_at(&mut chars, *cursor) {
+                    *input = chars.into_iter().collect();
+                    *cursor = new_cursor;
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
+    /// Transpose the words around the cursor (`M-t`).
+    fn prompt_transpose_words(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                let mut chars: Vec<char> = input.chars().collect();
+                if let Some(new_cursor) = transpose_words_at(&mut chars, *cursor) {
+                    *input = chars.into_iter().collect();
+                    *cursor = new_cursor;
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
     /// Change the case of the word after the cursor, moving the cursor past it.
     fn prompt_case_word(&mut self, transform: impl Fn(&[char]) -> String) {
         if self
@@ -1935,6 +1971,8 @@ impl App {
             ForwardWord => self.prompt_forward_word(),
             UpcaseWord => self.prompt_upcase_word(),
             DowncaseWord => self.prompt_downcase_word(),
+            TransposeChars => self.prompt_transpose_chars(),
+            TransposeWords => self.prompt_transpose_words(),
             DabbrevExpand => self.prompt_dabbrev_expand(),
             BackwardKillWord => self.prompt_backward_kill_word(),
             KillWord => self.prompt_kill_word(),
@@ -2204,6 +2242,8 @@ impl App {
             BackwardWord => self.move_words(-n),
             UpcaseWord => self.case_words(n, true),
             DowncaseWord => self.case_words(n, false),
+            TransposeChars => self.current_mut().buffer.transpose_chars(),
+            TransposeWords => self.current_mut().buffer.transpose_words(),
             DabbrevExpand => self.dabbrev_expand(),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
@@ -5845,6 +5885,41 @@ mod tests {
     }
 
     #[test]
+    fn transpose_actions_edit_buffer_input() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("teh");
+        app.perform(Action::TransposeChars);
+        assert_eq!(app.current().buffer.input(), "the");
+        app.current_mut().buffer.set_input("hello world");
+        app.perform(Action::TransposeWords);
+        assert_eq!(app.current().buffer.input(), "world hello");
+    }
+
+    #[test]
+    fn prompt_transpose_bindings() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "teh".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(prompt_input(&app), "the");
+        assert_eq!(prompt_cursor(&app), 3);
+
+        let mut app = app_without_servers();
+        app.start_browse_url();
+        for c in "hello world".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT);
+        assert_eq!(prompt_input(&app), "world hello");
+        assert_eq!(prompt_cursor(&app), 11);
+    }
+
+    #[test]
     fn dabbrev_expand_cycles_candidates() {
         let mut app = app_without_servers();
         let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
@@ -5902,8 +5977,14 @@ mod tests {
         press(&mut app, KeyCode::Char('-'), KeyModifiers::ALT);
         press(&mut app, KeyCode::Char('u'), KeyModifiers::ALT);
         assert_eq!(app.current().buffer.input(), "hello WORLD");
-        // Point ends at the start of the affected word.
-        assert_eq!(app.current().buffer.point().col, base + 6);
+        // Point stays where it was (at the end of the line).
+        assert_eq!(app.current().buffer.point().col, base + 11);
+
+        app.current_mut().buffer.set_input("hello WORLD");
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::ALT);
+        assert_eq!(app.current().buffer.input(), "hello world");
+        assert_eq!(app.current().buffer.point().col, base + 11);
     }
 
     #[test]
