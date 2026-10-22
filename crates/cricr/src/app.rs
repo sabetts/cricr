@@ -246,6 +246,8 @@ pub struct App {
     /// Whether kills/copies are written to the system clipboard (OSC 52).
     pub clipboard: bool,
     pub theme: Theme,
+    /// Colors used to draw the point, independent of the text under it.
+    pub cursor_style: Style,
     pub should_quit: bool,
     pub prompt: Prompt,
     /// Height of the minibuffer during the current prompt, never shrinking as
@@ -287,6 +289,8 @@ impl App {
         let fill_column = config.ui.fill_column;
         let clipboard = config.ui.clipboard;
         let theme = Theme::for_background(config.ui.background);
+        let cursor_style = Style::fg(Color::parse(&config.ui.cursor_fg).unwrap_or(Color::Black))
+            .bg(Color::parse(&config.ui.cursor_bg).unwrap_or(Color::Yellow));
         let history_dir = history::dir(&config);
         let mut app = App {
             config,
@@ -306,6 +310,7 @@ impl App {
             fill_column,
             clipboard,
             theme,
+            cursor_style,
             should_quit: false,
             prompt: Prompt::None,
             minibuffer_rows: 1,

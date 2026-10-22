@@ -151,6 +151,10 @@ pub struct UiConfig {
     pub title_badge: bool,
     /// Which rcirc face variant to use: `"dark"` (default) or `"light"`.
     pub background: Background,
+    /// Cursor foreground color (a name like `"black"` or `#rrggbb`).
+    pub cursor_fg: String,
+    /// Cursor background color.
+    pub cursor_bg: String,
 }
 
 impl Default for UiConfig {
@@ -162,6 +166,8 @@ impl Default for UiConfig {
             clipboard: true,
             title_badge: true,
             background: Background::Dark,
+            cursor_fg: "black".to_string(),
+            cursor_bg: "yellow".to_string(),
         }
     }
 }
@@ -183,6 +189,8 @@ fill_column = 80      # word-wrap messages at this column (0 = off)
 clipboard = true      # mirror kills/copies to the system clipboard (OSC 52)
 title_badge = true    # show buffers with activity in the terminal title (OSC 2)
 background = "dark"   # or "light"
+cursor_fg = "black"   # cursor text color (name or #rrggbb)
+cursor_bg = "yellow"  # cursor background color
 
 # After an unexpected drop cricr reconnects with exponential backoff: it waits
 # initial_secs, then doubles the delay on each failed attempt until max_secs.
@@ -359,6 +367,17 @@ mod tests {
         assert!(cfg.ui.title_badge);
         assert!(TEMPLATE.contains("title_badge"));
         assert_eq!(cfg.ui.background, Background::Dark);
+        assert_eq!(cfg.ui.cursor_fg, "black");
+        assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert!(TEMPLATE.contains("cursor_bg"));
+    }
+
+    #[test]
+    fn cursor_colors_are_configurable() {
+        let cfg: Config =
+            toml::from_str("[ui]\ncursor_fg = \"#ffffff\"\ncursor_bg = \"blue\"\n").unwrap();
+        assert_eq!(cfg.ui.cursor_fg, "#ffffff");
+        assert_eq!(cfg.ui.cursor_bg, "blue");
     }
 
     #[test]

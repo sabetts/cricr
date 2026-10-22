@@ -80,7 +80,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
                     && matches!(app.prompt, Prompt::None)
                     && chunk == cursor_chunk
                 {
-                    place_point_cursor(&mut cells, cursor_col, app.search.active);
+                    place_cursor(&mut cells, cursor_col, app.cursor_style);
                 }
                 lines.push(to_rline(&cells));
             }
@@ -90,7 +90,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
         if row == point.row && matches!(app.prompt, Prompt::None) {
-            place_point_cursor(&mut cells, point.col, app.search.active);
+            place_cursor(&mut cells, point.col, app.cursor_style);
         }
         lines.push(to_rline(&cells));
     }
@@ -188,7 +188,7 @@ fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
         let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
         // Show the cursor at the edit position within the prompt input.
         let mut cells: Vec<(char, Style)> = prompt.chars().map(|c| (c, Style::default())).collect();
-        place_cursor(&mut cells, cursor);
+        place_cursor(&mut cells, cursor, app.cursor_style);
         lines.push(to_rline(&cells));
         for (i, candidate) in candidates.iter().enumerate() {
             let style = if i == selected {
@@ -236,22 +236,7 @@ fn apply_highlights(cells: &mut [(char, Style)], row: usize, highlights: &[(Pos,
     }
 }
 
-fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize) {
-    if col < cells.len() {
-        cells[col].1 = cells[col].1.reverse();
-    } else {
-        cells.push((' ', Style::default().reverse()));
-    }
-}
-
-/// Place the point's cursor. During isearch the match highlight is also
-/// reverse-video, so use a distinctive color to keep point visible.
-fn place_point_cursor(cells: &mut Vec<(char, Style)>, col: usize, searching: bool) {
-    if !searching {
-        place_cursor(cells, col);
-        return;
-    }
-    let style = Style::fg(Color::Red).reverse().bold();
+fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize, style: Style) {
     if col < cells.len() {
         cells[col].1 = style;
     } else {
@@ -284,7 +269,9 @@ fn to_rline(cells: &[(char, Style)]) -> RLine<'static> {
 }
 
 fn rstyle(style: Style) -> RStyle {
-    let mut out = RStyle::default().fg(rcolor(style.color));
+    let mut out = RStyle::default()
+        .fg(rcolor(style.color))
+        .bg(rcolor(style.bg));
     if style.bold {
         out = out.add_modifier(Modifier::BOLD);
     }
@@ -361,11 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn search_cursor_stands_out_from_reverse_highlights() {
-        let mut cells = vec![('a', Style::default().reverse())];
-        place_point_cursor(&mut cells, 0, true);
-        assert_eq!(cells[0].1.color, Color::Red);
-        assert!(cells[0].1.reverse);
-        assert!(cells[0].1.bold);
+    fn cursor_style_is_independent_of_the_text_under_it() {
+        let mut cells = vec![('a', Style::fg(Color::Green).bold())];
+        let cursor = Style::fg(Color::Black).bg(Color::Yellow);
+        place_cursor(&mut cells, 0, cursor);
+        assert_eq!(cells[0].1, cursor);
     }
 }
