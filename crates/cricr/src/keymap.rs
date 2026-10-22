@@ -28,6 +28,7 @@ pub enum Action {
     DeleteBackward,
     DeleteForward,
     Undo,
+    Redo,
     BackwardKillWord,
     KillWord,
     KillLine,
@@ -56,9 +57,14 @@ pub fn translate(key: KeyEvent) -> Action {
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
         KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
         KeyCode::Char('\0') | KeyCode::Null => SetMark,
-        // C-M-< / C-M-> are aliases for beginning/end of buffer.
-        KeyCode::Char('<') if ctrl && alt => BeginningOfBuffer,
-        KeyCode::Char('>') if ctrl && alt => EndOfBuffer,
+        // C-M-< / C-M-> are aliases for beginning/end of buffer; C-M-_ (like
+        // C-?) redoes, matching Emacs.
+        KeyCode::Char(c) if ctrl && alt => match c.to_ascii_lowercase() {
+            '<' => BeginningOfBuffer,
+            '>' => EndOfBuffer,
+            '_' | '-' | '/' | '?' => Redo,
+            _ => None,
+        },
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
             'f' => ForwardChar,
             'b' => BackwardChar,
@@ -77,8 +83,10 @@ pub fn translate(key: KeyEvent) -> Action {
             'q' => QuotedInsert,
             't' => TransposeChars,
             // Emacs spells undo `C-_`; terminals often report it as C-- or
-            // C-/, depending on the layout.
+            // C-/, depending on the layout. `C-?` is redo where it arrives
+            // as a character instead of DEL.
             '_' | '-' | '/' => Undo,
+            '?' => Redo,
             // The Alacritty NUL workaround for C-SPC arrives via ConPTY as
             // Ctrl+Shift+2 on a US layout.
             #[cfg(windows)]
@@ -273,6 +281,23 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('/'), KeyModifiers::CONTROL)),
             Action::Undo
+        );
+    }
+
+    #[test]
+    fn redo_bindings() {
+        for c in ['_', '-', '/', '?'] {
+            assert_eq!(
+                translate(key(
+                    KeyCode::Char(c),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                )),
+                Action::Redo
+            );
+        }
+        assert_eq!(
+            translate(key(KeyCode::Char('?'), KeyModifiers::CONTROL)),
+            Action::Redo
         );
     }
 

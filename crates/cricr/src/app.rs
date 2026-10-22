@@ -2337,6 +2337,7 @@ impl App {
             DeleteBackward => self.delete_chars(-n),
             DeleteForward => self.delete_chars(n),
             Undo => self.undo(),
+            Redo => self.redo(),
             BackwardKillWord => {
                 let killed = self.current_mut().buffer.backward_kill_word();
                 self.kill_new(&killed, prev == LastCommand::Kill);
@@ -2564,6 +2565,15 @@ impl App {
             self.message = Some("Undo".to_string());
         } else {
             self.message = Some("No further undo information".to_string());
+        }
+    }
+
+    /// `C-M-_` / `C-?`: redo the last undone input-line edit.
+    fn redo(&mut self) {
+        if self.current_mut().buffer.redo() {
+            self.message = Some("Redo".to_string());
+        } else {
+            self.message = Some("No undone changes to redo".to_string());
         }
     }
 
@@ -3952,6 +3962,7 @@ fn help_lines() -> Vec<String> {
         "  M-d            kill word forward",
         "  C-d            delete character forward",
         "  C-_ / C--      undo an edit on the input line",
+        "  C-M-_ / C-?    redo an undone edit",
         "  C-SPC          set mark",
         "  C-w / M-w      kill / copy region",
         "  C-y / M-y      yank / yank-pop",
@@ -4640,6 +4651,39 @@ mod tests {
         app.switch_to(ch);
         press(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
         assert_eq!(app.message.as_deref(), Some("No further undo information"));
+    }
+
+    #[test]
+    fn ctrl_meta_underscore_redoes_input_edits() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.input(), "hello");
+        press(
+            &mut app,
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(app.current().buffer.input(), "hell");
+        assert_eq!(app.message.as_deref(), Some("Redo"));
+    }
+
+    #[test]
+    fn redo_without_an_undo_reports_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        press(
+            &mut app,
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(app.message.as_deref(), Some("No undone changes to redo"));
     }
 
     #[test]

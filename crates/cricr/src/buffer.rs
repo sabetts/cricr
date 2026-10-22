@@ -355,6 +355,7 @@ pub struct Buffer {
     mark: Option<Pos>,
     scroll: usize,
     undo: Vec<InputUndo>,
+    redo: Vec<InputUndo>,
 }
 
 impl Buffer {
@@ -371,6 +372,7 @@ impl Buffer {
             mark: None,
             scroll: 0,
             undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -385,6 +387,7 @@ impl Buffer {
             mark: None,
             scroll: 0,
             undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -396,6 +399,7 @@ impl Buffer {
             lines
         };
         self.undo.clear();
+        self.redo.clear();
         self.point = Pos::new(0, 0);
         self.scroll = 0;
         self.mark = None;
@@ -412,6 +416,7 @@ impl Buffer {
         self.scroll = 0;
         self.mark = None;
         self.undo.clear();
+        self.redo.clear();
     }
 
     /// Set the style used to render the prompt (e.g. `rcirc-prompt`).
@@ -558,6 +563,7 @@ impl Buffer {
         self.scroll = 0;
         self.point = Pos::new(0, self.prompt_len);
         self.undo.clear();
+        self.redo.clear();
     }
 
     /// The current input text (the prompt line after the prompt). Empty for
@@ -587,28 +593,50 @@ impl Buffer {
         self.input_set(text);
         self.point = Pos::new(self.last_row(), self.prompt_len + text.chars().count());
         self.undo.clear();
+        self.redo.clear();
     }
 
     /// Record the current input line before an edit. Point is stored relative
     /// to the prompt so later scrollback insertions cannot invalidate it.
     fn record_input_undo(&mut self) {
-        if !self.is_irc() {
-            return;
-        }
-        let text = self.input();
-        let col = self.point.col.saturating_sub(self.prompt_len);
+        let entry = self.current_input_state();
         if self
             .undo
             .last()
-            .is_some_and(|u| u.text == text && u.col == col)
+            .is_some_and(|u| u.text == entry.text && u.col == entry.col)
         {
             return;
         }
-        const MAX_UNDO: usize = 200;
-        if self.undo.len() == MAX_UNDO {
-            self.undo.remove(0);
+        // A fresh edit ends the redo branch.
+        self.redo.clear();
+        Self::push_history(&mut self.undo, entry);
+    }
+
+    fn current_input_state(&self) -> InputUndo {
+        let text = self.input();
+        let col = if self.point.row == self.last_row() {
+            self.point.col.saturating_sub(self.prompt_len)
+        } else {
+            // Point is in the scrollback: redo at the end of the input.
+            text.chars().count()
+        };
+        InputUndo { text, col }
+    }
+
+    fn push_history(stack: &mut Vec<InputUndo>, entry: InputUndo) {
+        const MAX_HISTORY: usize = 200;
+        if stack.len() == MAX_HISTORY {
+            stack.remove(0);
         }
-        self.undo.push(InputUndo { text, col });
+        stack.push(entry);
+    }
+
+    fn restore_input_state(&mut self, entry: &InputUndo) {
+        self.input_set(&entry.text);
+        let len = entry.text.chars().count();
+        self.point = Pos::new(self.last_row(), self.prompt_len + entry.col.min(len));
+        self.mark = None;
+        self.scroll_into_view();
     }
 
     /// Undo the most recent input-line edit. Returns `false` if there is
@@ -620,11 +648,24 @@ impl Buffer {
         let Some(entry) = self.undo.pop() else {
             return false;
         };
-        self.input_set(&entry.text);
-        let len = entry.text.chars().count();
-        self.point = Pos::new(self.last_row(), self.prompt_len + entry.col.min(len));
-        self.mark = None;
-        self.scroll_into_view();
+        let current = self.current_input_state();
+        Self::push_history(&mut self.redo, current);
+        self.restore_input_state(&entry);
+        true
+    }
+
+    /// Redo the most recently undone input-line edit. Returns `false` if
+    /// there is nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        if !self.is_irc() {
+            return false;
+        }
+        let Some(entry) = self.redo.pop() else {
+            return false;
+        };
+        let current = self.current_input_state();
+        Self::push_history(&mut self.undo, current);
+        self.restore_input_state(&entry);
         true
     }
 
@@ -1877,6 +1918,49 @@ mod tests {
         assert!(b.undo());
         assert_eq!(b.input(), "");
         assert!(!b.undo());
+    }
+
+    #[test]
+    fn undo_and_redo_walk_the_edit_history() {
+        let mut b = Buffer::new("> ");
+        b.insert_str("a");
+        b.insert_char('b');
+        b.insert_char('c');
+        assert!(b.undo());
+        assert_eq!(b.input(), "ab");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 4));
+        assert!(b.undo());
+        assert_eq!(b.input(), "a");
+        assert!(b.redo());
+        assert_eq!(b.input(), "ab");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 4));
+        assert!(b.redo());
+        assert_eq!(b.input(), "abc");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 5));
+        assert!(!b.redo());
+    }
+
+    #[test]
+    fn a_new_edit_clears_the_redo_branch() {
+        let mut b = Buffer::new("> ");
+        b.insert_str("a");
+        b.insert_char('b');
+        assert!(b.undo());
+        assert_eq!(b.input(), "a");
+        b.insert_char('c');
+        assert!(!b.redo());
+        assert_eq!(b.input(), "ac");
+    }
+
+    #[test]
+    fn redo_survives_new_output() {
+        let mut b = Buffer::new("> ");
+        b.insert_str("hello");
+        assert!(b.undo());
+        b.push_plain("incoming message");
+        assert!(b.redo());
+        assert_eq!(b.input(), "hello");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 7));
     }
 
     #[test]
