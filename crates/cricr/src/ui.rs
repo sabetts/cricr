@@ -27,27 +27,71 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     let buf = &app.current().buffer;
     let height = area.height as usize;
-    if height == 0 {
+    let width = area.width as usize;
+    if height == 0 || width == 0 {
         return;
     }
 
     let point = buf.point();
-    let mut top = buf.scroll();
-    if point.row < top {
-        top = point.row;
-    }
-    if point.row >= top + height {
-        top = point.row + 1 - height;
-    }
-
     let highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
     } else {
         Vec::new()
     };
 
+    // The prompt line is not stored wrapped, so split it for display. Every
+    // other logical line occupies one display row.
+    let prompt_row = buf.last_row();
+    let (mut prompt_chunks, cursor_chunk, cursor_col) = if buf.is_irc() {
+        let mut cells = line_cells(buf.line(prompt_row));
+        apply_highlights(&mut cells, prompt_row, &highlights);
+        let (chunk, col) = wrap_position(point.col, width);
+        (wrap_cells(&cells, width), chunk, col)
+    } else {
+        (Vec::new(), 0, 0)
+    };
+    if buf.is_irc() && point.row == prompt_row && cursor_chunk >= prompt_chunks.len() {
+        // Point at the start of a fresh visual row (e.g. exactly at the wrap
+        // boundary), so make room for the cursor.
+        prompt_chunks.resize(cursor_chunk + 1, Vec::new());
+    }
+    let prompt_height = prompt_chunks.len().max(1);
+    let total = if buf.is_irc() {
+        prompt_row + prompt_height
+    } else {
+        buf.len()
+    };
+    let cursor_display = if buf.is_irc() && point.row == prompt_row {
+        prompt_row + cursor_chunk
+    } else {
+        point.row
+    };
+
+    let mut top = buf.scroll().min(total.saturating_sub(1));
+    if cursor_display < top {
+        top = cursor_display;
+    }
+    if cursor_display >= top + height {
+        top = cursor_display + 1 - height;
+    }
+
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
-    for row in top..buf.len().min(top + height) {
+    for display in top..(top + height).min(total) {
+        if buf.is_irc() && display >= prompt_row {
+            let chunk = display - prompt_row;
+            if let Some(cells) = prompt_chunks.get(chunk) {
+                let mut cells = cells.clone();
+                if point.row == prompt_row
+                    && matches!(app.prompt, Prompt::None)
+                    && chunk == cursor_chunk
+                {
+                    place_cursor(&mut cells, cursor_col);
+                }
+                lines.push(to_rline(&cells));
+            }
+            continue;
+        }
+        let row = display;
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
         if row == point.row && matches!(app.prompt, Prompt::None) {
@@ -57,6 +101,25 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Split `cells` into hard-wrapped display rows, preserving every character.
+fn wrap_cells(cells: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
+    if width == 0 {
+        return vec![cells.to_vec()];
+    }
+    if cells.is_empty() {
+        return vec![Vec::new()];
+    }
+    cells.chunks(width).map(|chunk| chunk.to_vec()).collect()
+}
+
+/// The visual row and column of `col` when wrapped at `width`.
+fn wrap_position(col: usize, width: usize) -> (usize, usize) {
+    match col.checked_div(width) {
+        Some(row) => (row, col % width),
+        None => (0, col),
+    }
 }
 
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -221,5 +284,29 @@ fn rcolor(color: Color) -> RColor {
         Color::LightCyan => RColor::LightCyan,
         Color::White => RColor::White,
         Color::Rgb(r, g, b) => RColor::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_cells_without_losing_characters() {
+        let cells: Vec<(char, Style)> = "abcdef".chars().map(|c| (c, Style::default())).collect();
+        let chunks = wrap_cells(&cells, 4);
+        assert_eq!(chunks.len(), 2);
+        let text: String = chunks.iter().flatten().map(|(c, _)| *c).collect();
+        assert_eq!(text, "abcdef");
+        assert_eq!(chunks[0].len(), 4);
+        assert_eq!(chunks[1].len(), 2);
+    }
+
+    #[test]
+    fn wrap_position_maps_cursor_to_visual_row() {
+        assert_eq!(wrap_position(0, 4), (0, 0));
+        assert_eq!(wrap_position(3, 4), (0, 3));
+        assert_eq!(wrap_position(4, 4), (1, 0));
+        assert_eq!(wrap_position(7, 4), (1, 3));
     }
 }
