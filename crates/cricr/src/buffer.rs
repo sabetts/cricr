@@ -333,6 +333,15 @@ fn cells_to_line(cells: &[(char, Style)]) -> Line {
     Line::from_spans(spans)
 }
 
+/// A prior state of the input line, used to undo edits.
+#[derive(Debug, Clone)]
+struct InputUndo {
+    text: String,
+    /// Point as an offset from the prompt, so scrollback arriving between an
+    /// edit and its undo cannot move it.
+    col: usize,
+}
+
 /// The buffer model: scrollback lines plus a prompt line holding the input.
 #[derive(Debug, Clone)]
 pub struct Buffer {
@@ -345,6 +354,7 @@ pub struct Buffer {
     point: Pos,
     mark: Option<Pos>,
     scroll: usize,
+    undo: Vec<InputUndo>,
 }
 
 impl Buffer {
@@ -360,6 +370,7 @@ impl Buffer {
             point: Pos::new(0, prompt_len),
             mark: None,
             scroll: 0,
+            undo: Vec::new(),
         }
     }
 
@@ -373,6 +384,7 @@ impl Buffer {
             point: Pos::new(0, 0),
             mark: None,
             scroll: 0,
+            undo: Vec::new(),
         }
     }
 
@@ -383,6 +395,7 @@ impl Buffer {
         } else {
             lines
         };
+        self.undo.clear();
         self.point = Pos::new(0, 0);
         self.scroll = 0;
         self.mark = None;
@@ -398,6 +411,7 @@ impl Buffer {
         self.point = Pos::new(self.last_row(), self.prompt_len);
         self.scroll = 0;
         self.mark = None;
+        self.undo.clear();
     }
 
     /// Set the style used to render the prompt (e.g. `rcirc-prompt`).
@@ -543,6 +557,7 @@ impl Buffer {
         }
         self.scroll = 0;
         self.point = Pos::new(0, self.prompt_len);
+        self.undo.clear();
     }
 
     /// The current input text (the prompt line after the prompt). Empty for
@@ -571,6 +586,46 @@ impl Buffer {
         }
         self.input_set(text);
         self.point = Pos::new(self.last_row(), self.prompt_len + text.chars().count());
+        self.undo.clear();
+    }
+
+    /// Record the current input line before an edit. Point is stored relative
+    /// to the prompt so later scrollback insertions cannot invalidate it.
+    fn record_input_undo(&mut self) {
+        if !self.is_irc() {
+            return;
+        }
+        let text = self.input();
+        let col = self.point.col.saturating_sub(self.prompt_len);
+        if self
+            .undo
+            .last()
+            .is_some_and(|u| u.text == text && u.col == col)
+        {
+            return;
+        }
+        const MAX_UNDO: usize = 200;
+        if self.undo.len() == MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.undo.push(InputUndo { text, col });
+    }
+
+    /// Undo the most recent input-line edit. Returns `false` if there is
+    /// nothing left to undo.
+    pub fn undo(&mut self) -> bool {
+        if !self.is_irc() {
+            return false;
+        }
+        let Some(entry) = self.undo.pop() else {
+            return false;
+        };
+        self.input_set(&entry.text);
+        let len = entry.text.chars().count();
+        self.point = Pos::new(self.last_row(), self.prompt_len + entry.col.min(len));
+        self.mark = None;
+        self.scroll_into_view();
+        true
     }
 
     // ---- read-only queries -------------------------------------------------
@@ -731,6 +786,9 @@ impl Buffer {
             out.extend(changed.chars());
             out.extend_from_slice(&chars[end..]);
             let text: String = out.into_iter().collect();
+            if text != self.input() {
+                self.record_input_undo();
+            }
             self.input_set(&text);
             self.point = Pos::new(self.last_row(), base + start + new_len);
         } else {
@@ -783,6 +841,7 @@ impl Buffer {
             let point = self.point.col.saturating_sub(base).min(chars.len());
             if let Some(new_point) = transpose_chars_at(&mut chars, point) {
                 let text: String = chars.into_iter().collect();
+                self.record_input_undo();
                 self.input_set(&text);
                 self.point = Pos::new(self.last_row(), base + new_point);
             }
@@ -808,6 +867,7 @@ impl Buffer {
             let point = self.point.col.saturating_sub(base).min(chars.len());
             if let Some(new_point) = transpose_words_at(&mut chars, point) {
                 let text: String = chars.into_iter().collect();
+                self.record_input_undo();
                 self.input_set(&text);
                 self.point = Pos::new(self.last_row(), base + new_point);
             }
@@ -852,6 +912,9 @@ impl Buffer {
             out.extend(changed.chars());
             out.extend_from_slice(&chars[end..]);
             let text: String = out.into_iter().collect();
+            if text != self.input() {
+                self.record_input_undo();
+            }
             self.input_set(&text);
             let col = (point as isize + delta).max(base as isize) as usize;
             self.point = Pos::new(self.last_row(), col);
@@ -968,6 +1031,37 @@ impl Buffer {
             return;
         }
         if self.is_irc() {
+            self.record_input_undo();
+        }
+        self.insert_char_raw(c);
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        if self.is_irc() {
+            if !self.editable() {
+                return;
+            }
+            // One undo step for a whole paste/insert.
+            self.record_input_undo();
+            for c in s.chars() {
+                self.insert_char_raw(c);
+            }
+            return;
+        }
+        for c in s.chars() {
+            if c == '\n' {
+                self.insert_newline();
+            } else {
+                self.insert_char(c);
+            }
+        }
+    }
+
+    fn insert_char_raw(&mut self, c: char) {
+        if !self.editable() {
+            return;
+        }
+        if self.is_irc() {
             let mut chars: Vec<char> = self.input().chars().collect();
             let idx = self.point.col - self.prompt_len;
             chars.insert(idx.min(chars.len()), c);
@@ -983,16 +1077,6 @@ impl Buffer {
             self.point.col += 1;
         }
         self.scroll_into_view();
-    }
-
-    pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            if c == '\n' && !self.is_irc() {
-                self.insert_newline();
-            } else {
-                self.insert_char(c);
-            }
-        }
     }
 
     /// Insert a line break at point (free text buffers only).
@@ -1017,6 +1101,7 @@ impl Buffer {
         }
         if self.is_irc() {
             if self.point.col > self.prompt_len {
+                self.record_input_undo();
                 let mut chars: Vec<char> = self.input().chars().collect();
                 let idx = self.point.col - self.prompt_len - 1;
                 chars.remove(idx);
@@ -1051,6 +1136,7 @@ impl Buffer {
             let mut chars: Vec<char> = self.input().chars().collect();
             let idx = self.point.col - self.prompt_len;
             if idx < chars.len() {
+                self.record_input_undo();
                 chars.remove(idx);
             }
             let text: String = chars.into_iter().collect();
@@ -1083,6 +1169,9 @@ impl Buffer {
             let idx = (self.point.col - self.prompt_len).min(chars.len());
             let killed: String = chars[idx..].iter().collect();
             let kept: String = chars[..idx].iter().collect();
+            if !killed.is_empty() {
+                self.record_input_undo();
+            }
             self.input_set(&kept);
             self.scroll_into_view();
             killed
@@ -1120,6 +1209,7 @@ impl Buffer {
         }
         if self.is_irc() {
             let base = self.prompt_len;
+            self.record_input_undo();
             let mut chars: Vec<char> = self.input().chars().collect();
             let s = (start.col - base).min(chars.len());
             let e = (end.col - base).min(chars.len());
@@ -1246,6 +1336,9 @@ impl Buffer {
             out.extend(word.chars());
             out.extend_from_slice(&chars[end..]);
             let text: String = out.into_iter().collect();
+            if text != self.input() {
+                self.record_input_undo();
+            }
             self.input_set(&text);
             self.point = Pos::new(self.last_row(), base + start + word.chars().count());
         } else {
@@ -1761,6 +1854,49 @@ mod tests {
         b.replace_word_before_point("configuration");
         assert_eq!(b.input(), "configuration");
         assert_eq!(b.word_before_point(), "configuration");
+    }
+
+    #[test]
+    fn undo_restores_input_edits_across_new_output() {
+        let mut b = Buffer::new("> ");
+        b.insert_str("hello");
+        b.insert_char('!');
+        b.push_plain("incoming message");
+        assert!(b.undo());
+        assert_eq!(b.input(), "hello");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 7));
+        assert!(b.undo());
+        assert_eq!(b.input(), "");
+        assert!(!b.undo());
+    }
+
+    #[test]
+    fn undo_treats_a_paste_as_one_edit() {
+        let mut b = Buffer::new("> ");
+        b.insert_str("pasted text");
+        assert!(b.undo());
+        assert_eq!(b.input(), "");
+        assert!(!b.undo());
+    }
+
+    #[test]
+    fn set_input_starts_a_fresh_undo_history() {
+        let mut b = Buffer::new("> ");
+        b.insert_char('a');
+        b.set_input("x");
+        assert!(!b.undo());
+        assert_eq!(b.input(), "x");
+    }
+
+    #[test]
+    fn delete_backward_is_undoable() {
+        let mut b = Buffer::new("> ");
+        b.set_input("ab");
+        b.delete_backward();
+        assert_eq!(b.input(), "a");
+        assert!(b.undo());
+        assert_eq!(b.input(), "ab");
+        assert_eq!(b.point(), Pos::new(b.last_row(), 4));
     }
 
     #[test]

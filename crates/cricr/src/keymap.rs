@@ -27,6 +27,7 @@ pub enum Action {
     PageDown,
     DeleteBackward,
     DeleteForward,
+    Undo,
     BackwardKillWord,
     KillWord,
     KillLine,
@@ -75,6 +76,9 @@ pub fn translate(key: KeyEvent) -> Action {
             'g' => Abort,
             'q' => QuotedInsert,
             't' => TransposeChars,
+            // Emacs spells undo `C-_`; terminals often report it as C-- or
+            // C-/, depending on the layout.
+            '_' | '-' | '/' => Undo,
             // The Alacritty NUL workaround for C-SPC arrives via ConPTY as
             // Ctrl+Shift+2 on a US layout.
             #[cfg(windows)]
@@ -253,6 +257,22 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('t'), KeyModifiers::ALT)),
             Action::TransposeWords
+        );
+    }
+
+    #[test]
+    fn undo_bindings() {
+        assert_eq!(
+            translate(key(KeyCode::Char('_'), KeyModifiers::CONTROL)),
+            Action::Undo
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('-'), KeyModifiers::CONTROL)),
+            Action::Undo
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+            Action::Undo
         );
     }
 

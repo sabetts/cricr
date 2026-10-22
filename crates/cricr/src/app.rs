@@ -2336,6 +2336,7 @@ impl App {
             PageDown => self.page_down(),
             DeleteBackward => self.delete_chars(-n),
             DeleteForward => self.delete_chars(n),
+            Undo => self.undo(),
             BackwardKillWord => {
                 let killed = self.current_mut().buffer.backward_kill_word();
                 self.kill_new(&killed, prev == LastCommand::Kill);
@@ -2553,6 +2554,16 @@ impl App {
             } else {
                 self.current_mut().buffer.delete_backward();
             }
+        }
+    }
+
+    /// `C-_` / `C--`: undo the last edit to the input line. Incoming
+    /// scrollback does not clear the undo history.
+    fn undo(&mut self) {
+        if self.current_mut().buffer.undo() {
+            self.message = Some("Undo".to_string());
+        } else {
+            self.message = Some("No further undo information".to_string());
         }
     }
 
@@ -3940,6 +3951,7 @@ fn help_lines() -> Vec<String> {
         "  M-Backspace    kill word backward",
         "  M-d            kill word forward",
         "  C-d            delete character forward",
+        "  C-_ / C--      undo an edit on the input line",
         "  C-SPC          set mark",
         "  C-w / M-w      kill / copy region",
         "  C-y / M-y      yank / yank-pop",
@@ -4601,6 +4613,33 @@ mod tests {
         assert_eq!(snippet("a\nb   c"), "a b c");
         let long = "x".repeat(100);
         assert!(snippet(&long).chars().count() <= 41);
+    }
+
+    #[test]
+    fn c_minus_undoes_input_edits_after_new_output() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.input(), "hell");
+        app.current_mut()
+            .buffer
+            .push_plain("someone said something");
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.input(), "hello");
+        assert_eq!(app.message.as_deref(), Some("Undo"));
+    }
+
+    #[test]
+    fn undo_without_history_reports_it() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::CONTROL);
+        assert_eq!(app.message.as_deref(), Some("No further undo information"));
     }
 
     #[test]
