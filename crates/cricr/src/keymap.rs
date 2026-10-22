@@ -62,6 +62,9 @@ pub fn translate(key: KeyEvent) -> Action {
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
         KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
         KeyCode::Char('\0') | KeyCode::Null => SetMark,
+        // C-M-< / C-M-> are aliases for beginning/end of buffer.
+        KeyCode::Char('<') if ctrl && alt => BeginningOfBuffer,
+        KeyCode::Char('>') if ctrl && alt => EndOfBuffer,
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
             'f' => ForwardChar,
             'b' => BackwardChar,
@@ -203,6 +206,24 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::SearchForward
+        );
+    }
+
+    #[test]
+    fn control_meta_buffer_motion() {
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('<'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::BeginningOfBuffer
+        );
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('>'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Action::EndOfBuffer
         );
     }
 

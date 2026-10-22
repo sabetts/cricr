@@ -1189,8 +1189,14 @@ impl App {
             return;
         }
         if self.search.active {
-            self.handle_search_key(key);
-            return;
+            // Motion commands exit isearch and then perform their normal
+            // action from the current match, like Emacs.
+            if isearch_motion(key) {
+                self.search.accept();
+            } else {
+                self.handle_search_key(key);
+                return;
+            }
         }
         if self.quoted {
             self.quoted = false;
@@ -3707,6 +3713,26 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Whether `key` is a motion command that should leave isearch and run.
+fn isearch_motion(key: crossterm::event::KeyEvent) -> bool {
+    use Action::*;
+    matches!(
+        keymap::translate(key),
+        ForwardChar
+            | BackwardChar
+            | NextLine
+            | PrevLine
+            | BeginningOfLine
+            | EndOfLine
+            | ForwardWord
+            | BackwardWord
+            | BeginningOfBuffer
+            | EndOfBuffer
+            | PageUp
+            | PageDown
+    )
+}
+
 /// Byte offset of the `idx`-th char in `s`, clamped to the end.
 fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
@@ -4152,6 +4178,58 @@ mod tests {
         assert!(matches!(app.prompt, Prompt::BrowseUrl { .. }));
         assert!(app.prefix_echo.is_none());
         assert_ne!(app.message.as_deref(), Some("C-c-"));
+    }
+
+    #[test]
+    fn motion_key_exits_isearch_and_moves() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("beta");
+            b.push_plain("gamma");
+            b.beginning_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for c in "beta".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.search.active);
+        let found = app.current().buffer.point();
+        // C-n leaves isearch at the match and moves down one line.
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point().row, found.row + 1);
+    }
+
+    #[test]
+    fn control_meta_beginning_of_buffer_exits_isearch() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("beta");
+            b.push_plain("gamma");
+            b.beginning_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for c in "gamma".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.search.active);
+        press(
+            &mut app,
+            KeyCode::Char('<'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 0));
     }
 
     #[test]
