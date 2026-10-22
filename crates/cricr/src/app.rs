@@ -2266,7 +2266,10 @@ impl App {
                 self.kill_new(&killed, prev == LastCommand::Kill);
                 self.last_command = LastCommand::Kill;
             }
-            SetMark => self.current_mut().buffer.set_mark(),
+            SetMark => {
+                self.current_mut().buffer.set_mark();
+                self.message = Some("Mark set".to_string());
+            }
             KillRegion => self.kill_region(prev),
             CopyRegion => self.copy_region(prev),
             Yank => self.yank(),
@@ -4285,6 +4288,27 @@ mod tests {
         app.perform(Action::KillRegion);
         assert_eq!(app.current().buffer.input(), "hello ");
         app.perform(Action::Yank);
+        assert_eq!(app.current().buffer.input(), "hello world");
+    }
+
+    #[test]
+    fn ctrl_space_sets_mark_for_copy_region() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("hello world");
+        // Mark the end, move back over "world", then copy the region.
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(app.message.as_deref(), Some("Mark set"));
+        // NUL is another common encoding of C-SPC / C-@.
+        press(&mut app, KeyCode::Char('\0'), KeyModifiers::NONE);
+        assert_eq!(app.message.as_deref(), Some("Mark set"));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::ALT);
+        assert_eq!(app.kill_ring.current().as_deref(), Some("world"));
         assert_eq!(app.current().buffer.input(), "hello world");
     }
 

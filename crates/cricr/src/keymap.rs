@@ -51,6 +51,10 @@ pub fn translate(key: KeyEvent) -> Action {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
+        // Terminals report `C-SPC` in several ways: a space with CONTROL,
+        // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
+        KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
+        KeyCode::Char('\0') | KeyCode::Null => SetMark,
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
             'f' => ForwardChar,
             'b' => BackwardChar,
@@ -68,7 +72,6 @@ pub fn translate(key: KeyEvent) -> Action {
             'g' => Abort,
             'q' => QuotedInsert,
             't' => TransposeChars,
-            ' ' => SetMark,
             _ => None,
         },
         KeyCode::Char(c) if alt => match c {
@@ -112,7 +115,7 @@ pub fn translate(key: KeyEvent) -> Action {
 pub fn describe(key: KeyEvent) -> Option<String> {
     use KeyCode::*;
     let base = match key.code {
-        Char(' ') | Char('\0') => "SPC".to_string(),
+        Char(' ') | Char('\0') | Null => "SPC".to_string(),
         Char(c) => c.to_string(),
         Enter => "RET".to_string(),
         Tab => "TAB".to_string(),
@@ -213,6 +216,35 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('t'), KeyModifiers::ALT)),
             Action::TransposeWords
+        );
+    }
+
+    #[test]
+    fn ctrl_space_variants_set_mark() {
+        assert_eq!(
+            translate(key(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('@'), KeyModifiers::CONTROL)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('\0'), KeyModifiers::NONE)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Null, KeyModifiers::NONE)),
+            Action::SetMark
+        );
+        // Plain space and `@` still insert themselves.
+        assert_eq!(
+            translate(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Action::SelfInsert(' ')
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('@'), KeyModifiers::NONE)),
+            Action::SelfInsert('@')
         );
     }
 

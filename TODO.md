@@ -2,8 +2,8 @@
 
 * DONE add C-t M-t bindings
 * DONE M-- M-u/M-l should not move the point
+* DONE setting mark C-SPC doesn't work
 * input line needs to wrap long lines.
-* setting mark C-SPC doesn't work
 * does C-c C-b reset the unread line?
 * movement keys like C-f/C-n/C-p/C-M-< should exit isearch
 * pressing RET on an url should open it
