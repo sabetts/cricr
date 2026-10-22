@@ -191,6 +191,10 @@ const IDLE_MARK: Duration = Duration::from_secs(5 * 60);
 /// and this latch keeps a paste split across drains folding.
 const PASTE_LATCH: Duration = Duration::from_millis(30);
 
+/// How long to wait before echoing an incomplete prefix key (`C-c-`), like
+/// Emacs's `echo-keystrokes` (default one second).
+const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
+
 const COMMANDS: &[&str] = &[
     "/msg",
     "/query",
@@ -259,6 +263,9 @@ pub struct App {
     prefix: Prefix,
     /// A numeric argument being built (Emacs universal argument), if any.
     numeric_arg: Option<ArgState>,
+    /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
+    /// Emacs's `echo-keystrokes` does.
+    prefix_echo: Option<(String, Instant)>,
     quoted: bool,
     last_command: LastCommand,
     /// (start, end) positions of the text inserted by the last `yank`.
@@ -309,6 +316,7 @@ impl App {
             in_next_active: false,
             prefix: Prefix::None,
             numeric_arg: None,
+            prefix_echo: None,
             quoted: false,
             last_command: LastCommand::Other,
             last_yank: None,
@@ -1174,6 +1182,8 @@ impl App {
         }
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
+        // ...and cancels an overdue-but-unshown prefix hint.
+        self.prefix_echo = None;
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
             return;
@@ -1216,21 +1226,18 @@ impl App {
 
         if ctrl && key.code == KeyCode::Char('x') {
             self.numeric_arg = None;
-            self.prefix = Prefix::CtrlX;
-            self.message = Some("C-x-".to_string());
+            self.start_prefix(Prefix::CtrlX, "C-x-");
             return;
         }
         if ctrl && key.code == KeyCode::Char('c') {
             self.numeric_arg = None;
-            self.prefix = Prefix::CtrlC;
-            self.message = Some("C-c-".to_string());
+            self.start_prefix(Prefix::CtrlC, "C-c-");
             return;
         }
         // C-h (help) prefix. Some terminals report Ctrl+H as Backspace.
         if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace) {
             self.numeric_arg = None;
-            self.prefix = Prefix::Help;
-            self.message = Some("C-h-".to_string());
+            self.start_prefix(Prefix::Help, "C-h-");
             return;
         }
 
@@ -1337,6 +1344,29 @@ impl App {
         self.numeric_arg.take().map(ArgState::value).unwrap_or(1)
     }
 
+    /// Begin an incomplete key sequence and arrange for its hint to be
+    /// echoed only if the user pauses.
+    fn start_prefix(&mut self, prefix: Prefix, hint: &str) {
+        self.prefix = prefix;
+        self.message = None;
+        self.start_echo(hint);
+    }
+
+    fn start_echo(&mut self, hint: &str) {
+        self.prefix_echo = Some((hint.to_string(), Instant::now() + PREFIX_ECHO_DELAY));
+    }
+
+    /// Show the pending prefix hint once its delay has elapsed.
+    fn echo_pending_prefix(&mut self, now: Instant) {
+        if let Some((hint, deadline)) = &self.prefix_echo {
+            if *deadline <= now {
+                let hint = hint.clone();
+                self.prefix_echo = None;
+                self.message = Some(hint);
+            }
+        }
+    }
+
     fn handle_prefix(&mut self, key: crossterm::event::KeyEvent, ctrl: bool) {
         use crossterm::event::KeyCode;
         let prefix = std::mem::take(&mut self.prefix);
@@ -1355,8 +1385,7 @@ impl App {
                 KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => self.next_active(),
                 KeyCode::Char('g') if ctrl => {}
                 KeyCode::Char('f') if ctrl => {
-                    self.prefix = Prefix::CtrlCF;
-                    self.message = Some("C-c C-f-".to_string());
+                    self.start_prefix(Prefix::CtrlCF, "C-c C-f-");
                 }
                 KeyCode::Char('n') if ctrl => self.cmd_names(),
                 KeyCode::Char('i') if ctrl => self.toggle_ignore_activity(),
@@ -2287,7 +2316,7 @@ impl App {
             SearchBackward => self.start_search(SearchDirection::Backward),
             QuotedInsert => {
                 self.quoted = true;
-                self.message = Some("C-q-".to_string());
+                self.start_echo("C-q-");
             }
             Abort => {
                 self.current_mut().buffer.clear_mark();
@@ -3521,6 +3550,7 @@ impl App {
                 break;
             }
             let flash_deadline = self.copy_flash.map(|(_, deadline)| deadline);
+            let prefix_deadline = self.prefix_echo.as_ref().map(|(_, deadline)| *deadline);
             let reconnect_deadline = self.next_reconnect_deadline();
             tokio::select! {
                 Some((server, event)) = net_rx.recv() => {
@@ -3551,6 +3581,17 @@ impl App {
                     if let Some((restore, _)) = self.copy_flash.take() {
                         self.current_mut().buffer.set_point(restore);
                     }
+                }
+                // Echo an incomplete prefix key after the user pauses.
+                _ = async {
+                    match prefix_deadline {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.echo_pending_prefix(Instant::now());
                 }
                 // Fire any due reconnect attempts.
                 _ = async {
@@ -4085,6 +4126,32 @@ mod tests {
         assert!(matches!(app.prompt, Prompt::None));
         press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
         assert!(!app.should_quit, "C-c C-b twice must not quit");
+    }
+
+    #[test]
+    fn prefix_echo_waits_for_idle_delay() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prefix, Prefix::CtrlC));
+        // Nothing is echoed immediately.
+        assert_eq!(app.message, None);
+        assert!(app.prefix_echo.is_some());
+
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-c-"));
+        assert!(app.prefix_echo.is_none());
+    }
+
+    #[test]
+    fn completing_a_prefix_cancels_its_echo() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prompt, Prompt::BrowseUrl { .. }));
+        assert!(app.prefix_echo.is_none());
+        assert_ne!(app.message.as_deref(), Some("C-c-"));
     }
 
     #[test]
