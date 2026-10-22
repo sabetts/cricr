@@ -18,6 +18,8 @@ pub struct Search {
     pub query: String,
     pub direction: SearchDirection,
     pub origin: Option<Pos>,
+    /// End (exclusive) of the current match, if there is one.
+    pub match_end: Option<Pos>,
     pub failed: bool,
 }
 
@@ -28,6 +30,7 @@ impl Search {
         self.query.clear();
         self.direction = direction;
         self.origin = Some(origin);
+        self.match_end = None;
         self.failed = false;
     }
 
@@ -43,6 +46,7 @@ impl Search {
         self.query.clear();
         self.failed = false;
         self.origin = None;
+        self.match_end = None;
     }
 
     /// Keep the current position and end the search.
@@ -51,5 +55,6 @@ impl Search {
         self.query.clear();
         self.failed = false;
         self.origin = None;
+        self.match_end = None;
     }
 }

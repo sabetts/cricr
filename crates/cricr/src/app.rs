@@ -1190,9 +1190,17 @@ impl App {
         }
         if self.search.active {
             // Motion commands exit isearch and then perform their normal
-            // action from the current match, like Emacs.
+            // action from the current match, like Emacs: forward searches
+            // continue from the end of the match, backward ones from its start.
             if isearch_motion(key) {
+                let direction = self.search.direction;
+                let match_end = self.search.match_end;
                 self.search.accept();
+                if direction == SearchDirection::Forward {
+                    if let Some(end) = match_end {
+                        self.current_mut().buffer.set_point(end);
+                    }
+                }
             } else {
                 self.handle_search_key(key);
                 return;
@@ -2690,8 +2698,9 @@ impl App {
         };
         let forward = direction == SearchDirection::Forward;
         match self.current().buffer.search(&query, from, forward) {
-            Some((pos, _)) => {
+            Some((pos, len)) => {
                 self.current_mut().buffer.set_point(pos);
+                self.search.match_end = Some(Pos::new(pos.row, pos.col + len));
                 self.search.failed = false;
             }
             None => self.search.failed = true,
@@ -4199,10 +4208,56 @@ mod tests {
         }
         assert!(app.search.active);
         let found = app.current().buffer.point();
-        // C-n leaves isearch at the match and moves down one line.
+        // C-n leaves isearch at the end of the match and moves down a line.
         press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert!(!app.search.active);
-        assert_eq!(app.current().buffer.point().row, found.row + 1);
+        assert_eq!(app.current().buffer.point(), Pos::new(found.row + 1, 4));
+    }
+
+    #[test]
+    fn forward_search_motion_starts_at_match_end() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("beta");
+            b.push_plain("gamma");
+            b.beginning_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for c in "beta".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 0));
+        // Motion after a forward search starts at the end of "beta".
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 3));
+    }
+
+    #[test]
+    fn backward_search_motion_starts_at_match_start() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("beta");
+            b.push_plain("gamma");
+            b.end_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        for c in "beta".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 0));
+        // Motion after a backward search starts at the match's beginning.
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 1));
     }
 
     #[test]
