@@ -1188,6 +1188,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Any keystroke acknowledges the current buffer, including prefix and
+        // prompt keys that never reach `perform`.
+        self.note_user_activity();
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
         // ...and the completion list from `dabbrev-completion`.
@@ -2288,6 +2291,15 @@ impl App {
         self.minibuffer_rows
     }
 
+    /// Clear the current buffer's terminal-title activity badge (the unread
+    /// separator line itself is left in place) and restart the quiet timer, so
+    /// a reply moments later isn't treated as idle activity.
+    fn note_user_activity(&mut self) {
+        let cur = self.current;
+        self.buffers[cur].idle_marked = false;
+        self.buffers[cur].last_activity_at = Instant::now();
+    }
+
     fn perform(&mut self, action: Action) {
         use Action::*;
         if action != DabbrevExpand {
@@ -2295,12 +2307,7 @@ impl App {
         }
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
-        // Being active in the buffer clears its terminal-title activity badge
-        // (the unread separator line itself is left in place) and restarts the
-        // quiet timer, so a reply moments later isn't treated as idle activity.
-        let cur = self.current;
-        self.buffers[cur].idle_marked = false;
-        self.buffers[cur].last_activity_at = Instant::now();
+        self.note_user_activity();
         // Any real command ends a `C-c C-SPC` run.
         self.next_active_origin = Option::None;
         // A pending numeric argument (Emacs universal argument), default 1.
@@ -5398,6 +5405,28 @@ mod tests {
             app.buffers[ch].marker_row.is_some(),
             "separator should remain"
         );
+    }
+
+    #[test]
+    fn prefix_commands_clear_the_current_buffer_badge() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        app.config.ui.title_badge = true;
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.idle_mark = Duration::ZERO;
+        app.push_line(ch, Line::plain("hi"));
+        app.bump_activity(ch, false);
+        assert!(app.buffers[ch].idle_marked);
+        assert!(app.terminal_title().starts_with("cricr ["));
+
+        // C-c C-b opens the browse prompt; the prefix itself acknowledges the
+        // buffer even though it never reaches `perform`.
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prompt, Prompt::BrowseUrl { .. }));
+        assert!(!app.buffers[ch].idle_marked);
+        assert_eq!(app.terminal_title(), "cricr");
     }
 
     #[test]
