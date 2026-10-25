@@ -18,6 +18,7 @@ pub enum Action {
     BackwardWord,
     UpcaseWord,
     DowncaseWord,
+    CapitalizeWord,
     TransposeChars,
     TransposeWords,
     DabbrevExpand,
@@ -100,6 +101,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'b' | 'B' => BackwardWord,
             'u' | 'U' => UpcaseWord,
             'l' | 'L' => DowncaseWord,
+            'c' | 'C' => CapitalizeWord,
             't' | 'T' => TransposeWords,
             'd' | 'D' => KillWord,
             '/' => DabbrevExpand,
@@ -255,6 +257,10 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('l'), KeyModifiers::ALT)),
             Action::DowncaseWord
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('c'), KeyModifiers::ALT)),
+            Action::CapitalizeWord
         );
     }
 

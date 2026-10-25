@@ -16,7 +16,7 @@ use cricr_irc::message::Tag;
 use cricr_irc::{ClientCommand, ClientConfig, ClientHandle, Event};
 
 use crate::buffer::{
-    transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Span, Style,
+    capitalize_text, transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Span, Style,
 };
 use crate::config::Config;
 use crate::history;
@@ -1810,6 +1810,10 @@ impl App {
         self.prompt_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
     }
 
+    fn prompt_capitalize_word(&mut self) {
+        self.prompt_case_word(capitalize_text);
+    }
+
     /// Transpose the characters around the cursor (`C-t`).
     fn prompt_transpose_chars(&mut self) {
         if self
@@ -2057,6 +2061,7 @@ impl App {
             ForwardWord => self.prompt_forward_word(),
             UpcaseWord => self.prompt_upcase_word(),
             DowncaseWord => self.prompt_downcase_word(),
+            CapitalizeWord => self.prompt_capitalize_word(),
             TransposeChars => self.prompt_transpose_chars(),
             TransposeWords => self.prompt_transpose_words(),
             DabbrevExpand => self.prompt_dabbrev_expand(),
@@ -2343,6 +2348,7 @@ impl App {
             BackwardWord => self.move_words(-n),
             UpcaseWord => self.case_words(n, true),
             DowncaseWord => self.case_words(n, false),
+            CapitalizeWord => self.capitalize_words(n),
             TransposeChars => self.current_mut().buffer.transpose_chars(),
             TransposeWords => self.current_mut().buffer.transpose_words(),
             DabbrevExpand => self.dabbrev_expand(),
@@ -2445,6 +2451,17 @@ impl App {
                 (true, false) => self.current_mut().buffer.downcase_word(),
                 (false, true) => self.current_mut().buffer.backward_upcase_word(),
                 (false, false) => self.current_mut().buffer.backward_downcase_word(),
+            }
+        }
+    }
+
+    /// Capitalize `n` words (negative affects words before point).
+    fn capitalize_words(&mut self, n: i32) {
+        for _ in 0..n.abs() {
+            if n >= 0 {
+                self.current_mut().buffer.capitalize_word();
+            } else {
+                self.current_mut().buffer.backward_capitalize_word();
             }
         }
     }
@@ -4030,7 +4047,7 @@ fn help_lines() -> Vec<String> {
         "  RET            send input",
         "  TAB            complete nick or /command",
         "  M-p / M-n      previous / next input",
-        "  M-u / M-l      upcase / downcase word",
+        "  M-u / M-l / M-c  upcase / downcase / capitalize word",
         "  M-/            dabbrev-expand (complete from a word in the buffer)",
         "  C-M-/          dabbrev-completion (complete prefix and list matches)",
         "  C-k            kill to end of line",
@@ -6468,6 +6485,10 @@ mod tests {
         press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('l'), KeyModifiers::ALT);
         assert_eq!(prompt_input(&app), "hello world");
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::ALT);
+        assert_eq!(prompt_input(&app), "Hello world");
+        assert_eq!(prompt_cursor(&app), 5);
     }
 
     #[test]
@@ -6482,6 +6503,10 @@ mod tests {
         app.current_mut().buffer.beginning_of_line();
         app.perform(Action::DowncaseWord);
         assert_eq!(app.current().buffer.input(), "hello there");
+        app.current_mut().buffer.set_input("hELLO wORLD");
+        app.current_mut().buffer.beginning_of_line();
+        app.perform(Action::CapitalizeWord);
+        assert_eq!(app.current().buffer.input(), "Hello wORLD");
     }
 
     #[test]
@@ -6670,6 +6695,12 @@ mod tests {
         press(&mut app, KeyCode::Char('-'), KeyModifiers::ALT);
         press(&mut app, KeyCode::Char('l'), KeyModifiers::ALT);
         assert_eq!(app.current().buffer.input(), "hello world");
+        assert_eq!(app.current().buffer.point().col, base + 11);
+
+        app.current_mut().buffer.set_input("hello WORLD");
+        press(&mut app, KeyCode::Char('-'), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::ALT);
+        assert_eq!(app.current().buffer.input(), "hello World");
         assert_eq!(app.current().buffer.point().col, base + 11);
     }
 

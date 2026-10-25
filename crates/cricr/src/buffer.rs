@@ -798,6 +798,11 @@ impl Buffer {
         self.case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
     }
 
+    /// Capitalize the word after point (Emacs `capitalize-word`).
+    pub fn capitalize_word(&mut self) {
+        self.case_word(capitalize_text);
+    }
+
     /// Transform the word after point with `transform`, leaving point at the
     /// end of the (possibly length-changing) result.
     fn case_word(&mut self, transform: impl Fn(&[char]) -> String) {
@@ -869,6 +874,12 @@ impl Buffer {
     /// Downcase the word before point (`downcase-word` with a negative arg).
     pub fn backward_downcase_word(&mut self) {
         self.backward_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
+    }
+
+    /// Capitalize the word before point (`capitalize-word` with a negative
+    /// argument), leaving point in place.
+    pub fn backward_capitalize_word(&mut self) {
+        self.backward_case_word(capitalize_text);
     }
 
     /// Transpose the characters around point (`transpose-chars`, `C-t`).
@@ -1494,6 +1505,19 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Capitalize a word: uppercase its first character and lowercase the rest.
+pub(crate) fn capitalize_text(word: &[char]) -> String {
+    let mut out = String::new();
+    for (i, c) in word.iter().enumerate() {
+        if i == 0 {
+            out.extend(c.to_uppercase());
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
 /// Transpose the two characters around `point`, returning the new point.
 /// At the end of the text this swaps the last two characters; at the start it
 /// swaps the first two.
@@ -1668,6 +1692,30 @@ mod tests {
         b.beginning_of_buffer();
         b.upcase_word();
         assert_eq!(b.line(0).text(), "FOO bar");
+    }
+
+    #[test]
+    fn capitalize_word() {
+        let mut b = Buffer::new("> ");
+        b.set_input("hELLO wORLD");
+        b.beginning_of_line();
+        b.capitalize_word();
+        assert_eq!(b.input(), "Hello wORLD");
+        assert_eq!(b.point().col, 2 + 5);
+
+        b.end_of_line();
+        b.backward_capitalize_word();
+        assert_eq!(b.input(), "Hello World");
+        assert_eq!(b.point().col, 2 + 11);
+
+        let mut b = Buffer::text();
+        b.insert_str("hELLO wORLD");
+        b.beginning_of_buffer();
+        b.capitalize_word();
+        assert_eq!(b.line(0).text(), "Hello wORLD");
+        b.end_of_line();
+        b.backward_capitalize_word();
+        assert_eq!(b.line(0).text(), "Hello World");
     }
 
     #[test]
