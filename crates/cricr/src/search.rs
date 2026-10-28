@@ -21,6 +21,8 @@ pub struct Search {
     /// End (exclusive) of the current match, if there is one.
     pub match_end: Option<Pos>,
     pub failed: bool,
+    /// The last accepted search string, reused by `C-s C-s` / `C-r C-r`.
+    pub last_query: Option<String>,
 }
 
 impl Search {
@@ -51,6 +53,9 @@ impl Search {
 
     /// Keep the current position and end the search.
     pub fn accept(&mut self) {
+        if !self.query.is_empty() {
+            self.last_query = Some(self.query.clone());
+        }
         self.active = false;
         self.query.clear();
         self.failed = false;

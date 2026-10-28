@@ -2881,10 +2881,20 @@ impl App {
             KeyCode::Char('g') if ctrl => self.cancel_search(),
             KeyCode::Char('s') if ctrl => {
                 self.search.direction = SearchDirection::Forward;
+                if self.search.query.is_empty() {
+                    if let Some(last) = self.search.last_query.clone() {
+                        self.search.query = last;
+                    }
+                }
                 self.search_run(true);
             }
             KeyCode::Char('r') if ctrl => {
                 self.search.direction = SearchDirection::Backward;
+                if self.search.query.is_empty() {
+                    if let Some(last) = self.search.last_query.clone() {
+                        self.search.query = last;
+                    }
+                }
                 self.search_run(true);
             }
             KeyCode::Char(c) if !ctrl && !alt => {
@@ -4042,6 +4052,7 @@ fn help_lines() -> Vec<String> {
         "  M-< / M->      beginning / end of buffer",
         "  C-v / M-v      scroll up / down a screen",
         "  C-s / C-r      incremental search forward / backward",
+        "  C-s C-s        repeat the last search",
         "",
         "Editing",
         "  RET            send input",
@@ -4431,6 +4442,38 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(!app.search.active);
         assert_eq!(app.current().buffer.point(), Pos::new(1, 4));
+    }
+
+    #[test]
+    fn c_s_c_s_repeats_the_last_search() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("alpha");
+            b.push_plain("needle one");
+            b.push_plain("middle");
+            b.push_plain("needle two");
+            b.beginning_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        for c in "needle".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 6));
+
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.search.active);
+        assert_eq!(app.search.query, "needle");
+        assert_eq!(app.current().buffer.point(), Pos::new(3, 0));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(3, 6));
     }
 
     #[test]
