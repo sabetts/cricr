@@ -1,5 +1,6 @@
 /target
 **/*.rs.bk
-/contrib/rcirc.el
+/contrib/
 /test-config.toml
 /TODO.md
+/colors_list.txt
