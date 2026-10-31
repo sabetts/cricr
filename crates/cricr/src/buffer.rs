@@ -162,6 +162,8 @@ pub struct UrlPiece {
     pub end: usize,
     /// The complete URL, including the parts on other display lines.
     pub url: String,
+    /// Whether this piece contains the first character of the URL.
+    pub first: bool,
 }
 
 /// A single display line, made of one or more styled spans.
@@ -357,6 +359,7 @@ impl Line {
                                     start: piece_start - seg_start,
                                     end: piece_end - seg_start,
                                     url: url.clone(),
+                                    first: url_start >= seg_start && url_start < seg_end,
                                 });
                             }
                             chunks.push(Chunk {
@@ -583,6 +586,34 @@ impl Buffer {
 
     pub fn line(&self, row: usize) -> &Line {
         &self.lines[row]
+    }
+
+    /// The inclusive range of display rows occupied by the wrapped URL that
+    /// includes `row`. An unsplit URL occupies just `row`.
+    pub fn url_run_rows(&self, row: usize, url: &str) -> (usize, usize) {
+        let mut start = row;
+        while start > 0 {
+            let current_first = self.lines[start]
+                .urls
+                .iter()
+                .any(|p| p.url == url && p.first);
+            if current_first {
+                break;
+            }
+            if self.lines[start - 1].urls.iter().any(|p| p.url == url) {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut end = row;
+        while end + 1 < self.lines.len() {
+            match self.lines[end + 1].urls.iter().find(|p| p.url == url) {
+                Some(piece) if !piece.first => end += 1,
+                _ => break,
+            }
+        }
+        (start, end)
     }
 
     pub fn point(&self) -> Pos {
@@ -2335,6 +2366,36 @@ mod tests {
         }
         assert!(piece_count >= 3, "expected several URL pieces");
         assert_eq!(pieces, long);
+        assert_eq!(
+            wrapped
+                .iter()
+                .filter(|line| line.urls.iter().any(|piece| piece.first))
+                .count(),
+            1,
+            "exactly one piece should start the URL"
+        );
+    }
+
+    #[test]
+    fn wrapped_url_run_spans_every_piece() {
+        let prefix = "<nick> ";
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
+        let mut buffer = Buffer::text();
+        for wrapped in line.wrap(40) {
+            buffer.push_line(wrapped);
+        }
+
+        let first = (0..buffer.len())
+            .find(|&row| buffer.line(row).urls.iter().any(|piece| piece.first))
+            .expect("first URL piece");
+        let last = (0..buffer.len())
+            .rev()
+            .find(|&row| !buffer.line(row).urls.is_empty())
+            .expect("last URL piece");
+        for row in first..=last {
+            assert_eq!(buffer.url_run_rows(row, &long), (first, last));
+        }
     }
 
     #[test]

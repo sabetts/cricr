@@ -93,6 +93,27 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) -> Option<Viewport> {
         let display = top + (my - area.y) as usize;
         (display < scrollback_end).then(|| (display, (mx - area.x) as usize))
     });
+    let mut hover_ranges: Vec<(usize, usize, usize)> = Vec::new();
+    if let Some((hover_row, hover_col)) = hover {
+        if let Some((hover_start, hover_end, url)) = buf.line(hover_row).url_at(hover_col) {
+            let (start_row, end_row) = buf.url_run_rows(hover_row, &url);
+            for row in start_row..=end_row {
+                let line = buf.line(row);
+                let mut ranges: Vec<(usize, usize)> = line
+                    .urls
+                    .iter()
+                    .filter(|piece| piece.url == url)
+                    .map(|piece| (piece.start, piece.end))
+                    .collect();
+                if ranges.is_empty() && row == hover_row {
+                    ranges.push((hover_start, hover_end));
+                }
+                for (start, end) in ranges {
+                    hover_ranges.push((row, start, end));
+                }
+            }
+        }
+    }
 
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
     for display in top..(top + height).min(total) {
@@ -120,11 +141,11 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) -> Option<Viewport> {
             app.theme.lazy_highlight,
             app.theme.isearch,
         );
-        if let Some((hover_row, hover_col)) = hover {
-            if hover_row == row {
-                if let Some((start, end, _)) = buf.line(row).url_at(hover_col) {
-                    let end = end.min(cells.len());
-                    for cell in &mut cells[start..end] {
+        for (hover_row, start, end) in &hover_ranges {
+            if *hover_row == row {
+                let end = (*end).min(cells.len());
+                if *start < end {
+                    for cell in &mut cells[*start..end] {
                         cell.1.underline = true;
                     }
                 }
