@@ -16,7 +16,8 @@ use cricr_irc::message::Tag;
 use cricr_irc::{ClientCommand, ClientConfig, ClientHandle, Event};
 
 use crate::buffer::{
-    capitalize_text, transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Span, Style,
+    capitalize_text, extract_url, transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos,
+    Span, Style,
 };
 use crate::config::Config;
 use crate::history;
@@ -1619,8 +1620,30 @@ impl App {
         let buf = &self.current().buffer;
         let mut urls: Vec<String> = Vec::new();
         for row in 0..buf.len() {
-            for token in buf.line(row).text().split_whitespace() {
-                if let Some(url) = extract_url(token) {
+            let line = buf.line(row);
+            for piece in &line.urls {
+                if !urls.contains(&piece.url) {
+                    urls.push(piece.url.clone());
+                }
+            }
+            let chars: Vec<char> = line.text().chars().collect();
+            let mut idx = 0;
+            while idx < chars.len() {
+                if chars[idx].is_whitespace() {
+                    idx += 1;
+                    continue;
+                }
+                let start = idx;
+                while idx < chars.len() && !chars[idx].is_whitespace() {
+                    idx += 1;
+                }
+                // A split URL's fragments are covered by `line.urls`; don't
+                // mistake a partial fragment for a complete URL.
+                if line.urls.iter().any(|p| start < p.end && idx > p.start) {
+                    continue;
+                }
+                let token: String = chars[start..idx].iter().collect();
+                if let Some(url) = extract_url(&token) {
                     if !urls.contains(&url) {
                         urls.push(url);
                     }
@@ -1635,7 +1658,15 @@ impl App {
     fn url_at_point(&self) -> Option<String> {
         let buf = &self.current().buffer;
         let point = buf.point();
-        let text = buf.line(point.row).text();
+        let line = buf.line(point.row);
+        if let Some(piece) = line
+            .urls
+            .iter()
+            .find(|p| point.col >= p.start && point.col < p.end)
+        {
+            return Some(piece.url.clone());
+        }
+        let text = line.text();
         let chars: Vec<char> = text.chars().collect();
         let mut idx = 0;
         while idx < chars.len() {
@@ -1646,6 +1677,10 @@ impl App {
             let start = idx;
             while idx < chars.len() && !chars[idx].is_whitespace() {
                 idx += 1;
+            }
+            // Don't treat a split URL's fragment as a URL of its own.
+            if line.urls.iter().any(|p| start < p.end && idx > p.start) {
+                continue;
             }
             let token: String = chars[start..idx].iter().collect();
             let Some(url) = extract_url(&token) else {
@@ -3995,18 +4030,6 @@ fn common_prefix(items: &[String]) -> String {
         end = end.min(limit);
     }
     first.chars().take(end).collect()
-}
-
-/// Extract an http(s) URL from a whitespace-delimited token.
-fn extract_url(token: &str) -> Option<String> {
-    let start = token.find("http://").or_else(|| token.find("https://"))?;
-    let trimmed = token[start..].trim_end_matches(|c: char| {
-        matches!(
-            c,
-            ')' | '>' | ',' | '.' | ';' | '"' | '\'' | ']' | '}' | '\u{1}'
-        )
-    });
-    (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
 }
 
 /// The introductory text placed in the `*scratch*` buffer at startup.
@@ -6816,6 +6839,47 @@ mod tests {
         assert_eq!(app.url_at_point(), None);
         app.current_mut().buffer.set_point(Pos::new(0, 27));
         assert_eq!(app.url_at_point(), None);
+    }
+
+    #[test]
+    fn url_at_point_returns_full_url_from_every_wrapped_piece() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.fill_column = 40;
+        let prefix = "<nick> ";
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
+        app.push_line(ch, line);
+
+        let mut found = 0;
+        let rows = app.current().buffer.len();
+        for row in 0..rows {
+            let cols = app.current().buffer.line(row).char_len();
+            for col in 0..cols {
+                app.current_mut().buffer.set_point(Pos::new(row, col));
+                if let Some(url) = app.url_at_point() {
+                    assert_eq!(url, long, "wrong URL at row {row}, col {col}");
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, long.chars().count());
+    }
+
+    #[test]
+    fn browse_url_lists_a_wrapped_url_once() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.fill_column = 40;
+        let prefix = "<nick> ";
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
+        app.push_line(ch, line);
+
+        app.start_browse_url();
+        assert_eq!(app.url_candidates(""), vec![long]);
     }
 
     #[test]

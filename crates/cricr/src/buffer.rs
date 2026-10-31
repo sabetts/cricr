@@ -149,6 +149,18 @@ impl Span {
     }
 }
 
+/// A piece of a URL that was wrapped across display lines. Every piece keeps
+/// the complete URL so it can be opened from any row it occupies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlPiece {
+    /// Character column in this display line where the URL text begins.
+    pub start: usize,
+    /// Character column just past the URL text in this display line.
+    pub end: usize,
+    /// The complete URL, including the parts on other display lines.
+    pub url: String,
+}
+
 /// A single display line, made of one or more styled spans.
 #[derive(Debug, Clone, Default)]
 pub struct Line {
@@ -159,6 +171,9 @@ pub struct Line {
     /// Absolute time (Unix epoch seconds) this line was produced, if known.
     /// Used only by the scrollback cache; not part of line equality.
     pub time: Option<i64>,
+    /// URL pieces carried by this display row, when wrapping split a URL.
+    /// Derived by `wrap`; not part of line equality.
+    pub urls: Vec<UrlPiece>,
 }
 
 impl PartialEq for Line {
@@ -175,6 +190,7 @@ impl Line {
             spans: vec![Span::new(text, Style::default())],
             indent: 0,
             time: None,
+            urls: Vec::new(),
         }
     }
 
@@ -183,6 +199,7 @@ impl Line {
             spans: vec![Span::new(text, style)],
             indent: 0,
             time: None,
+            urls: Vec::new(),
         }
     }
 
@@ -191,6 +208,7 @@ impl Line {
             spans,
             indent: 0,
             time: None,
+            urls: Vec::new(),
         }
     }
 
@@ -219,9 +237,9 @@ impl Line {
     /// Word-wrap this line to `width` columns. Continuation lines are indented
     /// by `self.indent`. Returns the original line unchanged if it fits.
     ///
-    /// Words are kept whole where possible, and URLs are never split (a URL
-    /// that is itself wider than the line overflows it) so they stay copyable
-    /// and openable.
+    /// Words are kept whole where possible. A URL that does not fit is wrapped
+    /// across rows at exact width; every row keeps the full URL in `urls`, so
+    /// it can still be opened as one link.
     pub fn wrap(&self, width: usize) -> Vec<Line> {
         if width == 0 {
             return vec![self.clone()];
@@ -236,14 +254,14 @@ impl Line {
         }
 
         let indent = self.indent.min(width.saturating_sub(1));
-        let mut chunks: Vec<&[(char, Style)]> = Vec::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
         let mut start = 0;
         let mut limit = width;
         // On the first line, never break inside the prefix (columns < indent).
         let mut min_break = indent;
         while start < cells.len() {
             if cells.len() - start <= limit {
-                chunks.push(&cells[start..]);
+                chunks.push(Chunk::new(&cells[start..]));
                 break;
             }
             let window_end = start + limit;
@@ -252,7 +270,7 @@ impl Line {
                 .rev()
                 .find(|&i| cells[i - 1].0 == ' ' && i > min_break);
             if let Some(i) = brk {
-                chunks.push(&cells[start..i - 1]);
+                chunks.push(Chunk::new(&cells[start..i - 1]));
                 start = i;
             } else {
                 // No space to break on inside the window. Identify the token
@@ -265,16 +283,55 @@ impl Line {
                 let word_end = (word_start..cells.len())
                     .find(|&i| cells[i].0 == ' ')
                     .unwrap_or(cells.len());
-                if is_url(&cells[word_start..word_end]) {
-                    // Never split a URL or give it its own line; keep it on the
-                    // current line and let it overflow.
-                    chunks.push(&cells[start..word_end]);
+                let token_text: String = cells[word_start..word_end]
+                    .iter()
+                    .map(|(c, _)| *c)
+                    .collect();
+                if let Some(url) = extract_url(&token_text) {
+                    if word_start > start {
+                        // Give the URL a fresh row instead of letting it run
+                        // past the edge of the current one.
+                        chunks.push(Chunk::new(&cells[start..word_start]));
+                        start = word_start;
+                        limit = width.saturating_sub(indent);
+                        min_break = 0;
+                        continue;
+                    }
+                    if word_end - start <= limit {
+                        chunks.push(Chunk::new(&cells[start..word_end]));
+                    } else {
+                        let url_start = start
+                            + token_text[..token_text.find(&url).unwrap_or(0)]
+                                .chars()
+                                .count();
+                        let url_end = url_start + url.chars().count();
+                        let mut seg_start = start;
+                        while seg_start < word_end {
+                            let seg_end = (seg_start + limit).min(word_end);
+                            let piece_start = seg_start.max(url_start);
+                            let piece_end = seg_end.min(url_end);
+                            let mut urls = Vec::new();
+                            if piece_start < piece_end {
+                                urls.push(UrlPiece {
+                                    start: piece_start - seg_start,
+                                    end: piece_end - seg_start,
+                                    url: url.clone(),
+                                });
+                            }
+                            chunks.push(Chunk {
+                                cells: &cells[seg_start..seg_end],
+                                urls,
+                            });
+                            seg_start = seg_end;
+                            limit = width.saturating_sub(indent);
+                        }
+                    }
                     start = (word_end + 1).min(cells.len());
                 } else if word_start > start {
-                    chunks.push(&cells[start..word_start]);
+                    chunks.push(Chunk::new(&cells[start..word_start]));
                     start = word_start;
                 } else {
-                    chunks.push(&cells[start..window_end]);
+                    chunks.push(Chunk::new(&cells[start..window_end]));
                     start = window_end;
                 }
             }
@@ -285,24 +342,52 @@ impl Line {
         chunks
             .into_iter()
             .enumerate()
-            .map(|(i, chunk)| {
-                let mut line = cells_to_line(chunk);
+            .map(|(i, mut chunk)| {
+                if i > 0 && indent > 0 {
+                    for piece in &mut chunk.urls {
+                        piece.start += indent;
+                        piece.end += indent;
+                    }
+                }
+                let mut line = cells_to_line(chunk.cells);
                 if i > 0 && indent > 0 {
                     let mut spans = vec![Span::new(" ".repeat(indent), Style::default())];
                     spans.append(&mut line.spans);
                     line = Line::from_spans(spans);
                 }
+                line.urls = chunk.urls;
                 line
             })
             .collect()
     }
 }
 
-/// Whether a wrapped word is an http(s) URL, which is never broken across
-/// lines (so it stays copyable and openable).
-fn is_url(cells: &[(char, Style)]) -> bool {
-    let text: String = cells.iter().map(|(c, _)| *c).collect();
-    text.contains("http://") || text.contains("https://")
+/// A slice of cells that will become one display line, plus the URL pieces it
+/// carries (with columns relative to the slice).
+struct Chunk<'a> {
+    cells: &'a [(char, Style)],
+    urls: Vec<UrlPiece>,
+}
+
+impl<'a> Chunk<'a> {
+    fn new(cells: &'a [(char, Style)]) -> Self {
+        Chunk {
+            cells,
+            urls: Vec::new(),
+        }
+    }
+}
+
+/// Extract an http(s) URL from a whitespace-delimited token.
+pub(crate) fn extract_url(token: &str) -> Option<String> {
+    let start = token.find("http://").or_else(|| token.find("https://"))?;
+    let trimmed = token[start..].trim_end_matches(|c: char| {
+        matches!(
+            c,
+            ')' | '>' | ',' | '.' | ';' | '"' | '\'' | ']' | '}' | '\u{1}'
+        )
+    });
+    (trimmed.len() > "https://".len()).then(|| trimmed.to_string())
 }
 
 fn cells_to_line(cells: &[(char, Style)]) -> Line {
@@ -2165,28 +2250,65 @@ mod tests {
     }
 
     #[test]
-    fn urls_are_never_split() {
+    fn url_that_fits_on_a_fresh_row_moves_whole() {
         let prefix = "<nick> ";
-        // A URL that does not fit after the text moves whole to the next line.
-        let url = format!("https://example.com/{}", "a".repeat(60));
+        let url = format!("https://example.com/{}", "a".repeat(10));
         let line = Line::plain(format!("{prefix}see {url}")).indented(prefix.chars().count());
         let wrapped = line.wrap(40);
         assert!(
             wrapped.iter().any(|l| l.text().contains(&url)),
-            "URL split across lines: {wrapped:?}"
+            "URL was split instead of moving whole: {wrapped:?}"
         );
+        assert!(wrapped.iter().all(|l| l.urls.is_empty()));
+    }
 
-        // A URL wider than the line stays on the line it started on (no extra
-        // break) and overflows intact rather than being cut.
+    #[test]
+    fn long_url_wraps_at_exact_width_and_keeps_its_identity() {
+        let prefix = "<nick> ";
         let long = format!("https://example.com/{}", "b".repeat(80));
         let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
         let wrapped = line.wrap(40);
-        assert_eq!(
-            wrapped.len(),
-            1,
-            "overflowing URL should not get its own line: {wrapped:?}"
-        );
-        assert!(wrapped[0].text().contains(&long));
+
+        assert!(wrapped.len() > 1, "long URL did not wrap: {wrapped:?}");
+        for line in &wrapped {
+            assert!(
+                line.char_len() <= 40,
+                "wrapped line is too long: {:?}",
+                line.text()
+            );
+        }
+
+        let mut pieces = String::new();
+        let mut piece_count = 0;
+        for line in &wrapped {
+            for piece in &line.urls {
+                piece_count += 1;
+                assert_eq!(piece.url, long);
+                let chars: Vec<char> = line.text().chars().collect();
+                pieces.extend(&chars[piece.start..piece.end]);
+            }
+        }
+        assert!(piece_count >= 3, "expected several URL pieces");
+        assert_eq!(pieces, long);
+    }
+
+    #[test]
+    fn wrapped_url_excludes_trailing_punctuation() {
+        let prefix = "<nick> ";
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}({long}).")).indented(prefix.chars().count());
+        let wrapped = line.wrap(40);
+
+        let mut pieces = String::new();
+        for line in &wrapped {
+            for piece in &line.urls {
+                assert_eq!(piece.url, long);
+                let chars: Vec<char> = line.text().chars().collect();
+                pieces.extend(&chars[piece.start..piece.end]);
+            }
+        }
+        assert_eq!(pieces, long);
+        assert!(wrapped.last().unwrap().text().ends_with(")."));
     }
 
     #[test]
