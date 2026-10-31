@@ -6,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use crossterm::event::{Event as TermEvent, KeyEventKind};
+use crossterm::event::{Event as TermEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
@@ -222,6 +223,15 @@ const COMMANDS: &[&str] = &[
     "/buffer",
 ];
 
+/// The buffer's screen rectangle and first visible buffer row on the last
+/// draw, used to map mouse coordinates back to text.
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    pub area: Rect,
+    pub top: usize,
+    pub prompt_row: usize,
+}
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -236,6 +246,10 @@ pub struct App {
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
+    /// Screen geometry from the last draw, for mouse hit-testing.
+    viewport: Option<Viewport>,
+    /// Last mouse position, used to underline the URL under the pointer.
+    pub mouse: Option<(u16, u16)>,
     /// Quiet spell after which activity in the current buffer is marked unread.
     idle_mark: Duration,
     /// In-progress `M-/` (dabbrev) expansion, for cycling.
@@ -306,6 +320,8 @@ impl App {
             completions: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
+            viewport: None,
+            mouse: None,
             idle_mark: IDLE_MARK,
             dabbrev: None,
             pasting_until: None,
@@ -1658,41 +1674,38 @@ impl App {
     fn url_at_point(&self) -> Option<String> {
         let buf = &self.current().buffer;
         let point = buf.point();
-        let line = buf.line(point.row);
-        if let Some(piece) = line
-            .urls
-            .iter()
-            .find(|p| point.col >= p.start && point.col < p.end)
-        {
-            return Some(piece.url.clone());
+        buf.line(point.row).url_at(point.col).map(|(_, _, url)| url)
+    }
+
+    /// The URL under a screen coordinate, if any.
+    fn url_at_screen(&self, x: u16, y: u16) -> Option<String> {
+        let viewport = self.viewport?;
+        let area = viewport.area;
+        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+            return None;
         }
-        let text = line.text();
-        let chars: Vec<char> = text.chars().collect();
-        let mut idx = 0;
-        while idx < chars.len() {
-            if chars[idx].is_whitespace() {
-                idx += 1;
-                continue;
-            }
-            let start = idx;
-            while idx < chars.len() && !chars[idx].is_whitespace() {
-                idx += 1;
-            }
-            // Don't treat a split URL's fragment as a URL of its own.
-            if line.urls.iter().any(|p| start < p.end && idx > p.start) {
-                continue;
-            }
-            let token: String = chars[start..idx].iter().collect();
-            let Some(url) = extract_url(&token) else {
-                continue;
-            };
-            let byte = token.find(&url).unwrap_or(0);
-            let col = start + token[..byte].chars().count();
-            if point.col >= col && point.col < col + url.chars().count() {
-                return Some(url);
-            }
+        let display = viewport.top + (y - area.y) as usize;
+        let buffer = &self.current().buffer;
+        if display >= viewport.prompt_row || display >= buffer.len() {
+            return None;
         }
-        None
+        let col = (x - area.x) as usize;
+        buffer.line(display).url_at(col).map(|(_, _, url)| url)
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                self.mouse = Some((mouse.column, mouse.row));
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.mouse = Some((mouse.column, mouse.row));
+                if let Some(url) = self.url_at_screen(mouse.column, mouse.row) {
+                    self.open_url(&url);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
@@ -3775,7 +3788,9 @@ impl App {
                 self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
             }
             self.ensure_scroll_visible();
-            terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            let mut viewport = None;
+            terminal.draw(|frame| viewport = crate::ui::draw(frame, self))?;
+            self.viewport = viewport;
             self.sync_title();
             if self.should_quit {
                 self.reset_title();
@@ -3872,6 +3887,7 @@ impl App {
                     self.handle_key(key);
                 }
                 TermEvent::Paste(text) => self.handle_paste(text),
+                TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
                 _ => {}
             }
         }
@@ -6865,6 +6881,41 @@ mod tests {
             }
         }
         assert_eq!(found, long.chars().count());
+    }
+
+    #[test]
+    fn url_at_screen_maps_mouse_to_wrapped_url_pieces() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        app.fill_column = 40;
+        let prefix = "<nick> ";
+        let long = format!("https://example.com/{}", "b".repeat(80));
+        let line = Line::plain(format!("{prefix}{long}")).indented(prefix.chars().count());
+        app.push_line(ch, line);
+        let prompt_row = app.current().buffer.last_row();
+        app.viewport = Some(Viewport {
+            area: Rect::new(0, 0, 40, 10),
+            top: 0,
+            prompt_row,
+        });
+
+        let mut pieces = 0;
+        for row in 0..prompt_row {
+            for piece in &app.current().buffer.line(row).urls {
+                assert_eq!(
+                    app.url_at_screen(piece.start as u16, row as u16).as_deref(),
+                    Some(piece.url.as_str())
+                );
+                assert_eq!(
+                    app.url_at_screen((piece.end - 1) as u16, row as u16)
+                        .as_deref(),
+                    Some(piece.url.as_str())
+                );
+                pieces += 1;
+            }
+        }
+        assert!(pieces >= 3);
     }
 
     #[test]

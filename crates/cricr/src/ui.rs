@@ -6,11 +6,11 @@ use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Prompt};
+use crate::app::{App, Prompt, Viewport};
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::{Search, SearchDirection};
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
+pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Viewport> {
     let minibuffer = app.minibuffer_height().max(1);
     let rows = Layout::vertical([
         Constraint::Min(0),
@@ -19,17 +19,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .split(frame.area());
 
-    draw_buffer(frame, app, rows[0]);
+    let viewport = draw_buffer(frame, app, rows[0]);
     draw_mode_line(frame, app, rows[1]);
     draw_minibuffer(frame, app, rows[2]);
+    viewport
 }
 
-fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) -> Option<Viewport> {
     let buf = &app.current().buffer;
     let height = area.height as usize;
     let width = area.width as usize;
     if height == 0 || width == 0 {
-        return;
+        return None;
     }
 
     let point = buf.point();
@@ -84,6 +85,14 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
 
     let bottom_anchored = buf.is_irc() && buf.scroll() + height >= buf.len();
     let top = display_top(buf.scroll(), total, height, cursor_display, bottom_anchored);
+    let scrollback_end = if buf.is_irc() { prompt_row } else { total };
+    let hover = app.mouse.and_then(|(mx, my)| {
+        if mx < area.x || mx >= area.right() || my < area.y || my >= area.bottom() {
+            return None;
+        }
+        let display = top + (my - area.y) as usize;
+        (display < scrollback_end).then(|| (display, (mx - area.x) as usize))
+    });
 
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
     for display in top..(top + height).min(total) {
@@ -111,6 +120,16 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
             app.theme.lazy_highlight,
             app.theme.isearch,
         );
+        if let Some((hover_row, hover_col)) = hover {
+            if hover_row == row {
+                if let Some((start, end, _)) = buf.line(row).url_at(hover_col) {
+                    let end = end.min(cells.len());
+                    for cell in &mut cells[start..end] {
+                        cell.1.underline = true;
+                    }
+                }
+            }
+        }
         if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, cursor_point.col, app.cursor_style);
         }
@@ -118,6 +137,11 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    Some(Viewport {
+        area,
+        top,
+        prompt_row: scrollback_end,
+    })
 }
 
 /// Where to draw the point. During a forward isearch Emacs leaves point at the
@@ -337,6 +361,9 @@ fn rstyle(style: Style) -> RStyle {
     }
     if style.reverse {
         out = out.add_modifier(Modifier::REVERSED);
+    }
+    if style.underline {
+        out = out.add_modifier(Modifier::UNDERLINED);
     }
     out
 }

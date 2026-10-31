@@ -94,6 +94,7 @@ pub struct Style {
     pub bold: bool,
     pub dim: bool,
     pub reverse: bool,
+    pub underline: bool,
 }
 
 impl Style {
@@ -104,6 +105,7 @@ impl Style {
             bold: false,
             dim: false,
             reverse: false,
+            underline: false,
         }
     }
 
@@ -129,6 +131,7 @@ impl Style {
             bold: false,
             dim: false,
             reverse: false,
+            underline: false,
         }
     }
 }
@@ -234,6 +237,42 @@ impl Line {
         self.spans.iter().map(|s| s.text.chars().count()).sum()
     }
 
+    /// The URL under `col` on this display row: its character range and the
+    /// complete URL text. Split-URL rows use their `urls` metadata.
+    pub fn url_at(&self, col: usize) -> Option<(usize, usize, String)> {
+        if let Some(piece) = self.urls.iter().find(|p| col >= p.start && col < p.end) {
+            return Some((piece.start, piece.end, piece.url.clone()));
+        }
+        let chars = self.chars();
+        let mut idx = 0;
+        while idx < chars.len() {
+            if chars[idx].is_whitespace() {
+                idx += 1;
+                continue;
+            }
+            let start = idx;
+            while idx < chars.len() && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+            // A split URL's fragments are covered by `urls`; don't mistake
+            // one for a URL of its own.
+            if self.urls.iter().any(|p| start < p.end && idx > p.start) {
+                continue;
+            }
+            let token: String = chars[start..idx].iter().collect();
+            let Some(url) = extract_url(&token) else {
+                continue;
+            };
+            let byte = token.find(&url).unwrap_or(0);
+            let url_start = start + token[..byte].chars().count();
+            let url_end = url_start + url.chars().count();
+            if col >= url_start && col < url_end {
+                return Some((url_start, url_end, url));
+            }
+        }
+        None
+    }
+
     /// Word-wrap this line to `width` columns. Continuation lines are indented
     /// by `self.indent`. Returns the original line unchanged if it fits.
     ///
@@ -288,9 +327,11 @@ impl Line {
                     .map(|(c, _)| *c)
                     .collect();
                 if let Some(url) = extract_url(&token_text) {
-                    if word_start > start {
+                    if word_start > start && word_start > min_break {
                         // Give the URL a fresh row instead of letting it run
-                        // past the edge of the current one.
+                        // past the edge of the current one. If the URL is the
+                        // whole message, keep it on the prefix's row so an
+                        // URL-only post doesn't leave a blank first line.
                         chunks.push(Chunk::new(&cells[start..word_start]));
                         start = word_start;
                         limit = width.saturating_sub(indent);
@@ -300,7 +341,7 @@ impl Line {
                     if word_end - start <= limit {
                         chunks.push(Chunk::new(&cells[start..word_end]));
                     } else {
-                        let url_start = start
+                        let url_start = word_start
                             + token_text[..token_text.find(&url).unwrap_or(0)]
                                 .chars()
                                 .count();
@@ -2270,6 +2311,10 @@ mod tests {
         let wrapped = line.wrap(40);
 
         assert!(wrapped.len() > 1, "long URL did not wrap: {wrapped:?}");
+        assert!(
+            wrapped[0].text().contains("https://"),
+            "URL-only post left a blank first row: {wrapped:?}"
+        );
         for line in &wrapped {
             assert!(
                 line.char_len() <= 40,
