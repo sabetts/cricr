@@ -27,6 +27,7 @@ pub enum Action {
     EndOfBuffer,
     PageUp,
     PageDown,
+    Recenter,
     DeleteBackward,
     DeleteForward,
     Undo,
@@ -76,6 +77,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'a' => BeginningOfLine,
             'e' => EndOfLine,
             'v' => PageDown,
+            'l' => Recenter,
             's' => SearchForward,
             'r' => SearchBackward,
             'd' => DeleteForward,
@@ -215,6 +217,10 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::SearchForward
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::Recenter
         );
     }
 

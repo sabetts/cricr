@@ -624,6 +624,11 @@ impl Buffer {
         self.scroll
     }
 
+    /// Set the first visible row, clamped to the last row.
+    pub fn set_scroll(&mut self, row: usize) {
+        self.scroll = row.min(self.last_row());
+    }
+
     pub fn last_row(&self) -> usize {
         self.lines.len() - 1
     }

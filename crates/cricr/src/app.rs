@@ -111,6 +111,14 @@ enum LastCommand {
     Yank,
 }
 
+/// Where `C-l` (`recenter-top-bottom`) put point's line last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecenterPos {
+    Middle,
+    Top,
+    Bottom,
+}
+
 /// State for cycling through `M-/` (dabbrev) expansions.
 #[derive(Debug, Clone, Default)]
 struct Dabbrev {
@@ -287,6 +295,8 @@ pub struct App {
     prefix_echo: Option<(String, Instant)>,
     quoted: bool,
     last_command: LastCommand,
+    /// Last position used by `C-l`, for cycling middle/top/bottom.
+    recenter_pos: Option<RecenterPos>,
     /// (start, end) positions of the text inserted by the last `yank`.
     last_yank: Option<(Pos, Pos)>,
     /// Pending `M-w` indication: (position to restore, deadline).
@@ -344,6 +354,7 @@ impl App {
             prefix_echo: None,
             quoted: false,
             last_command: LastCommand::Other,
+            recenter_pos: None,
             last_yank: None,
             copy_flash: None,
             last_push_row: 0,
@@ -664,15 +675,16 @@ impl App {
         marker
     }
 
-    /// A `Apr 2026 ------` separator for the month containing `time`.
+    /// A `--- Apr 2026 ------` separator for the month containing `time`.
     fn date_marker_line(&self, time: i64) -> Line {
         let label = format_local(time, "%b %Y");
+        let prefix = format!("--- {label} ");
         let dashes = self
             .fill_column
-            .saturating_sub(label.chars().count() + 1)
+            .saturating_sub(prefix.chars().count())
             .max(1);
         Line::styled(
-            format!("{label} {}", "-".repeat(dashes)),
+            format!("{prefix}{}", "-".repeat(dashes)),
             Style::fg(Color::DarkGray),
         )
     }
@@ -1205,6 +1217,12 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Any command other than C-l breaks the recenter cycle.
+        let is_recenter = key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'l'));
+        if !is_recenter {
+            self.recenter_pos = None;
+        }
         // Any keystroke acknowledges the current buffer, including prefix and
         // prompt keys that never reach `perform`.
         self.note_user_activity();
@@ -1219,6 +1237,11 @@ impl App {
             return;
         }
         if self.search.active {
+            // C-l is `isearch-scroll`: recenter without leaving the search.
+            if is_recenter {
+                self.recenter(None);
+                return;
+            }
             // Motion commands exit isearch and then perform their normal
             // action from the current match, like Emacs: forward searches
             // continue from the end of the match, backward ones from its start.
@@ -1415,6 +1438,8 @@ impl App {
         use crossterm::event::KeyCode;
         let prefix = std::mem::take(&mut self.prefix);
         self.message = None;
+        // A prefix sequence is not a recenter, even when it ends in C-l.
+        self.recenter_pos = None;
         match prefix {
             Prefix::None => {}
             Prefix::CtrlX => match key.code {
@@ -2120,6 +2145,7 @@ impl App {
             Yank => self.prompt_yank(),
             PrevLine => self.prompt_move(count, -1),
             NextLine => self.prompt_move(count, 1),
+            Recenter => self.recenter(Option::None),
             _ => {}
         }
     }
@@ -2364,6 +2390,7 @@ impl App {
         // Any real command ends a `C-c C-SPC` run.
         self.next_active_origin = Option::None;
         // A pending numeric argument (Emacs universal argument), default 1.
+        let arg = self.numeric_arg;
         let n = self.take_arg();
         match action {
             None => {}
@@ -2405,6 +2432,7 @@ impl App {
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
             PageUp => self.page_up(),
             PageDown => self.page_down(),
+            Recenter => self.recenter(arg),
             DeleteBackward => self.delete_chars(-n),
             DeleteForward => self.delete_chars(n),
             Undo => self.undo(),
@@ -2738,6 +2766,42 @@ impl App {
     fn page_down(&mut self) {
         let n = self.page_lines();
         self.current_mut().buffer.page_forward(n);
+    }
+
+    /// `C-l`: Emacs `recenter-top-bottom`. Without an argument the window
+    /// cycles middle -> top -> bottom; with one, point's line is placed that
+    /// many rows from the window top (plain `C-u` centers, negative counts
+    /// from the bottom).
+    fn recenter(&mut self, arg: Option<ArgState>) {
+        let height = self.viewport_rows.max(1);
+        let row = self.current().buffer.point().row;
+        let line = match arg {
+            Some(a) if !a.digits => height / 2,
+            Some(a) => {
+                let n = a.value();
+                if n < 0 {
+                    height.saturating_sub(n.unsigned_abs() as usize)
+                } else {
+                    (n as usize).min(height - 1)
+                }
+            }
+            None => {
+                let next = match self.recenter_pos {
+                    None | Some(RecenterPos::Bottom) => RecenterPos::Middle,
+                    Some(RecenterPos::Middle) => RecenterPos::Top,
+                    Some(RecenterPos::Top) => RecenterPos::Bottom,
+                };
+                self.recenter_pos = Some(next);
+                match next {
+                    RecenterPos::Middle => height / 2,
+                    RecenterPos::Top => 0,
+                    RecenterPos::Bottom => height - 1,
+                }
+            }
+        };
+        self.current_mut()
+            .buffer
+            .set_scroll(row.saturating_sub(line));
     }
 
     /// Add text to the kill ring and mirror the result to the system
@@ -4090,6 +4154,7 @@ fn help_lines() -> Vec<String> {
         "  C-a / C-e      beginning / end of line",
         "  M-< / M->      beginning / end of buffer",
         "  C-v / M-v      scroll up / down a screen",
+        "  C-l            recenter (middle / top / bottom)",
         "  C-s / C-r      incremental search forward / backward",
         "  C-s C-s        repeat the last search",
         "",
@@ -4729,6 +4794,79 @@ mod tests {
         assert_eq!(app.current().buffer.point().row, bottom - 8);
         app.perform(Action::PageDown);
         assert_eq!(app.current().buffer.point().row, bottom);
+    }
+
+    #[test]
+    fn c_l_cycles_recenter_positions() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..50 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.viewport_rows = 10;
+        app.current_mut().buffer.set_point(Pos::new(25, 0));
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.scroll(), 20, "middle");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.scroll(), 25, "top");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.scroll(), 16, "bottom");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.scroll(), 20, "middle again");
+    }
+
+    #[test]
+    fn recenter_cycle_restarts_after_another_command() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..50 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.viewport_rows = 10;
+        app.current_mut().buffer.set_point(Pos::new(25, 0));
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.current().buffer.scroll(), 20);
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        // Point moved to row 24; C-l centers again instead of moving to the
+        // top of the window.
+        assert_eq!(app.current().buffer.scroll(), 19);
+    }
+
+    #[test]
+    fn recenter_honors_a_numeric_argument() {
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        for i in 0..50 {
+            app.push_line(ch, Line::plain(format!("line {i}")));
+        }
+        app.switch_to(ch);
+        app.viewport_rows = 10;
+        app.current_mut().buffer.set_point(Pos::new(25, 0));
+
+        // M-3 C-l: point's line three rows below the window top.
+        app.numeric_arg = Some(ArgState {
+            magnitude: 3,
+            sign: 1,
+            digits: true,
+        });
+        app.perform(Action::Recenter);
+        assert_eq!(app.current().buffer.scroll(), 22);
+
+        // Plain C-u C-l centers.
+        app.numeric_arg = Some(ArgState {
+            magnitude: 4,
+            sign: 1,
+            digits: false,
+        });
+        app.perform(Action::Recenter);
+        assert_eq!(app.current().buffer.scroll(), 20);
     }
 
     #[test]
@@ -5625,10 +5763,18 @@ mod tests {
         push_history_line(&mut app, ch, "three", ts(2026, 5, 2));
         let text = buffer_text(&app, ch);
         // Only the month *change* is marked; the first line is not.
-        assert!(!text.iter().any(|l| l.starts_with("Apr 2026")), "{text:?}");
-        let separators: Vec<&String> = text.iter().filter(|l| l.starts_with("May 2026")).collect();
+        assert!(
+            !text.iter().any(|l| l.starts_with("--- Apr 2026")),
+            "{text:?}"
+        );
+        let separators: Vec<&String> = text
+            .iter()
+            .filter(|l| l.starts_with("--- May 2026"))
+            .collect();
         assert_eq!(separators.len(), 1, "{text:?}");
-        assert!(separators[0].contains("---"), "{text:?}");
+        assert!(separators[0].starts_with("--- May 2026 "), "{text:?}");
+        assert!(separators[0].ends_with('-'), "{text:?}");
+        assert_eq!(separators[0].chars().count(), app.fill_column);
     }
 
     #[tokio::test]
@@ -5650,7 +5796,7 @@ mod tests {
         let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
         let text = buffer_text(&app, ch);
         assert!(
-            text.iter().any(|l| l.starts_with("May 2026")),
+            text.iter().any(|l| l.starts_with("--- May 2026")),
             "date separator missing on reload: {text:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
