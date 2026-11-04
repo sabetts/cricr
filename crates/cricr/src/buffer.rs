@@ -6,6 +6,8 @@
 //! lives at the bottom of the same buffer), but editing is only permitted at
 //! or after the prompt.
 
+use std::sync::Arc;
+
 /// A logical position: a row index and a character column within that row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Pos {
@@ -179,6 +181,9 @@ pub struct Line {
     /// URL pieces carried by this display row, when wrapping split a URL.
     /// Derived by `wrap`; not part of line equality.
     pub urls: Vec<UrlPiece>,
+    /// The original unwrapped text, shared by every display row produced by
+    /// `wrap`. Not part of line equality.
+    logical: Option<Arc<str>>,
 }
 
 impl PartialEq for Line {
@@ -196,6 +201,7 @@ impl Line {
             indent: 0,
             time: None,
             urls: Vec::new(),
+            logical: None,
         }
     }
 
@@ -205,6 +211,7 @@ impl Line {
             indent: 0,
             time: None,
             urls: Vec::new(),
+            logical: None,
         }
     }
 
@@ -214,6 +221,7 @@ impl Line {
             indent: 0,
             time: None,
             urls: Vec::new(),
+            logical: None,
         }
     }
 
@@ -229,6 +237,14 @@ impl Line {
             out.push_str(&span.text);
         }
         out
+    }
+
+    /// The line's text before it was wrapped for display.
+    pub fn logical_text(&self) -> String {
+        match &self.logical {
+            Some(text) => text.to_string(),
+            None => self.text(),
+        }
     }
 
     pub fn chars(&self) -> Vec<char> {
@@ -294,6 +310,7 @@ impl Line {
             return vec![self.clone()];
         }
 
+        let logical: Arc<str> = Arc::from(self.text());
         let indent = self.indent.min(width.saturating_sub(1));
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut start = 0;
@@ -383,7 +400,7 @@ impl Line {
             min_break = 0;
         }
 
-        chunks
+        let mut lines: Vec<Line> = chunks
             .into_iter()
             .enumerate()
             .map(|(i, mut chunk)| {
@@ -402,7 +419,11 @@ impl Line {
                 line.urls = chunk.urls;
                 line
             })
-            .collect()
+            .collect();
+        for line in &mut lines {
+            line.logical = Some(logical.clone());
+        }
+        lines
     }
 }
 
@@ -756,6 +777,15 @@ impl Buffer {
         self.point = Pos::new(self.last_row(), self.prompt_len + text.chars().count());
         self.undo.clear();
         self.redo.clear();
+    }
+
+    /// Append `text` to the input line and leave point at the end.
+    pub fn append_to_input(&mut self, text: &str) {
+        if !self.is_irc() {
+            return;
+        }
+        self.end_of_buffer();
+        self.insert_str(text);
     }
 
     /// Record the current input line before an edit. Point is stored relative
@@ -2270,6 +2300,24 @@ mod tests {
     }
 
     #[test]
+    fn append_to_input_appends_at_the_end_and_moves_point() {
+        let mut b = Buffer::new("> ");
+        b.push_plain("hello");
+        b.set_input("reply ");
+        b.set_point(Pos::new(0, 0));
+
+        b.append_to_input("hello");
+
+        assert_eq!(b.input(), "reply hello");
+        assert_eq!(
+            b.point(),
+            Pos::new(b.last_row(), b.prompt_len() + "reply hello".chars().count())
+        );
+        assert!(b.undo());
+        assert_eq!(b.input(), "reply ");
+    }
+
+    #[test]
     fn paging_moves_point_and_scroll() {
         let mut b = Buffer::new("> ");
         for i in 0..50 {
@@ -2310,6 +2358,17 @@ mod tests {
             assert!(l.char_len() <= 30);
             assert!(!l.text().starts_with(' '));
             assert!(!l.text().ends_with(' '));
+        }
+    }
+
+    #[test]
+    fn wrapped_rows_remember_the_unwrapped_text() {
+        let text = "word ".repeat(20).trim_end().to_string();
+        let line = Line::plain(text.clone());
+        let wrapped = line.wrap(30);
+        assert!(wrapped.len() > 1);
+        for row in &wrapped {
+            assert_eq!(row.logical_text(), text);
         }
     }
 

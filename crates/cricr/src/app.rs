@@ -2401,11 +2401,16 @@ impl App {
             }
             Send => {
                 if self.current().buffer.is_irc() && !self.current().buffer.editable() {
-                    // RET on a URL in the scrollback opens it.
+                    // RET on a URL opens it; elsewhere in the scrollback it
+                    // appends that line to the input, unwrapping it first.
                     if let Some(url) = self.url_at_point() {
                         self.open_url(&url);
                         return;
                     }
+                    let row = self.current().buffer.point().row;
+                    let text = self.current().buffer.line(row).logical_text();
+                    self.current_mut().buffer.append_to_input(&text);
+                    return;
                 }
                 if matches!(self.current().kind, Kind::Scratch | Kind::Help) {
                     self.current_mut().buffer.insert_newline();
@@ -4159,7 +4164,7 @@ fn help_lines() -> Vec<String> {
         "  C-s C-s        repeat the last search",
         "",
         "Editing",
-        "  RET            send input",
+        "  RET            send input (scrollback: open URL or copy line)",
         "  TAB            complete nick or /command",
         "  M-p / M-n      previous / next input",
         "  M-u / M-l / M-c  upcase / downcase / capitalize word",
@@ -4867,6 +4872,68 @@ mod tests {
         });
         app.perform(Action::Recenter);
         assert_eq!(app.current().buffer.scroll(), 20);
+    }
+
+    #[test]
+    fn ret_on_a_chat_line_copies_it_into_the_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.push_line(ch, Line::plain("hello there"));
+        app.switch_to(ch);
+        let rows = app.current().buffer.len();
+        app.current_mut().buffer.set_point(Pos::new(0, 3));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.current().buffer.input(), "hello there");
+        assert_eq!(app.current().buffer.len(), rows, "RET must not send");
+        let point = app.current().buffer.point();
+        assert_eq!(point.row, app.current().buffer.last_row());
+        assert_eq!(
+            point.col,
+            app.current().buffer.prompt_len() + "hello there".chars().count()
+        );
+    }
+
+    #[test]
+    fn ret_on_a_chat_line_appends_to_the_existing_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.push_line(ch, Line::plain("hello there"));
+        app.switch_to(ch);
+        app.current_mut().buffer.set_input("reply ");
+        app.current_mut().buffer.set_point(Pos::new(0, 0));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.current().buffer.input(), "reply hello there");
+    }
+
+    #[test]
+    fn ret_on_a_wrapped_chat_line_copies_the_whole_message() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        let text = format!("<bob> {}", "word ".repeat(20).trim_end());
+        app.fill_column = 20;
+        app.push_line(ch, Line::plain(text.clone()).indented(6));
+        app.switch_to(ch);
+        let last_message_row = app.current().buffer.last_row() - 1;
+        app.current_mut()
+            .buffer
+            .set_point(Pos::new(last_message_row, 8));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(app.current().buffer.input(), text);
+        let point = app.current().buffer.point();
+        assert_eq!(point.row, app.current().buffer.last_row());
+        assert_eq!(
+            point.col,
+            app.current().buffer.prompt_len() + text.chars().count()
+        );
     }
 
     #[test]
