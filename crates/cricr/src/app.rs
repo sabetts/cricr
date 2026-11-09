@@ -1146,6 +1146,10 @@ impl App {
     }
 
     /// Kill a buffer: part from a channel (or close a query), then remove it.
+    ///
+    /// When the current buffer is killed, show the one it was switched from
+    /// (like Emacs's `switch-to-prev-buffer`) and keep walking back through the
+    /// visit history on later kills.
     fn kill_buffer(&mut self, idx: usize) {
         if idx >= self.buffers.len() {
             return;
@@ -1179,18 +1183,46 @@ impl App {
                 self.save_history_buffer(&dir, idx);
             }
         }
+        if self.current == idx {
+            if let Some(replacement) = self.replacement_after_kill(idx) {
+                // Use the normal switch path so the replacement's visit order
+                // and point behave exactly as if the user had selected it.
+                self.switch_to(replacement);
+            }
+        }
         self.buffers.remove(idx);
         if self.current > idx {
             self.current -= 1;
         } else if self.current == idx {
             self.current = idx.min(self.buffers.len().saturating_sub(1));
         }
-        if self.previous >= self.buffers.len() {
-            self.previous = self.buffers.len().saturating_sub(1);
+        self.previous = match index_after_removing(self.previous, idx) {
+            Some(previous) if previous != self.current => previous,
+            _ => self
+                .most_recent_buffer_excluding(self.current)
+                .unwrap_or(self.current),
+        };
+    }
+
+    /// The buffer to show after killing `idx`: the one the user came from,
+    /// falling back to the most recently visited buffer.
+    fn replacement_after_kill(&self, idx: usize) -> Option<usize> {
+        let previous = self.previous;
+        if previous != idx && previous < self.buffers.len() {
+            return Some(previous);
         }
-        if let Some(chan) = self.buffers.get_mut(self.current) {
-            chan.buffer.end_of_buffer();
-        }
+        self.most_recent_buffer_excluding(idx)
+    }
+
+    /// The most recently visited buffer other than `exclude`. Ties (buffers
+    /// that have never been visited) fall back to creation order.
+    fn most_recent_buffer_excluding(&self, exclude: usize) -> Option<usize> {
+        self.buffers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != exclude)
+            .max_by_key(|(i, b)| (b.last_visited, std::cmp::Reverse(*i)))
+            .map(|(i, _)| i)
     }
 
     fn send(&mut self, server: usize, command: ClientCommand) {
@@ -4006,6 +4038,16 @@ impl App {
     }
 }
 
+/// The index a buffer has after `removed` is deleted from the buffer vector.
+/// `None` means the index referred to the removed buffer.
+fn index_after_removing(index: usize, removed: usize) -> Option<usize> {
+    match index.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(index),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(index - 1),
+    }
+}
+
 /// Where an incoming message should be shown.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
@@ -5243,6 +5285,64 @@ mod tests {
         app.kill_buffer(help);
         assert_eq!(app.buffers.len(), before - 1);
         assert!(app.buffers.iter().all(|b| b.target != "*Help*"));
+    }
+
+    #[test]
+    fn killing_the_current_buffer_returns_to_the_previous_buffer() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.switch_to(a);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        app.switch_to(b);
+        // A newer buffer that was never visited must not win over the buffer
+        // we actually came from.
+        app.new_buffer(0, "#c".to_string(), Kind::Channel);
+
+        app.kill_buffer(b);
+
+        assert_eq!(app.current().target, "#a");
+        assert_eq!(app.previous_buffer_name(), "*scratch*");
+    }
+
+    #[test]
+    fn killing_the_current_buffer_walks_back_through_history() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.switch_to(a);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        app.switch_to(b);
+        let c = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(c);
+
+        app.kill_buffer(c);
+        assert_eq!(app.current().target, "#b");
+        assert_eq!(app.previous_buffer_name(), "#a");
+
+        let cur = app.current;
+        app.kill_buffer(cur);
+        assert_eq!(app.current().target, "#a");
+        assert_eq!(app.previous_buffer_name(), "*scratch*");
+
+        let cur = app.current;
+        app.kill_buffer(cur);
+        assert_eq!(app.current().target, "*scratch*");
+    }
+
+    #[test]
+    fn killing_a_non_current_buffer_leaves_current_and_point_alone() {
+        let mut app = app_without_servers();
+        let a = app.new_buffer(0, "#a".to_string(), Kind::Channel);
+        app.switch_to(a);
+        let b = app.new_buffer(0, "#b".to_string(), Kind::Channel);
+        app.switch_to(b);
+        app.push_line(b, Line::plain("history".to_string()));
+        app.buffers[b].buffer.set_point(Pos::new(0, 0));
+
+        app.kill_buffer(a);
+
+        assert_eq!(app.current, b - 1);
+        assert_eq!(app.current().target, "#b");
+        assert_eq!(app.buffers[app.current].buffer.point(), Pos::new(0, 0));
     }
 
     #[test]
