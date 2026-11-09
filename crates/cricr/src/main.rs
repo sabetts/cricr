@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -54,6 +55,7 @@ async fn run(cfg: config::Config) -> Result<()> {
         out,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableFocusChange,
         EnableMouseCapture
     )?;
     let backend = CrosstermBackend::new(out);
@@ -65,6 +67,7 @@ async fn run(cfg: config::Config) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen
     )

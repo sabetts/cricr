@@ -123,6 +123,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) -> Option<Viewport> {
                 let mut cells = cells.clone();
                 if cursor_point.row == prompt_row
                     && matches!(app.prompt, Prompt::None)
+                    && app.has_focus()
                     && chunk == cursor_chunk
                 {
                     place_cursor(&mut cells, cursor_col, app.cursor_style);
@@ -151,7 +152,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) -> Option<Viewport> {
                 }
             }
         }
-        if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
+        if row == cursor_point.row && matches!(app.prompt, Prompt::None) && app.has_focus() {
             place_cursor(&mut cells, cursor_point.col, app.cursor_style);
         }
         lines.push(to_rline(&cells));
@@ -265,7 +266,9 @@ fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
         let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
         // Show the cursor at the edit position within the prompt input.
         let mut cells: Vec<(char, Style)> = prompt.chars().map(|c| (c, Style::default())).collect();
-        place_cursor(&mut cells, cursor, app.cursor_style);
+        if app.has_focus() {
+            place_cursor(&mut cells, cursor, app.cursor_style);
+        }
         lines.push(to_rline(&cells));
         for (i, candidate) in candidates.iter().enumerate() {
             let style = if i == selected {

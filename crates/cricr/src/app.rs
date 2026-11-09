@@ -258,6 +258,8 @@ pub struct App {
     viewport: Option<Viewport>,
     /// Last mouse position, used to underline the URL under the pointer.
     pub mouse: Option<(u16, u16)>,
+    /// Whether the terminal window currently has focus.
+    focused: bool,
     /// Quiet spell after which activity in the current buffer is marked unread.
     idle_mark: Duration,
     /// In-progress `M-/` (dabbrev) expansion, for cycling.
@@ -332,6 +334,7 @@ impl App {
             viewport_rows: 20,
             viewport: None,
             mouse: None,
+            focused: true,
             idle_mark: IDLE_MARK,
             dabbrev: None,
             pasting_until: None,
@@ -969,6 +972,11 @@ impl App {
             .get(self.previous)
             .map(|b| b.target.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether the terminal window currently has focus.
+    pub fn has_focus(&self) -> bool {
+        self.focused
     }
 
     /// Whether activity in the current buffer is ignored.
@@ -3989,6 +3997,8 @@ impl App {
                 }
                 TermEvent::Paste(text) => self.handle_paste(text),
                 TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
+                TermEvent::FocusGained => self.focused = true,
+                TermEvent::FocusLost => self.focused = false,
                 _ => {}
             }
         }
@@ -5664,6 +5674,57 @@ mod tests {
         assert!(!is_multiline_paste(&[ch('a'), enter()]));
         // A multiline paste: the newline is followed by more text.
         assert!(is_multiline_paste(&[ch('a'), enter(), ch('b')]));
+    }
+
+    #[test]
+    fn focus_events_toggle_the_cursor() {
+        let mut app = app_without_servers();
+        assert!(app.has_focus());
+        app.handle_term_batch(vec![TermEvent::FocusLost]);
+        assert!(!app.has_focus());
+        app.handle_term_batch(vec![TermEvent::FocusGained]);
+        assert!(app.has_focus());
+    }
+
+    #[test]
+    fn cursor_is_not_drawn_while_unfocused() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color as RColor;
+
+        let mut app = app_without_servers();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let cursor_cells = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| cell.bg == RColor::Yellow)
+                .count()
+        };
+
+        terminal
+            .draw(|frame| {
+                crate::ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        assert!(cursor_cells(&terminal) > 0);
+
+        app.handle_term_batch(vec![TermEvent::FocusLost]);
+        terminal
+            .draw(|frame| {
+                crate::ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        assert_eq!(cursor_cells(&terminal), 0);
+
+        app.handle_term_batch(vec![TermEvent::FocusGained]);
+        terminal
+            .draw(|frame| {
+                crate::ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        assert!(cursor_cells(&terminal) > 0);
     }
 
     #[cfg(windows)]
