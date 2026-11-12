@@ -1487,13 +1487,13 @@ impl App {
                 KeyCode::Char('b') => self.start_switch_buffer(),
                 KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
-                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Char('g') if ctrl => self.message = Some("Quit".to_string()),
                 _ => self.undefined("C-x", key),
             },
             Prefix::CtrlC => match key.code {
                 KeyCode::Char('b') if ctrl => self.start_browse_url(),
                 KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') => self.next_active(),
-                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Char('g') if ctrl => self.message = Some("Quit".to_string()),
                 KeyCode::Char('f') if ctrl => {
                     self.start_prefix(Prefix::CtrlCF, "C-c C-f-");
                 }
@@ -1520,12 +1520,12 @@ impl App {
                 KeyCode::Char('s') if ctrl => self.insert_format('\u{1e}'),
                 KeyCode::Char('f') | KeyCode::Char('t') if ctrl => self.insert_format('\u{11}'),
                 KeyCode::Char('d') if ctrl => self.unformat(),
-                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Char('g') if ctrl => self.message = Some("Quit".to_string()),
                 _ => self.undefined("C-c C-f", key),
             },
             Prefix::Help => match key.code {
                 KeyCode::Char('b') => self.show_help(),
-                KeyCode::Char('g') if ctrl => {}
+                KeyCode::Char('g') if ctrl => self.message = Some("Quit".to_string()),
                 _ => self.undefined("C-h", key),
             },
         }
@@ -2162,7 +2162,10 @@ impl App {
             self.dabbrev = Option::None;
         }
         match action {
-            Abort => self.prompt = Prompt::None,
+            Abort => {
+                self.prompt = Prompt::None;
+                self.message = Some("Quit".to_string());
+            }
             SelfInsert(c) => self.prompt_insert(c),
             DeleteBackward => self.prompt_delete_backward(),
             DeleteForward => self.prompt_delete_forward(),
@@ -2522,7 +2525,7 @@ impl App {
             }
             Abort => {
                 self.current_mut().buffer.clear_mark();
-                self.message = Option::None;
+                self.message = Some("Quit".to_string());
             }
         }
     }
@@ -3008,7 +3011,7 @@ impl App {
         }
         let direction = self.search.direction;
         let point = self.current().buffer.point();
-        let from = if advance {
+        let mut from = if advance {
             step_point(point, direction)
         } else if let Some(origin) = self.search.origin {
             if point == origin && self.search.failed {
@@ -3019,6 +3022,10 @@ impl App {
         } else {
             point
         };
+        if !advance && direction == SearchDirection::Backward {
+            let needle_len = query.to_lowercase().chars().count();
+            from = Pos::new(from.row, from.col + needle_len);
+        }
         let forward = direction == SearchDirection::Forward;
         match self.current().buffer.search(&query, from, forward) {
             Some((pos, len)) => {
@@ -3035,7 +3042,10 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('g') if ctrl => self.cancel_search(),
+            KeyCode::Char('g') if ctrl => {
+                self.cancel_search();
+                self.message = Some("Quit".to_string());
+            }
             KeyCode::Char('s') if ctrl => {
                 self.search.direction = SearchDirection::Forward;
                 if self.search.query.is_empty() {
@@ -4709,6 +4719,28 @@ mod tests {
     }
 
     #[test]
+    fn backward_search_keeps_matching_when_query_extends() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+        let ch = app.new_buffer(0, "#c".to_string(), Kind::Channel);
+        app.switch_to(ch);
+        {
+            let b = &mut app.current_mut().buffer;
+            b.push_plain("abbott");
+            b.push_plain("middle");
+            b.push_plain("abc");
+            b.end_of_buffer();
+        }
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
+    }
+
+    #[test]
     fn control_meta_beginning_of_buffer_exits_isearch() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = app_without_servers();
@@ -4750,6 +4782,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn c_g_shows_quit_in_the_echo_area() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app_without_servers();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.message.as_deref(), Some("Quit"));
+
+        // While a prefix is pending.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert_eq!(app.message.as_deref(), Some("Quit"));
+
+        // While a prompt is open.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(matches!(app.prompt, Prompt::SwitchBuffer { .. }));
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("Quit"));
+
+        // During isearch.
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(!app.search.active);
+        assert_eq!(app.message.as_deref(), Some("Quit"));
     }
 
     #[test]
